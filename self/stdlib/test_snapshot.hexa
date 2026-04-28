@@ -1,0 +1,319 @@
+// self/stdlib/test_snapshot.hexa — vitest `toMatchSnapshot()` parity.
+//
+// Resolves hive blocker: a few archived snapshot tests under
+// `packages/swarm/test/snapshot.test.archive.txt` rely on snapshot-file
+// comparison. Provides on-disk `<test>.snap` storage with first-run
+// auto-write semantics + subsequent-run compare semantics.
+//
+// raw 9  (pure-hexa):     external libs = 0 — uses self/stdlib/fs.
+// raw 18 (self-host fixpoint): zero new builtins.
+// raw 91 (no_silent_errors): mismatch records via test_record_failure;
+//   first-run write is ALWAYS announced on stdout (never silent).
+// raw 159 (hexa-lang-upstream-proposal-mandate): hive snapshot ports use
+//   this module instead of re-implementing snap I/O.
+//
+// ── On-disk format ───────────────────────────────────────────────────
+// One snapshot file per test file, suffix `.snap`. A snap file is a
+// flat list of newline-delimited records of the form:
+//
+//   ::SNAP::<name>
+//   <serialized lines, indented 2 spaces>
+//   ::END::
+//
+// `name` is unique within the file (vitest convention: `it` name +
+// optional counter). Mismatch / missing-name are reported by name.
+//
+// ── Public API ───────────────────────────────────────────────────────
+//   to_match_snapshot(name, actual)         — compare; auto-write on miss
+//   to_match_snapshot_in(snap_path, name, actual)
+//   snapshot_set_path(snap_path)             — module-level default path
+//   snapshot_clear(snap_path)                — delete the snap file
+//   snapshot_serialize(v)                    — debug; returns canonical form
+//
+// ── Known gaps (raw 91 honest) ───────────────────────────────────────
+//   G1. NO color diff. Mismatch message is plain `expected=... got=...`.
+//       Color requires ANSI handling + termcap detection — not blocked
+//       at language level, but explicitly deferred (raw 91 honest stub).
+//   G2. NO inline snapshots (`toMatchInlineSnapshot`). The interp can't
+//       rewrite source files mid-run.
+//   G3. Serialization of nested maps/objects uses json_stringify, which
+//       is total over hexa-native types but does NOT canonicalise key
+//       order. Tests that compare object snapshots may flap if the
+//       runtime ever changes its iteration order — documented limit.
+//
+// ── --selftest ────────────────────────────────────────────────────────
+//   hexa run self/stdlib/test_snapshot.hexa --selftest
+//     → emits __TEST_SNAPSHOT_SELFTEST__ <PASS|FAIL> n=<N> fail=<M>
+
+use "self/stdlib/fs"
+use "self/stdlib/json"
+use "self/stdlib/test"
+
+// ─── module state ────────────────────────────────────────────────────
+let mut _snap_default_path = ""
+
+// ─── public API ──────────────────────────────────────────────────────
+fn snapshot_set_path(snap_path) {
+    _snap_default_path = to_string(snap_path)
+}
+
+fn snapshot_serialize(v) {
+    let t = type_of(v)
+    if t == "string" { return to_string(v) }
+    return json_stringify_pretty(v)
+}
+
+// Indent every line of `s` by 2 spaces. Used in record body so that
+// even if the body contains `::SNAP::` literals they are not confused
+// with record framing.
+fn _snap_indent(s) {
+    let lines = to_string(s).split("\n")
+    let mut out = []
+    let mut i = 0
+    while i < len(lines) {
+        out.push("  " + lines[i])
+        i = i + 1
+    }
+    return out.join("\n")
+}
+
+fn _snap_dedent(s) {
+    let lines = to_string(s).split("\n")
+    let mut out = []
+    let mut i = 0
+    while i < len(lines) {
+        let ln = lines[i]
+        if len(ln) >= 2 {
+            // strip leading "  " — be tolerant of single-char prefix
+            let mut stripped = []
+            let mut j = 0
+            while j < len(ln) {
+                if j < 2 && (ln[j] == ' ' || ln[j] == '\t') {
+                    j = j + 1
+                } else {
+                    stripped.push(ln[j])
+                    j = j + 1
+                }
+            }
+            out.push(stripped.join(""))
+        } else {
+            out.push(ln)
+        }
+        i = i + 1
+    }
+    return out.join("\n")
+}
+
+// Read all records from a snap file. Returns array of [name, body].
+// On missing file, returns []. raw 91: never throws on missing.
+fn _snap_read_records(snap_path) {
+    let content = read_file_safe(snap_path)
+    if content == "" { return [] }
+    let lines = content.split("\n")
+    let mut records = []
+    let mut i = 0
+    while i < len(lines) {
+        let ln = lines[i]
+        if len(ln) >= 8 && ln.starts_with("::SNAP::") {
+            // Parse name
+            let mut name_chars = []
+            let mut j = 8
+            while j < len(ln) {
+                name_chars.push(ln[j])
+                j = j + 1
+            }
+            let name = name_chars.join("")
+            // Collect body lines until ::END::
+            let mut body_lines = []
+            i = i + 1
+            while i < len(lines) {
+                if lines[i] == "::END::" { break }
+                body_lines.push(lines[i])
+                i = i + 1
+            }
+            let raw_body = body_lines.join("\n")
+            records.push([name, _snap_dedent(raw_body)])
+        }
+        i = i + 1
+    }
+    return records
+}
+
+fn _snap_write_records(snap_path, records) {
+    let mut out = []
+    let mut i = 0
+    while i < len(records) {
+        let r = records[i]
+        out.push("::SNAP::" + to_string(r[0]))
+        out.push(_snap_indent(r[1]))
+        out.push("::END::")
+        i = i + 1
+    }
+    return write_file_safe(snap_path, out.join("\n") + "\n")
+}
+
+fn _snap_find(records, name) {
+    let mut i = 0
+    while i < len(records) {
+        if records[i][0] == name {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn to_match_snapshot_in(snap_path, name, actual) {
+    let serial = snapshot_serialize(actual)
+    let records = _snap_read_records(snap_path)
+    let idx = _snap_find(records, name)
+    if idx < 0 {
+        // First run for this name — append + write.
+        records.push([to_string(name), serial])
+        _snap_write_records(snap_path, records)
+        println("  snapshot WRITE " + to_string(name) + " (" + snap_path + ")")
+        return true
+    }
+    let existing = records[idx][1]
+    if existing == serial {
+        return true
+    }
+    let msg = "snapshot mismatch [" + to_string(name) + "] expected=" + existing
+        + " got=" + serial
+    test_record_failure(msg)
+    return false
+}
+
+fn to_match_snapshot(name, actual) {
+    if _snap_default_path == "" {
+        let msg = "to_match_snapshot: no default snap path set; "
+            + "call snapshot_set_path() or use to_match_snapshot_in()"
+        test_record_failure(msg)
+        return false
+    }
+    return to_match_snapshot_in(_snap_default_path, name, actual)
+}
+
+fn snapshot_clear(snap_path) {
+    return fs_unlink(snap_path)
+}
+
+// ─── --selftest ──────────────────────────────────────────────────────
+fn _snap_selftest() {
+    test_clear()
+    let mut fail = 0
+    let mut n = 0
+
+    let pid = to_string(exec("echo $$")).trim()
+    let scratch_dir = "/tmp/_hexa_snap_selftest_" + pid
+    let _ = exec("rm -rf " + scratch_dir + " && mkdir -p " + scratch_dir)
+    let snap_path = scratch_dir + "/test.snap"
+
+    // 1. first run: write a fresh snapshot — match returns true
+    n = n + 1
+    let ok1 = to_match_snapshot_in(snap_path, "alpha", "hello")
+    if !ok1 {
+        eprintln("FAIL 1 first-run write should succeed")
+        fail = fail + 1
+    }
+
+    // 2. second run: same value reads-back match
+    n = n + 1
+    let ok2 = to_match_snapshot_in(snap_path, "alpha", "hello")
+    if !ok2 {
+        eprintln("FAIL 2 same-value read-back match")
+        fail = fail + 1
+    }
+
+    // 3. mismatch: different value records failure
+    n = n + 1
+    test_clear()
+    let ok3 = to_match_snapshot_in(snap_path, "alpha", "WORLD")
+    if ok3 {
+        eprintln("FAIL 3 mismatch should return false")
+        fail = fail + 1
+    }
+
+    // 4. second name in same file
+    n = n + 1
+    let ok4 = to_match_snapshot_in(snap_path, "beta", "another")
+    if !ok4 {
+        eprintln("FAIL 4 second-name first-write")
+        fail = fail + 1
+    }
+
+    // 5. records persisted: read raw file + check both names present
+    n = n + 1
+    let raw = read_file_safe(snap_path)
+    if !raw.contains("::SNAP::alpha") || !raw.contains("::SNAP::beta") {
+        eprintln("FAIL 5 raw snap missing names. content=" + raw)
+        fail = fail + 1
+    }
+
+    // 6. array snapshot serializes via json
+    n = n + 1
+    let ok6 = to_match_snapshot_in(snap_path, "arr", [1, 2, 3])
+    if !ok6 {
+        eprintln("FAIL 6 array snap first write")
+        fail = fail + 1
+    }
+    n = n + 1
+    let ok7 = to_match_snapshot_in(snap_path, "arr", [1, 2, 3])
+    if !ok7 {
+        eprintln("FAIL 7 array snap re-read match")
+        fail = fail + 1
+    }
+
+    // 7. snapshot_clear deletes file
+    n = n + 1
+    snapshot_clear(snap_path)
+    if fs_exists(snap_path) {
+        eprintln("FAIL 8 snapshot_clear should remove file")
+        fail = fail + 1
+    }
+
+    // 8. multiline body round-trip
+    n = n + 1
+    let ml = "line1\nline2\nline3"
+    let ok8 = to_match_snapshot_in(snap_path, "multi", ml)
+    if !ok8 {
+        eprintln("FAIL 9 multiline first write")
+        fail = fail + 1
+    }
+    n = n + 1
+    let ok9 = to_match_snapshot_in(snap_path, "multi", ml)
+    if !ok9 {
+        eprintln("FAIL 10 multiline read-back match")
+        fail = fail + 1
+    }
+
+    // 9. default path API
+    n = n + 1
+    snapshot_set_path(snap_path)
+    let ok10 = to_match_snapshot("via_default", "x")
+    if !ok10 {
+        eprintln("FAIL 11 default-path first write")
+        fail = fail + 1
+    }
+
+    // cleanup scratch
+    let _ = exec("rm -rf " + scratch_dir)
+
+    if fail == 0 {
+        println("__TEST_SNAPSHOT_SELFTEST__ PASS n=" + to_string(n) + " fail=0")
+    } else {
+        println("__TEST_SNAPSHOT_SELFTEST__ FAIL n=" + to_string(n) + " fail=" + to_string(fail))
+    }
+}
+
+let _snap_argv = args()
+let mut _snap_selftest_flag = false
+let mut _snap_ai = 0
+while _snap_ai < len(_snap_argv) {
+    if _snap_argv[_snap_ai] == "--selftest" { _snap_selftest_flag = true }
+    if _snap_argv[_snap_ai] == "--selftest-snapshot" { _snap_selftest_flag = true }
+    _snap_ai = _snap_ai + 1
+}
+if _snap_selftest_flag {
+    _snap_selftest()
+}

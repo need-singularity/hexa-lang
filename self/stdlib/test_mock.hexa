@@ -1,0 +1,312 @@
+// self/stdlib/test_mock.hexa — vitest `vi.fn()` / `vi.mock()` parity.
+//
+// Provides function spies and mock-return-value plumbing for hive's
+// archived *.test.ts ports. Vitest patterns observed in archives:
+//   const fn = vi.fn(() => 42);   fn(arg);   expect(fn).toHaveBeenCalledWith(arg);
+//   vi.mock('../module', () => ({ ... }));
+//
+// raw 9  (pure-hexa):     external libs = 0.
+// raw 18 (self-host fixpoint): zero new builtins.
+// raw 91 (no_silent_errors): mock_get / mock_calls return well-defined
+//   sentinels on lookup miss; never silent void.
+// raw 159 (hexa-lang-upstream-proposal-mandate): hive ports use this
+//   module instead of re-implementing spy plumbing.
+//
+// ── Why id-based not closure-captured spies ──────────────────────────
+// As documented in bench.hexa + test.hexa, this interp cannot persist
+// fn refs in module-level containers. Vitest's `vi.fn(impl)` returns a
+// callable that ALSO has `.mock.calls` etc. — that closure-with-state
+// pattern is unavailable.
+//
+// The honest workaround:
+//   mock_new(name)            → returns int id
+//   mock_record(id, args_arr) → user-call site explicitly records
+//   mock_calls(id)            → returns recorded calls list
+//   mock_set_return(id, v)    → sets the canned return
+//   mock_get_return(id)       → reads canned return
+//   mock_call_count(id)       → len(mock_calls(id))
+//   mock_reset(id)            → clears calls, keeps id allocated
+//   mock_clear_all()          → tears down whole registry
+//
+// The user wraps real call sites with `mock_record(id, [a,b])` + reads
+// `mock_get_return(id)` inside their fake. This is the same pattern
+// hand-rolled in many vitest tests via `vi.fn().mockImplementation(...)`.
+//
+// ── Known gaps (raw 91 honest) ───────────────────────────────────────
+//   G1. NO `vi.mock('module-path', factory)` — that requires linker-level
+//       module replacement. Honestly stubbed: a no-op `vi_mock_module()`
+//       that records the request to a manual-review log and returns
+//       false. Hive ports affected (e.g. mocking `node:fs`) must be
+//       refactored to dependency-inject the implementation.
+//   G2. NO automatic argument matching (`expect(fn).toHaveBeenCalledWith(...)`).
+//       We expose `mock_was_called_with(id, args_arr)` for direct use.
+//   G3. NO timer / clock mocks (vi.useFakeTimers). Hive's mono_ns-based
+//       paths can't intercept the runtime clock.
+//
+// ── --selftest ────────────────────────────────────────────────────────
+//   hexa run self/stdlib/test_mock.hexa --selftest
+//     → emits __TEST_MOCK_SELFTEST__ <PASS|FAIL> n=<N> fail=<M>
+
+// ─── module state ────────────────────────────────────────────────────
+// Two parallel arrays keyed by id (sequential int ints). We avoid maps
+// of-arrays here because nested mutable map paths are inconsistent
+// across interp versions; parallel array indexing is rock-solid.
+let mut _mock_names = []           // [string] — debug/observability
+let mut _mock_calls_table = []     // [[args_arr, args_arr, ...]] per id
+let mut _mock_returns = []         // [any] — canned return per id
+let mut _mock_has_return = []      // [bool] — whether a return is set
+
+// Manual-review log for vi_mock_module() requests.
+let mut _mock_module_log = []
+
+// ─── public API ──────────────────────────────────────────────────────
+fn mock_new(name) {
+    _mock_names.push(to_string(name))
+    _mock_calls_table.push([])
+    _mock_returns.push(0)
+    _mock_has_return.push(false)
+    return len(_mock_names) - 1
+}
+
+// Record a call. args_arr should be an array (use [] for nullary calls).
+fn mock_record(id, args_arr) {
+    if id < 0 || id >= len(_mock_calls_table) {
+        eprintln("mock_record: bad id " + to_string(id))
+        return false
+    }
+    _mock_calls_table[id].push(args_arr)
+    return true
+}
+
+fn mock_calls(id) {
+    if id < 0 || id >= len(_mock_calls_table) {
+        return []
+    }
+    return _mock_calls_table[id]
+}
+
+fn mock_call_count(id) {
+    return len(mock_calls(id))
+}
+
+fn mock_set_return(id, v) {
+    if id < 0 || id >= len(_mock_returns) {
+        eprintln("mock_set_return: bad id " + to_string(id))
+        return false
+    }
+    _mock_returns[id] = v
+    _mock_has_return[id] = true
+    return true
+}
+
+fn mock_get_return(id) {
+    if id < 0 || id >= len(_mock_returns) {
+        return 0
+    }
+    if !_mock_has_return[id] {
+        return 0
+    }
+    return _mock_returns[id]
+}
+
+fn mock_has_return(id) {
+    if id < 0 || id >= len(_mock_has_return) {
+        return false
+    }
+    return _mock_has_return[id]
+}
+
+// Helper: was the spy called with these EXACT args (deep-eq)?
+// Returns true if any recorded call's args_arr deeply equals query.
+fn _mock_deep_eq(a, b) {
+    let ta = type_of(a)
+    let tb = type_of(b)
+    if ta != tb { return false }
+    if ta == "array" {
+        if len(a) != len(b) { return false }
+        let mut i = 0
+        while i < len(a) {
+            if !_mock_deep_eq(a[i], b[i]) { return false }
+            i = i + 1
+        }
+        return true
+    }
+    return a == b
+}
+
+fn mock_was_called_with(id, args_arr) {
+    let calls = mock_calls(id)
+    let mut i = 0
+    while i < len(calls) {
+        if _mock_deep_eq(calls[i], args_arr) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn mock_reset(id) {
+    if id < 0 || id >= len(_mock_calls_table) {
+        return false
+    }
+    _mock_calls_table[id] = []
+    _mock_has_return[id] = false
+    return true
+}
+
+fn mock_clear_all() {
+    _mock_names = []
+    _mock_calls_table = []
+    _mock_returns = []
+    _mock_has_return = []
+    _mock_module_log = []
+}
+
+fn mock_name(id) {
+    if id < 0 || id >= len(_mock_names) { return "" }
+    return _mock_names[id]
+}
+
+// G1: no-op stub that logs the request for manual review.
+fn vi_mock_module(module_path) {
+    _mock_module_log.push(to_string(module_path))
+    eprintln("vi_mock_module: STUB — module replacement requires runtime hook (G1)."
+        + " Refactor target to dependency-inject. requested=" + to_string(module_path))
+    return false
+}
+
+fn vi_mock_module_log() {
+    return _mock_module_log
+}
+
+// ─── --selftest ──────────────────────────────────────────────────────
+fn _mock_selftest() {
+    mock_clear_all()
+    let mut fail = 0
+    let mut n = 0
+
+    // 1. mock_new returns sequential ids
+    n = n + 1
+    let a = mock_new("alpha")
+    let b = mock_new("beta")
+    if a != 0 || b != 1 {
+        eprintln("FAIL 1 ids wrong: a=" + to_string(a) + " b=" + to_string(b))
+        fail = fail + 1
+    }
+
+    // 2. mock_name lookup
+    n = n + 1
+    if mock_name(a) != "alpha" || mock_name(b) != "beta" {
+        eprintln("FAIL 2 names")
+        fail = fail + 1
+    }
+
+    // 3. record calls
+    n = n + 1
+    mock_record(a, [1, 2])
+    mock_record(a, ["hi"])
+    if mock_call_count(a) != 2 {
+        eprintln("FAIL 3 call_count")
+        fail = fail + 1
+    }
+
+    // 4. calls table content
+    n = n + 1
+    let calls = mock_calls(a)
+    if len(calls) != 2 || len(calls[0]) != 2 || calls[0][0] != 1 {
+        eprintln("FAIL 4 calls content")
+        fail = fail + 1
+    }
+
+    // 5. mock_was_called_with positive
+    n = n + 1
+    if !mock_was_called_with(a, [1, 2]) {
+        eprintln("FAIL 5 was_called_with positive")
+        fail = fail + 1
+    }
+
+    // 6. mock_was_called_with negative
+    n = n + 1
+    if mock_was_called_with(a, [9, 9]) {
+        eprintln("FAIL 6 was_called_with negative")
+        fail = fail + 1
+    }
+
+    // 7. mock_set_return + mock_get_return
+    n = n + 1
+    mock_set_return(b, 42)
+    if mock_get_return(b) != 42 {
+        eprintln("FAIL 7 get_return scalar")
+        fail = fail + 1
+    }
+
+    // 8. mock_has_return flag
+    n = n + 1
+    if !mock_has_return(b) || mock_has_return(a) {
+        eprintln("FAIL 8 has_return flags")
+        fail = fail + 1
+    }
+
+    // 9. mock_set_return with array value
+    n = n + 1
+    mock_set_return(b, [1, 2, 3])
+    let r = mock_get_return(b)
+    if len(r) != 3 || r[2] != 3 {
+        eprintln("FAIL 9 array return")
+        fail = fail + 1
+    }
+
+    // 10. mock_reset clears calls but not name
+    n = n + 1
+    mock_reset(a)
+    if mock_call_count(a) != 0 || mock_name(a) != "alpha" {
+        eprintln("FAIL 10 reset")
+        fail = fail + 1
+    }
+
+    // 11. mock_calls on bad id returns []
+    n = n + 1
+    if len(mock_calls(999)) != 0 {
+        eprintln("FAIL 11 bad id calls")
+        fail = fail + 1
+    }
+
+    // 12. vi_mock_module stub records request + returns false
+    n = n + 1
+    let ok = vi_mock_module("../node_fs")
+    if ok {
+        eprintln("FAIL 12 vi_mock_module should return false (G1 stub)")
+        fail = fail + 1
+    }
+    n = n + 1
+    if len(vi_mock_module_log()) != 1 || vi_mock_module_log()[0] != "../node_fs" {
+        eprintln("FAIL 13 vi_mock_module did not log")
+        fail = fail + 1
+    }
+
+    // 13. mock_clear_all resets registry
+    n = n + 1
+    mock_clear_all()
+    let c = mock_new("gamma")
+    if c != 0 {
+        eprintln("FAIL 14 clear_all should restart ids")
+        fail = fail + 1
+    }
+
+    if fail == 0 {
+        println("__TEST_MOCK_SELFTEST__ PASS n=" + to_string(n) + " fail=0")
+    } else {
+        println("__TEST_MOCK_SELFTEST__ FAIL n=" + to_string(n) + " fail=" + to_string(fail))
+    }
+}
+
+let _mock_argv = args()
+let mut _mock_selftest_flag = false
+let mut _mock_ai = 0
+while _mock_ai < len(_mock_argv) {
+    if _mock_argv[_mock_ai] == "--selftest" { _mock_selftest_flag = true }
+    if _mock_argv[_mock_ai] == "--selftest-mock" { _mock_selftest_flag = true }
+    _mock_ai = _mock_ai + 1
+}
+if _mock_selftest_flag {
+    _mock_selftest()
+}

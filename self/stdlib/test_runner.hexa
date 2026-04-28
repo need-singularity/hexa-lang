@@ -1,0 +1,423 @@
+// self/stdlib/test_runner.hexa — discover + run *.test.hexa files.
+//
+// Pairs with self/stdlib/test.hexa + expect.hexa to give hive a
+// vitest-equivalent CLI:
+//
+//   hexa run self/stdlib/test_runner.hexa --discover packages/audit/test
+//
+// raw 9  (pure-hexa):     external libs = 0 — fs.hexa + exec only.
+// raw 18 (self-host fixpoint): zero new builtins. The runner runs other
+//   .test.hexa files via `exec("hexa run ...")` (sub-process) and parses
+//   their `__TEST_RUNNER_RESULT__` summary lines.
+// raw 91 (no_silent_errors): every discovered file's exit/parse status is
+//   reflected in the aggregate summary; missing summary line → FAIL.
+// raw 159 (hexa-lang-upstream-proposal-mandate): hive sister-repo CIs
+//   `hexa run self/stdlib/test_runner.hexa --discover ...` instead of
+//   wrapping vitest in shell.
+//
+// ── Discovery ────────────────────────────────────────────────────────
+//   --discover <dir>   recursive walk; collects every `*.test.hexa`.
+//                      Does NOT follow symlinks. Hidden dirs (.git etc)
+//                      are skipped. Directories named `node_modules` or
+//                      `dist` or `archive` are pruned.
+//   --file <path>      add a single explicit file (repeatable).
+//   --hexa <bin>       override hexa binary path (defaults to ./hexa).
+//   --jsonl <path>     write per-file JSONL results to this path
+//                      (one line per discovered file).
+//   --quiet            suppress per-file echo; final summary still printed.
+//
+// ── Output ───────────────────────────────────────────────────────────
+//   For each *.test.hexa file:
+//     `· running <path>`
+//     stdout / stderr from the child are echoed verbatim
+//     `  ↳ <PASS|FAIL> total=N pass=P fail=F` line per file
+//   Aggregate at the end:
+//     `__TEST_RUNNER_RESULT__ <PASS|FAIL> total=<N> pass=<P> fail=<F>`
+//
+// JSONL record per file (when --jsonl set):
+//   {"file":"...","verdict":"PASS|FAIL","total":N,"pass":P,"fail":F,"raw":"..."}
+//
+// ── Known gaps (raw 91 honest) ───────────────────────────────────────
+//   G1. No parallelism. Files run serially because hexa exec() is sync
+//       and thread/spawn primitives aren't exposed at stdlib level.
+//   G2. Per-test (within-file) selection (`--testNamePattern`) is NOT
+//       implemented — it would require driving the framework directly,
+//       not via subprocess.
+//   G3. Watch mode is NOT implemented.
+//
+// ── --selftest ────────────────────────────────────────────────────────
+//   hexa run self/stdlib/test_runner.hexa --selftest
+//     → emits __TEST_RUNNER_FRAMEWORK_SELFTEST__ <PASS|FAIL>
+
+use "self/stdlib/fs"
+use "self/stdlib/shell_escape"
+
+// ─── recursive *.test.hexa discovery ─────────────────────────────────
+fn _runner_should_prune_dir(name) {
+    if len(name) == 0 { return true }
+    if name[0] == '.' { return true }
+    if name == "node_modules" { return true }
+    if name == "dist" { return true }
+    if name == "archive" { return true }
+    if name == "build" { return true }
+    return false
+}
+
+fn _runner_ends_with(s, suffix) {
+    return s.ends_with(suffix)
+}
+
+fn _runner_walk(root) {
+    let mut found = []
+    let mut stack = [to_string(root)]
+    while len(stack) > 0 {
+        let cur = stack[len(stack) - 1]
+        // pop
+        let mut new_stack = []
+        let mut k = 0
+        while k < len(stack) - 1 {
+            new_stack.push(stack[k])
+            k = k + 1
+        }
+        stack = new_stack
+        let entries = read_dir(cur)
+        let mut i = 0
+        while i < len(entries) {
+            let entry = entries[i]
+            let path = cur + "/" + entry
+            if lstat_is_dir(path) {
+                if !_runner_should_prune_dir(entry) {
+                    stack.push(path)
+                }
+            } else {
+                if _runner_ends_with(entry, ".test.hexa") {
+                    found.push(path)
+                }
+            }
+            i = i + 1
+        }
+    }
+    return found
+}
+
+// ─── result-line parser ──────────────────────────────────────────────
+// Scans `output` (stdout) for the LAST line starting with
+// `__TEST_RUNNER_RESULT__`. Returns [verdict, total, pass, fail, found].
+// `found`==false ⇒ no summary line; treat as FAIL.
+fn _runner_parse_result(output) {
+    let lines = to_string(output).split("\n")
+    let mut last_idx = -1
+    let mut i = 0
+    while i < len(lines) {
+        if lines[i].starts_with("__TEST_RUNNER_RESULT__") {
+            last_idx = i
+        }
+        i = i + 1
+    }
+    if last_idx < 0 {
+        return ["FAIL", 0, 0, 0, false]
+    }
+    let parts = lines[last_idx].split(" ")
+    let mut verdict = "FAIL"
+    let mut total = 0
+    let mut pass = 0
+    let mut fail = 0
+    let mut p = 0
+    while p < len(parts) {
+        let token = parts[p]
+        if token == "PASS" { verdict = "PASS" }
+        if token == "FAIL" && p > 0 { verdict = "FAIL" }
+        if token.starts_with("total=") {
+            let v = token.split("=")
+            if len(v) == 2 { total = to_int(v[1]) }
+        }
+        if token.starts_with("pass=") {
+            let v = token.split("=")
+            if len(v) == 2 { pass = to_int(v[1]) }
+        }
+        if token.starts_with("fail=") {
+            let v = token.split("=")
+            if len(v) == 2 { fail = to_int(v[1]) }
+        }
+        p = p + 1
+    }
+    return [verdict, total, pass, fail, true]
+}
+
+// ─── single-file run ─────────────────────────────────────────────────
+fn _runner_run_file(hexa_bin, file_path, quiet) {
+    if !quiet {
+        println("· running " + file_path)
+    }
+    let cmd = shell_escape(hexa_bin) + " run " + shell_escape(file_path) + " 2>&1"
+    let out = to_string(exec(cmd))
+    if !quiet {
+        println(out)
+    }
+    let parsed = _runner_parse_result(out)
+    let verdict = parsed[0]
+    let total = parsed[1]
+    let pass = parsed[2]
+    let fail = parsed[3]
+    let found = parsed[4]
+    if !found {
+        // No summary line — show a clear honest message + treat as FAIL.
+        println("  ↳ FAIL " + file_path + " (no __TEST_RUNNER_RESULT__ line — file did not call test_summary())")
+    } else {
+        println("  ↳ " + verdict + " " + file_path
+            + " total=" + to_string(total)
+            + " pass=" + to_string(pass)
+            + " fail=" + to_string(fail))
+    }
+    return [verdict, total, pass, fail, file_path, out]
+}
+
+// ─── jsonl emit ──────────────────────────────────────────────────────
+fn _runner_jsonl_record(rec) {
+    // rec = [verdict, total, pass, fail, file_path, raw_out]
+    let raw = rec[5]
+    // simple JSON escape for raw stdout — escape backslash + dquote +
+    // newlines into \n. Sufficient for hexa stdout.
+    let mut esc_chars = []
+    let mut i = 0
+    while i < len(raw) {
+        let ch = raw[i]
+        if ch == '\\' {
+            esc_chars.push('\\')
+            esc_chars.push('\\')
+        } else if ch == '"' {
+            esc_chars.push('\\')
+            esc_chars.push('"')
+        } else if ch == '\n' {
+            esc_chars.push('\\')
+            esc_chars.push('n')
+        } else if ch == '\r' {
+            // drop CR
+        } else {
+            esc_chars.push(ch)
+        }
+        i = i + 1
+    }
+    let raw_esc = esc_chars.join("")
+    return "{\"file\":\"" + rec[4] + "\""
+        + ",\"verdict\":\"" + rec[0] + "\""
+        + ",\"total\":" + to_string(rec[1])
+        + ",\"pass\":" + to_string(rec[2])
+        + ",\"fail\":" + to_string(rec[3])
+        + ",\"raw\":\"" + raw_esc + "\"}"
+}
+
+// ─── argv driver ─────────────────────────────────────────────────────
+fn _runner_main() {
+    let argv = args()
+    let mut discover_dirs = []
+    let mut explicit_files = []
+    let mut hexa_bin = "./hexa"
+    let mut jsonl_path = ""
+    let mut quiet = false
+    let mut i = 0
+    while i < len(argv) {
+        let tok = argv[i]
+        if tok == "--discover" && i + 1 < len(argv) {
+            discover_dirs.push(argv[i + 1])
+            i = i + 2
+        } else if tok == "--file" && i + 1 < len(argv) {
+            explicit_files.push(argv[i + 1])
+            i = i + 2
+        } else if tok == "--hexa" && i + 1 < len(argv) {
+            hexa_bin = argv[i + 1]
+            i = i + 2
+        } else if tok == "--jsonl" && i + 1 < len(argv) {
+            jsonl_path = argv[i + 1]
+            i = i + 2
+        } else if tok == "--quiet" {
+            quiet = true
+            i = i + 1
+        } else {
+            i = i + 1
+        }
+    }
+
+    // Collect target files.
+    let mut targets = []
+    let mut d = 0
+    while d < len(discover_dirs) {
+        let walked = _runner_walk(discover_dirs[d])
+        let mut w = 0
+        while w < len(walked) {
+            // skip self-test of the framework runner — that runs via
+            // direct --selftest invocation, not via discover walk.
+            if !walked[w].ends_with("test_runner.test.hexa") {
+                targets.push(walked[w])
+            }
+            w = w + 1
+        }
+        d = d + 1
+    }
+    let mut e = 0
+    while e < len(explicit_files) {
+        targets.push(explicit_files[e])
+        e = e + 1
+    }
+
+    // De-dup + sort (insertion order preserved, simple O(n²) dedup OK).
+    let mut uniq = []
+    let mut t = 0
+    while t < len(targets) {
+        let cur = targets[t]
+        let mut seen = false
+        let mut u = 0
+        while u < len(uniq) {
+            if uniq[u] == cur { seen = true }
+            u = u + 1
+        }
+        if !seen { uniq.push(cur) }
+        t = t + 1
+    }
+    targets = uniq
+
+    if len(targets) == 0 {
+        println("__TEST_RUNNER_RESULT__ FAIL total=0 pass=0 fail=0 (no targets)")
+        return
+    }
+
+    // Run each.
+    let mut records = []
+    let mut tot_total = 0
+    let mut tot_pass = 0
+    let mut tot_fail = 0
+    let mut file_failures = 0
+    let mut r = 0
+    while r < len(targets) {
+        let rec = _runner_run_file(hexa_bin, targets[r], quiet)
+        records.push(rec)
+        tot_total = tot_total + rec[1]
+        tot_pass = tot_pass + rec[2]
+        tot_fail = tot_fail + rec[3]
+        if rec[0] != "PASS" { file_failures = file_failures + 1 }
+        r = r + 1
+    }
+
+    // JSONL out
+    if jsonl_path != "" {
+        let mut jl = []
+        let mut k = 0
+        while k < len(records) {
+            jl.push(_runner_jsonl_record(records[k]))
+            k = k + 1
+        }
+        let _ = write_file_safe(jsonl_path, jl.join("\n") + "\n")
+        println("· wrote " + jsonl_path)
+    }
+
+    // Aggregate verdict: any file FAIL ⇒ aggregate FAIL.
+    let verdict = if file_failures == 0 && tot_fail == 0 { "PASS" } else { "FAIL" }
+    println("")
+    println("── runner aggregate (" + to_string(len(records)) + " files) ──")
+    println("__TEST_RUNNER_RESULT__ " + verdict
+        + " total=" + to_string(tot_total)
+        + " pass=" + to_string(tot_pass)
+        + " fail=" + to_string(tot_fail))
+}
+
+// ─── --selftest ──────────────────────────────────────────────────────
+// Synthetic .test.hexa file with a known good summary line; runner
+// should discover it + agree on the counts.
+fn _runner_selftest() {
+    let pid = to_string(exec("echo $$")).trim()
+    let scratch = "/tmp/_hexa_runner_selftest_" + pid
+    let _ = exec("rm -rf " + scratch + " && mkdir -p " + scratch + "/sub")
+    let f1 = scratch + "/synth_pass.test.hexa"
+    let f2 = scratch + "/sub/synth_fail.test.hexa"
+
+    // Both files just emit a __TEST_RUNNER_RESULT__ line directly so
+    // that the runner's parse path is exercised without depending on
+    // test.hexa being on disk via path lookup. Pure interpolation.
+    let pass_body = "println(\"__TEST_RUNNER_RESULT__ PASS total=3 pass=3 fail=0\")\n"
+    let fail_body = "println(\"__TEST_RUNNER_RESULT__ FAIL total=2 pass=1 fail=1\")\n"
+    let _ = write_file_safe(f1, pass_body)
+    let _ = write_file_safe(f2, fail_body)
+
+    let mut fail = 0
+    let mut n = 0
+
+    // 1. walk discovers both files
+    n = n + 1
+    let walked = _runner_walk(scratch)
+    if len(walked) != 2 {
+        eprintln("FAIL 1 walk count: " + to_string(len(walked)))
+        fail = fail + 1
+    }
+
+    // 2. parse the synthetic PASS line
+    n = n + 1
+    let p = _runner_parse_result("__TEST_RUNNER_RESULT__ PASS total=3 pass=3 fail=0")
+    if p[0] != "PASS" || p[1] != 3 || p[2] != 3 || p[3] != 0 || !p[4] {
+        eprintln("FAIL 2 parse PASS line: " + to_string(p))
+        fail = fail + 1
+    }
+
+    // 3. parse FAIL line
+    n = n + 1
+    let q = _runner_parse_result("hello\n__TEST_RUNNER_RESULT__ FAIL total=5 pass=2 fail=3\nbye")
+    if q[0] != "FAIL" || q[1] != 5 || q[3] != 3 || !q[4] {
+        eprintln("FAIL 3 parse FAIL line: " + to_string(q))
+        fail = fail + 1
+    }
+
+    // 4. parse missing line
+    n = n + 1
+    let r2 = _runner_parse_result("just some output\nno summary here")
+    if r2[4] {
+        eprintln("FAIL 4 parse should report not-found")
+        fail = fail + 1
+    }
+
+    // 5. run a single file end-to-end via _runner_run_file
+    n = n + 1
+    let rec = _runner_run_file("/Users/ghost/core/hexa-lang/hexa", f1, true)
+    if rec[0] != "PASS" || rec[1] != 3 || rec[2] != 3 || rec[3] != 0 {
+        eprintln("FAIL 5 run_file: " + to_string(rec))
+        fail = fail + 1
+    }
+
+    // 6. dir prune predicate
+    n = n + 1
+    if !_runner_should_prune_dir(".git") || !_runner_should_prune_dir("node_modules") {
+        eprintln("FAIL 6 prune predicate")
+        fail = fail + 1
+    }
+    n = n + 1
+    if _runner_should_prune_dir("packages") || _runner_should_prune_dir("test") {
+        eprintln("FAIL 7 prune false-positive")
+        fail = fail + 1
+    }
+
+    // cleanup
+    let _ = exec("rm -rf " + scratch)
+
+    if fail == 0 {
+        println("__TEST_RUNNER_FRAMEWORK_SELFTEST__ PASS n=" + to_string(n) + " fail=0")
+    } else {
+        println("__TEST_RUNNER_FRAMEWORK_SELFTEST__ FAIL n=" + to_string(n) + " fail=" + to_string(fail))
+    }
+}
+
+// ─── argv dispatch ───────────────────────────────────────────────────
+let _runner_argv = args()
+let mut _runner_selftest_flag = false
+let mut _runner_run_flag = false
+let mut _runner_ai = 0
+while _runner_ai < len(_runner_argv) {
+    let _a = _runner_argv[_runner_ai]
+    if _a == "--selftest-runner" { _runner_selftest_flag = true }
+    if _a == "--selftest" { _runner_selftest_flag = true }
+    if _a == "--discover" { _runner_run_flag = true }
+    if _a == "--file" { _runner_run_flag = true }
+    _runner_ai = _runner_ai + 1
+}
+if _runner_selftest_flag {
+    _runner_selftest()
+} else if _runner_run_flag {
+    _runner_main()
+}
