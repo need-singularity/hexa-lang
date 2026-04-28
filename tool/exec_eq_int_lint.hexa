@@ -1,0 +1,326 @@
+// tool/exec_eq_int_lint.hexa — RFC-007 P1: detect `exec(...) == int_literal` silent-fail pattern
+//
+// @tool(slug="exec_eq_int_lint", desc="flag exec(cmd) compared to integer literal — silent-fail bug class")
+// @usage(hexa run /Users/ghost/core/hexa-lang/tool/exec_eq_int_lint.hexa [--path <dir>] [--ext <csv>])
+// @example(`if exec("ls") == 0 { ... }` is silent-false: exec returns string, not exit code)
+// @exit_codes(0=no violations, 1=violations found, 2=scan error)
+//
+// PROBLEM (RFC-007, anima-eeg B11 audit 2026-04-28)
+//   hexa runtime exec(cmd: string) returns captured stdout (string), not an
+//   int exit code (POSIX C system(3) mental model). The natural-looking
+//   pattern silently fails forever:
+//
+//       if exec("some-command") == 0 { ... }   // never taken: string == int
+//
+//   anima-eeg audit found 9 BUG-class instances across helper modules
+//   (commit da368d14 patched them; commit 3c2dc93f confirmed clean).
+//
+// PATTERNS DETECTED
+//   1. Direct comparison:
+//        exec(cmd) == <int>      exec(cmd) != <int>
+//        exec(cmd) <  <int>      exec(cmd) >  <int>
+//        exec(cmd) <= <int>      exec(cmd) >= <int>
+//        <int> == exec(cmd)      (commutative)
+//   2. Single-hop let binding:
+//        let rc = exec(cmd)
+//        if rc == <int> { ... }
+//   3. Inverse direction (`<int> == exec(cmd)`)
+//
+// OUT OF SCOPE (defer to follow-up RFC)
+//   - Comparison with bool (`exec(cmd) == true`) — separate type-error class
+//   - 2+ let hops (data-flow cost > value)
+//   - String concat (`exec(cmd) + "x" == ...`) — semantically correct
+//   - exec_with_status / exec_capture / exec_stream (correct APIs)
+//
+// ALLOW MARKER
+//   `// exec_eq_int_lint: allow` on the same line skips that line.
+//
+// FIX SUGGESTION
+//   `let r = exec_with_status(cmd); if r[1] == <int> { ... }`
+//   ref: proposals/rfc_006_exec_return_type.md (decision tree)
+
+fn _pwd() -> string {
+    let mut p = env("PWD")
+    if p == "" { p = to_string(exec("pwd")).trim() }
+    return p
+}
+
+fn _scan_path(root: string, exts: array) -> array {
+    let mut name_filter = ""
+    let mut i = 0
+    while i < len(exts) {
+        if i > 0 { name_filter = name_filter + " -o " }
+        name_filter = name_filter + "-name '*." + exts[i] + "'"
+        i = i + 1
+    }
+    let prune = "-name node_modules -o -name dist -o -name build -o -name '.hexa-cache' -o -name '.git' -o -path '*test/fixtures/exec_eq_int_lint*'"
+    let cmd = "find '" + root + "' \\( " + prune + " \\) -prune -o \\( " + name_filter + " \\) -print"
+    let out = to_string(exec(cmd))
+    let lines = split(out, "\n")
+    let mut files = []
+    let mut k = 0
+    while k < len(lines) {
+        let t = lines[k].trim()
+        if len(t) > 0 { files.push(t) }
+        k = k + 1
+    }
+    return files
+}
+
+fn _is_comment_line(line: string) -> bool {
+    let t = line.trim_start()
+    return t.starts_with("//")
+}
+
+// Skip comparison operators where neither side actually involves exec().
+// Returns the 0-based index of the operator if a comparison is present,
+// else -1. Operators tried in priority order: ==, !=, <=, >=, <, >.
+fn _find_comparison_op(s: string) -> int {
+    let ops = ["==", "!=", "<=", ">=", "<", ">"]
+    let mut best = -1
+    let mut k = 0
+    while k < len(ops) {
+        let pos = s.index_of(ops[k])
+        if pos >= 0 {
+            if best < 0 || pos < best { best = pos }
+        }
+        k = k + 1
+    }
+    return best
+}
+
+// Get the operator string at a given position (re-discriminates 1-vs-2 char).
+fn _op_at(s: string, pos: int) -> string {
+    if pos < 0 || pos + 1 >= len(s) { return "" }
+    let two = s.substring(pos, pos + 2)
+    if two == "==" || two == "!=" || two == "<=" || two == ">=" { return two }
+    let one = s.substring(pos, pos + 1)
+    if one == "<" || one == ">" { return one }
+    return ""
+}
+
+// Is `tok` an integer literal? (optionally signed, all digits)
+fn _is_int_literal(tok: string) -> bool {
+    let t = tok.trim()
+    if len(t) == 0 { return false }
+    let mut start = 0
+    let first = t.substring(0, 1)
+    if first == "-" || first == "+" {
+        if len(t) == 1 { return false }
+        start = 1
+    }
+    let mut k = start
+    while k < len(t) {
+        let ch = t.substring(k, k + 1)
+        if !contains("0123456789", ch) { return false }
+        k = k + 1
+    }
+    return true
+}
+
+// Trim a side of the comparison: also strip a leading `(` or `if `/`while ` etc.
+fn _normalize_lhs(s: string) -> string {
+    let mut t = s.trim()
+    // strip leading `if ` / `while ` / `else if ` / `return ` / `let mut x = ` / `let x = `
+    let prefixes = ["if ", "while ", "else if ", "return "]
+    let mut k = 0
+    while k < len(prefixes) {
+        if t.starts_with(prefixes[k]) {
+            t = t.substring(len(prefixes[k]), len(t)).trim()
+        }
+        k = k + 1
+    }
+    // strip trailing `(` for cases like `if (exec(x) == 0)` — light handling
+    while t.starts_with("(") {
+        t = t.substring(1, len(t)).trim()
+    }
+    return t
+}
+
+fn _normalize_rhs(s: string) -> string {
+    let mut t = s.trim()
+    // strip trailing `{` for if/while body openers
+    while t.ends_with("{") {
+        t = t.substring(0, len(t) - 1).trim()
+    }
+    // strip ONE unbalanced trailing `)` for `if (lhs == rhs)` patterns.
+    // Compute net paren balance; if negative (more `)` than `(`), peel one.
+    let mut depth = 0
+    let mut k = 0
+    while k < len(t) {
+        let ch = t.substring(k, k + 1)
+        if ch == "(" { depth = depth + 1 }
+        if ch == ")" { depth = depth - 1 }
+        k = k + 1
+    }
+    if depth < 0 && t.ends_with(")") {
+        t = t.substring(0, len(t) - 1).trim()
+    }
+    return t
+}
+
+// Does the LHS or RHS expression boil down to a `exec(...)` call?
+// Conservative: must START with `exec(` after light prefix stripping; we
+// disregard chained calls (`exec(x).trim()`) — those are explicit string ops.
+fn _is_exec_call(s: string) -> bool {
+    let t = s.trim()
+    if !t.starts_with("exec(") { return false }
+    // Reject explicit-string-cast forms exec(...).trim() / .substring(...) / etc.
+    // by checking for `).` after the matched closing paren.
+    // Find matching paren at depth 0.
+    let mut depth = 0
+    let mut k = 0
+    let mut close_at = -1
+    while k < len(t) {
+        let ch = t.substring(k, k + 1)
+        if ch == "(" { depth = depth + 1 }
+        if ch == ")" {
+            depth = depth - 1
+            if depth == 0 { close_at = k; break }
+        }
+        k = k + 1
+    }
+    if close_at < 0 { return false }
+    // After close, the comparison should follow — anything between close+1
+    // and end (after whitespace) is a chained method call → reject.
+    let tail = t.substring(close_at + 1, len(t)).trim()
+    if len(tail) == 0 { return true }
+    // Allow trailing whitespace only; otherwise reject as chained.
+    return false
+}
+
+// Track let-binding pass: record `let <name> = exec(...)` (no method chain)
+// and on subsequent lines flag `<name> <op> <int>` / `<int> <op> <name>`.
+fn _scan_file(path: string) -> array {
+    let src = to_string(read_file(path))
+    let lines = split(src, "\n")
+    let mut violations = []
+    // bound vars: array of strings (names whose RHS is a bare `exec(...)`).
+    let mut exec_vars = []
+    let mut lineno = 0
+    let mut idx = 0
+    while idx < len(lines) {
+        let raw = lines[idx]
+        lineno = lineno + 1
+        idx = idx + 1
+        if _is_comment_line(raw) { continue }
+        let allow_marker = "// exec_eq_int_lint: allow"
+        if raw.index_of(allow_marker) >= 0 { continue }
+
+        // Pass A: track `let [mut] <name> = exec(...)` bindings.
+        let trimmed = raw.trim()
+        if trimmed.starts_with("let ") {
+            // parse: "let mut? <name> = <rhs>"
+            let mut rest = trimmed.substring(4, len(trimmed)).trim()
+            if rest.starts_with("mut ") { rest = rest.substring(4, len(rest)).trim() }
+            let eq_at = rest.index_of("=")
+            if eq_at > 0 {
+                let name = rest.substring(0, eq_at).trim()
+                let rhs = rest.substring(eq_at + 1, len(rest)).trim()
+                // remove trailing comment
+                let cmt = rhs.index_of("//")
+                let rhs2 = if cmt >= 0 { rhs.substring(0, cmt).trim() } else { rhs }
+                if _is_exec_call(rhs2) {
+                    // record name only if it's a simple identifier
+                    if len(name) > 0 && !contains(name, " ") && !contains(name, ":") {
+                        exec_vars.push(name)
+                    }
+                }
+            }
+        }
+
+        // Pass B: detect comparison `<lhs> <op> <rhs>` where one side is
+        // exec(...) or a let-bound exec variable, and the other side is int.
+        let op_pos = _find_comparison_op(raw)
+        if op_pos < 0 { continue }
+        let op = _op_at(raw, op_pos)
+        if len(op) == 0 { continue }
+        let lhs_raw = raw.substring(0, op_pos)
+        let rhs_raw = raw.substring(op_pos + len(op), len(raw))
+        let lhs = _normalize_lhs(lhs_raw)
+        let rhs = _normalize_rhs(rhs_raw)
+
+        let lhs_exec = _is_exec_call(lhs)
+        let rhs_exec = _is_exec_call(rhs)
+        let mut lhs_is_bound = false
+        let mut rhs_is_bound = false
+        let mut bv = 0
+        while bv < len(exec_vars) {
+            if lhs == exec_vars[bv] { lhs_is_bound = true }
+            if rhs == exec_vars[bv] { rhs_is_bound = true }
+            bv = bv + 1
+        }
+
+        let lhs_int = _is_int_literal(lhs)
+        let rhs_int = _is_int_literal(rhs)
+
+        let exec_side = lhs_exec || lhs_is_bound || rhs_exec || rhs_is_bound
+        let int_side = lhs_int || rhs_int
+        if !(exec_side && int_side) { continue }
+        // both-int or both-exec: not the bug shape we care about
+        if (lhs_exec || lhs_is_bound) && (rhs_exec || rhs_is_bound) { continue }
+        if lhs_int && rhs_int { continue }
+
+        let kind = if (lhs_exec || rhs_exec) { "direct" } else { "let-bound" }
+        violations.push([path, to_string(lineno), kind, op,
+                         "exec() result vs int literal — exec returns string; use exec_with_status(cmd)[1] for exit code"])
+    }
+    return violations
+}
+
+// ── CLI ────────────────────────────────────────────────────────
+let _raw_args = args()
+let mut cli = []
+let mut _ai = 2
+while _ai < len(_raw_args) {
+    cli.push(_raw_args[_ai])
+    _ai = _ai + 1
+}
+
+let mut root = ""
+let mut ext_arg = ""
+let mut single_file = ""
+let mut i = 0
+while i < len(cli) {
+    let a = cli[i]
+    if a == "--path" {
+        if i + 1 < len(cli) { root = cli[i + 1]; i = i + 1 }
+    } else if a == "--ext" {
+        if i + 1 < len(cli) { ext_arg = cli[i + 1]; i = i + 1 }
+    } else if a == "--file" {
+        if i + 1 < len(cli) { single_file = cli[i + 1]; i = i + 1 }
+    }
+    i = i + 1
+}
+
+let mut files = []
+if len(single_file) > 0 {
+    files.push(single_file)
+} else {
+    if len(root) == 0 { root = _pwd() }
+    let exts = if len(ext_arg) > 0 { split(ext_arg, ",") } else { ["hexa"] }
+    files = _scan_path(root, exts)
+}
+
+println("── exec_eq_int_lint ── scanning " + to_string(len(files)) + " file(s)")
+
+let mut all_errors = 0
+let mut fi = 0
+while fi < len(files) {
+    let f = files[fi]
+    let vs = _scan_file(f)
+    let mut vi = 0
+    while vi < len(vs) {
+        let v = vs[vi]
+        let line = "  " + v[0] + ":" + v[1] + ": WARN [exec-eq-int-literal] (" + v[2] + " " + v[3] + ") " + v[4]
+        eprintln(line)
+        eprintln("    fix: let r = exec_with_status(cmd); if r[1] == <int> { ... }")
+        all_errors = all_errors + 1
+        vi = vi + 1
+    }
+    fi = fi + 1
+}
+
+println("── done: violations=" + to_string(all_errors))
+if all_errors > 0 { exit(1) }
+exit(0)

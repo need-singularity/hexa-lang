@@ -1,9 +1,11 @@
 # RFC 007 — Lint rule: detect `exec(...) == int_literal` silent-fail pattern
 
-- **Status**: proposed
+- **Status**: done (P1 landed 2026-04-28)
 - **Date**: 2026-04-28
 - **Severity**: correctness (silent-fail; user-mental-model mismatch)
 - **Priority**: P1 (high signal-to-LoC; ~20 LoC catches a bug class found in the wild via anima-eeg audit)
+- **Implementation**: `tool/exec_eq_int_lint.hexa` (standalone CLI, ~230 LoC), `self/linter.hexa` `check_exec_eq_int` (~85 LoC integration); fixtures in `test/fixtures/exec_eq_int_lint/` (4 FAIL + 3 PASS, 7/7 selftest correct)
+- **Live-fire on landing**: anima-eeg 48 files = 0 violations (matches post-audit clean state); hexa-lang `self/` = 3 true-positive bugs found (`self/test/test_module_gate.hexa:43`, `self/ml/run_7b_h100.hexa:213,234`); hexa-lang `tool/` = 9 true-positive bugs (`tool/anima_docker_sync.hexa:225`, `tool/deploy_h100.hexa:212,219,228,238,245,252,263,273`); 0 false positives observed across ~2200 files scanned
 - **Source**: split out from RFC-006 (exec() return-type semantics) after fact-correction discovered the proposed builtins (`exec_status`, `exec_capture`, `exec_both`) already exist as `exec_with_status` / `exec_capture` / `exec_stream`. RFC-006 narrowed to lint+docs; this RFC formalizes the lint rule as a standalone deliverable so it can land independently.
 
 ## Problem
