@@ -1,6 +1,6 @@
 # RFC 008 — Project-relative helper invocation primitive (`project_python()` / `project_helper_runner()`)
 
-- **Status**: proposed
+- **Status**: done (P1 Form A landed 2026-04-28)
 - **Date**: 2026-04-28
 - **Severity**: correctness (silent drift across helpers — venv-dependent project class)
 - **Priority**: P1 (anima-eeg-class venv-dependent projects: critical; general projects: ergonomic)
@@ -132,3 +132,18 @@ Placeholder ID: `hexa-lang/issues/TBD-g7-project-relative-helper-invocation`
 - **Generality honesty**: Form B (helper-kind dispatch) is speculative — only Python is in-evidence. Recommend landing Form A first; defer Form B until a 2nd helper-kind shows up in the wild.
 - **Fallback-4 raw#10 surface**: the system-python fallback path **must** emit the warning; if implementation silently falls through without warning, the RFC is anti-falsified (the warning is the load-bearing safety net). Implementer must dogfood the warning surface in the regression test.
 - **No silent-drift claim**: this RFC does not eliminate the possibility of project_python returning a venv that itself lacks the needed dependencies. It only eliminates the case where **the wrong interpreter** is chosen. Dependency-completeness in the venv is a project-side discipline (e.g. `.venv-eeg/requirements.txt` audit).
+
+## Landing Record (2026-04-28)
+
+- **Form A landed** in `self/stdlib/path.hexa` (was tentatively proposed for `self/stdlib/proc.hexa`; chose `path.hexa` because it is a path-resolution operation, not an exec primitive — `proc.hexa` does not yet exist as a separate module).
+- **LoC added**: ~63 stdlib (function + doc-comment) + ~52 selftest = ~115 LoC total.
+- **Selftest**: `__PATH_SELFTEST__ PASS n=25 fail=0` (was n=20 pre-RFC-008; +5 cases for project_python: .venv-eeg / .venv / preference-order / fallback-4 / trailing-slash idempotency).
+- **Live evidence**:
+  - `project_python("/Users/ghost/core/anima")` → `/Users/ghost/core/anima/.venv-eeg/bin/python` (correct).
+  - No-venv → `python3` + raw 10 stderr warn fires (verified eyeball — fallback-4 anti-falsifier check satisfied).
+  - `ANIMA_EEG_VENV_PYTHON=/custom/path` override → `/custom/path` (step-3 env override).
+  - Generic `PROJECT_PYTHON=/generic/python` also honored (added per raw 91 generality concern — anima-eeg-only naming was too narrow).
+- **raw 18 self-host fixpoint**: 0 impact. `self/stdlib/path.hexa` is not imported by the self-host compiler chain (verified via grep over `self/`); module is consumer-side only.
+- **Form B (helper-kind dispatch) deferred**: as recommended in §"Proposed API". Will land iff a 2nd helper-kind (Node/Lua/Ruby) shows in-the-wild evidence.
+- **anima-eeg helper migration**: deferred to anima-eeg side commits. Sample migration call form: `let py = project_python("/Users/ghost/core/anima")` then `exec(py + " /tmp/helper.py ...")` replaces hard-coded `.venv-eeg/bin/python`.
+- **Cross-platform note**: implementation is POSIX-only (`bin/python` shim). Linux uses identical `.venv-eeg/bin/python` layout — verified by inspection of venv standard. Windows (`Scripts/python.exe`) is out of scope per RFC-008 §"Compatibility" (hexa runtime target is Mac + Linux per `path.hexa` header).

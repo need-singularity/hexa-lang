@@ -1,11 +1,31 @@
 # RFC 001 — popen_lines() / process_spawn() streaming subprocess stdlib
 
-- **Status**: proposed
+- **Status**: partial-landed (capture-and-split wrapper) — streaming form deferred
 - **Date**: 2026-04-28
 - **Severity**: BLOCKER
 - **Priority**: P0
 - **Source convergence**: convergence/hexa_lang_upstream_2026_04_28_anima_eeg_gaps.convergence (gap 1)
 - **Source session**: anima-eeg D-day (electrode_adjustment_helper.hexa --live mode iter1-iter4)
+
+## Implementation Status (2026-04-28 update)
+
+- **`self/stdlib/proc.hexa`** landed: `popen_lines(cmd) -> [string]` and
+  `popen_lines_with_status(cmd) -> [[string], int]` as hexa-only wrappers
+  over the existing `exec_with_status` builtin. Selftest 5/5 PASS
+  (`hexa run self/stdlib/proc.hexa --selftest`). Zero impact on raw#18
+  self-host fixpoint (new file, not referenced from `self/main.hexa`
+  bootstrap chain).
+- **NOT landed (raw#10 honest C3)**: the streaming iterator form
+  (`for line in popen_lines(...)` consuming stdout incrementally as
+  the subprocess emits) and `process_spawn() -> Process` handle. The
+  current wrapper buffers ALL stdout via `exec_with_status` and THEN
+  splits — it does NOT satisfy this RFC's falsifier (sub-second per-line
+  latency while subprocess still alive). True streaming requires a new
+  C builtin (pipe + fork + readline loop) and is tracked as a separate
+  cycle.
+- **Anima-eeg gap status**: closed for the find/grep/git-log line-by-line
+  capture use case (the dominant pattern). NOT closed for the
+  `electrode_adjustment_helper.hexa --live` per-tick streaming case.
 
 ## Problem
 
