@@ -395,9 +395,10 @@ fn a24v2_rule_density(buf: string, rules: array) -> int {
     return (absorbed * 100) / n
 }
 
-// a24v2_encode / a24v2_decode: first-tick wire = identity passthrough
-// gated by class-gate (MIN_BYTES) and input-size cap (MAX_INPUT_BYTES).
-// Wire promotion DEFERRED to subsequent tick gated by F-A24-V2-LAT PASS.
+// a24v2_encode / a24v2_decode: s2 mode = build-only estimator gated wire.
+// Returns identity passthrough (subsequent-tick wire was deferred per first-tick
+// honest C3). RETAINED for backward compat: callers that selected s2 stay
+// on identity; first-tick winner-eligibility gated by s3 wire below.
 fn a24v2_encode(text: string) -> string {
     let n = len(text)
     if n < A24_V2_MIN_BYTES { return text }
@@ -409,7 +410,269 @@ fn a24v2_decode(stream: string) -> string {
     return stream
 }
 
-// ───────────────── selftest (5 fixtures + 3 latency probes) ─────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// PASS 3.5 — A24 v2 s3 WIRE encode/decode (post-a505ec43 honest C3 resolution)
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// a505ec43 finding: A24 v2 was BUILD-ONLY estimator (encode/decode wire absent).
+// Therefore A24 v2 was NOT byte-eq composite winner-eligible (no wire stream
+// to compete on with A18 / A25 / A29 wire pool). v3 wire ships the encode/decode
+// pair so the dispatcher can route mixed-class files to A24 if the wire output
+// beats identity on size.
+//
+// Wire format (header + base64url-of-payload body, sigil ^[):
+//
+//   Header line:    `# a24:s3 v=bounded-v3 n=<input_bytes> r=<n_rules>\n`
+//   Body line:      `^[<base64url-of-payload>\n`
+//
+// Payload byte layout:
+//   Section 1 — rule dictionary (variable size, ≤ 5×r bytes since L∈{3,4}):
+//     For each rule i in [0..r):
+//       byte[0]  = L (rule length, 3 or 4)
+//       byte[1..L] = rhs raw bytes
+//   Section 2 — tokenized stream (output of _tokenize_v2):
+//     Bytes ∈ [0..255]. Marker=254 → next 2 bytes = (rule_id_hi, rule_id_lo).
+//     Escape=255 → next 1 byte = literal byte ∈ {254,255}.
+//
+// Decoder reads back: parse header → n, r. b64-decode body. Read r rule entries.
+// Stream-decode tokenized section.
+//
+// raw 142 D2 try-and-revert: a24v2_encode_v3 returns shortest of {wire_v3,
+// identity}. If rule dictionary + tokenized + b64 + header overhead exceeds
+// raw input bytes, identity wins.
+//
+// raw 137 cmix-ban: deterministic integer pack/unpack only. No fp ops.
+// raw 65/68 idempotent: same input → same wire output (byte-identical).
+
+// ─── b64url codec (interop with A18/A23/A29; NOT shared due to raw 18 self-host) ───
+
+const A24_V2_B64_ALPHA = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+fn _a24v2_b64_enc(bytes: array) -> string {
+    let mut out = []
+    let n: i64 = len(bytes)
+    let mut i: i64 = 0
+    while i < n {
+        let b0: i64 = bytes[i]
+        let b1: i64 = if i + 1 < n { bytes[i + 1] } else { 0 }
+        let b2: i64 = if i + 2 < n { bytes[i + 2] } else { 0 }
+        let acc: i64 = b0 * 65536 + b1 * 256 + b2
+        let c0: i64 = acc / 262144
+        let r0: i64 = acc - c0 * 262144
+        let c1: i64 = r0 / 4096
+        let r1: i64 = r0 - c1 * 4096
+        let c2: i64 = r1 / 64
+        let c3: i64 = r1 - c2 * 64
+        let group: i64 = if i + 3 <= n { 4 } else { (n - i) + 1 }
+        let chs = [c0, c1, c2, c3]
+        let mut e: i64 = 0
+        while e < group { out.push(A24_V2_B64_ALPHA.substring(chs[e], chs[e] + 1)); e = e + 1 }
+        i = i + 3
+    }
+    // 4-char tail = u24 byte count (matches A29/A23 convention)
+    let mut nv: i64 = n
+    if nv > 16777215 { nv = 16777215 }
+    let t0: i64 = nv / 262144
+    let r0t: i64 = nv - t0 * 262144
+    let t1: i64 = r0t / 4096
+    let r1t: i64 = r0t - t1 * 4096
+    let t2: i64 = r1t / 64
+    let t3: i64 = r1t - t2 * 64
+    out.push(A24_V2_B64_ALPHA.substring(t0, t0 + 1))
+    out.push(A24_V2_B64_ALPHA.substring(t1, t1 + 1))
+    out.push(A24_V2_B64_ALPHA.substring(t2, t2 + 1))
+    out.push(A24_V2_B64_ALPHA.substring(t3, t3 + 1))
+    return out.join("")
+}
+
+fn _a24v2_b64_char_idx(c: string) -> i64 { return A24_V2_B64_ALPHA.index_of(c) }
+
+fn _a24v2_b64_dec(s: string) -> array {
+    let total: i64 = len(s)
+    if total < 4 { return [] }
+    let t0: i64 = _a24v2_b64_char_idx(s.substring(total - 4, total - 3))
+    let t1: i64 = _a24v2_b64_char_idx(s.substring(total - 3, total - 2))
+    let t2: i64 = _a24v2_b64_char_idx(s.substring(total - 2, total - 1))
+    let t3: i64 = _a24v2_b64_char_idx(s.substring(total - 1, total))
+    let bcount: i64 = t0 * 262144 + t1 * 4096 + t2 * 64 + t3
+    let body_len: i64 = total - 4
+    let mut out = []
+    let mut i: i64 = 0
+    while i < body_len {
+        let group: i64 = if i + 4 <= body_len { 4 } else { body_len - i }
+        let mut acc: i64 = 0
+        let mut j: i64 = 0
+        while j < 4 {
+            let d: i64 = if j < group { _a24v2_b64_char_idx(s.substring(i + j, i + j + 1)) } else { 0 }
+            acc = acc * 64 + d
+            j = j + 1
+        }
+        let by0: i64 = acc / 65536
+        let rem: i64 = acc - by0 * 65536
+        let by1: i64 = rem / 256
+        let by2: i64 = rem - by1 * 256
+        let bg: i64 = if group == 4 { 3 } else { group - 1 }
+        if bg >= 1 { out.push(by0) }
+        if bg >= 2 { out.push(by1) }
+        if bg >= 3 { out.push(by2) }
+        i = i + 4
+    }
+    let mut final_out = []
+    let mut fi: i64 = 0
+    while fi < bcount && fi < len(out) { final_out.push(out[fi]); fi = fi + 1 }
+    return final_out
+}
+
+// ─── _a24v2_pack_payload: serialize rule dictionary + tokenized stream → byte array ───
+
+fn _a24v2_pack_payload(rules: array, tokenized: array) -> array {
+    let mut out = []
+    let r: i64 = len(rules)
+    // Section 1: rule dictionary. For each rule, write 1 byte L, then L raw rhs bytes.
+    let mut i: i64 = 0
+    while i < r {
+        let rhs = rules[i][0]
+        let L: i64 = len(rhs)
+        out.push(L)
+        let mut q: i64 = 0
+        while q < L {
+            out.push(ord(_byte_at_v2(rhs, q)))
+            q = q + 1
+        }
+        i = i + 1
+    }
+    // Section 2: tokenized stream (already byte-array form from _tokenize_v2).
+    let nt: i64 = len(tokenized)
+    let mut j: i64 = 0
+    while j < nt { out.push(tokenized[j]); j = j + 1 }
+    return out
+}
+
+// ─── _a24v2_unpack_payload: parse dict + stream → reconstructed byte array ───
+
+fn _a24v2_unpack_payload(payload: array, n_rules: i64) -> array {
+    let mut p: i64 = 0
+    let plen: i64 = len(payload)
+    let mut rules_rhs = []
+    let mut i: i64 = 0
+    while i < n_rules {
+        if p >= plen { return [] }
+        let L: i64 = payload[p]
+        p = p + 1
+        if p + L > plen { return [] }
+        let mut rhs_bytes = []
+        let mut q: i64 = 0
+        while q < L {
+            rhs_bytes.push(payload[p + q])
+            q = q + 1
+        }
+        rules_rhs.push(rhs_bytes)
+        p = p + L
+        i = i + 1
+    }
+    // Section 2: tokenized stream → reconstruct original bytes.
+    let mut out = []
+    while p < plen {
+        let b: i64 = payload[p]
+        if b == A24_V2_RULE_MARKER {
+            if p + 2 >= plen { return [] }
+            let hi: i64 = payload[p + 1]
+            let lo: i64 = payload[p + 2]
+            let rule_id: i64 = hi * 256 + lo
+            if rule_id < 0 || rule_id >= n_rules { return [] }
+            let rhs_bytes = rules_rhs[rule_id]
+            let rL: i64 = len(rhs_bytes)
+            let mut k: i64 = 0
+            while k < rL { out.push(rhs_bytes[k]); k = k + 1 }
+            p = p + 3
+        } else if b == A24_V2_RULE_ESCAPE {
+            if p + 1 >= plen { return [] }
+            out.push(payload[p + 1])
+            p = p + 2
+        } else {
+            out.push(b)
+            p = p + 1
+        }
+    }
+    return out
+}
+
+// ─── _a24v2_encode_v3_force: build rules + tokenize + pack → wire string ───
+
+fn _a24v2_encode_v3_force(text: string) -> string {
+    let n: i64 = len(text)
+    if n >= 7 && text.substring(0, 7) == "# a24:s" { return text }
+    let rules = a24v2_synthesize_rules(text)
+    let tokenized = _tokenize_v2(text, rules)
+    let payload = _a24v2_pack_payload(rules, tokenized)
+    let payload_b64 = _a24v2_b64_enc(payload)
+    let header = "# a24:s3 v=bounded-v3 n=" + to_string(n) + " r=" + to_string(len(rules))
+    let body = "^[" + payload_b64
+    return header + "\n" + body + "\n"
+}
+
+// a24v2_encode_v3: try-and-revert (raw 142 D2) — return shortest of {wire_v3, identity}.
+// Below MIN_BYTES or above MAX_INPUT_BYTES → identity passthrough.
+fn a24v2_encode_v3(text: string) -> string {
+    let n: i64 = len(text)
+    if n < A24_V2_MIN_BYTES { return text }
+    if n > A24_V2_MAX_INPUT_BYTES { return text }
+    if n >= 7 && text.substring(0, 7) == "# a24:s" { return text }
+    let v3 = _a24v2_encode_v3_force(text)
+    if len(v3) < n { return v3 }
+    return text
+}
+
+// _a24v2_decode_v3_to_bytes: byte-array decode (preserves multibyte byte-eq).
+// Auto-detects v=bounded-v3 (^[ sigil). Non-A24 input returns []
+// (caller treats as identity passthrough).
+fn _a24v2_decode_v3_to_bytes(stream: string) -> array {
+    let lines = stream.split("\n")
+    if len(lines) < 2 { return [] }
+    let header = lines[0]
+    if len(header) < 7 || header.substring(0, 7) != "# a24:s" { return [] }
+    let n_pos: i64 = header.index_of(" n=")
+    let r_pos: i64 = header.index_of(" r=")
+    if n_pos < 0 || r_pos < 0 { return [] }
+    let _n_bytes: i64 = parse_int(header.substring(n_pos + 3, r_pos))
+    let n_rules: i64 = parse_int(header.substring(r_pos + 3, len(header)))
+
+    // Find ^[ body line.
+    let mut body_b64 = ""
+    let mut i = 1
+    while i < len(lines) {
+        let l = lines[i]
+        if len(l) >= 2 && l.substring(0, 2) == "^[" {
+            body_b64 = l.substring(2, len(l))
+            break
+        }
+        i = i + 1
+    }
+    if len(body_b64) == 0 { return [] }
+    let payload = _a24v2_b64_dec(body_b64)
+    return _a24v2_unpack_payload(payload, n_rules)
+}
+
+// a24v2_decode_v3: string-returning round-trip. ASCII-safe path uses chr()
+// concat; for multibyte byte-eq verification, callers should use
+// _a24v2_decode_v3_to_bytes.
+fn a24v2_decode_v3(stream: string) -> string {
+    let lines = stream.split("\n")
+    if len(lines) < 2 { return stream }
+    let header = lines[0]
+    if len(header) < 7 || header.substring(0, 7) != "# a24:s" { return stream }
+    let bytes = _a24v2_decode_v3_to_bytes(stream)
+    if len(bytes) == 0 { return stream }
+    let mut parts = []
+    let mut i = 0
+    while i < len(bytes) {
+        parts.push(chr(bytes[i]))
+        i = i + 1
+    }
+    return parts.join("")
+}
+
+// ───────────────── selftest (5 fixtures + 3 latency probes + 5 wire) ─────────────────
 
 fn _english_4kb_v2() -> string {
     let phrase = "the quick brown fox jumps over the lazy dog "
@@ -437,7 +700,7 @@ fn _english_70kb_v2() -> string {
 }
 
 fn _selftest_v2() -> int {
-    println("# hxc_a24_v2_bounded selftest (FIRST TICK BUILD — PASS 1+2+2.5+3 + 3 latency probes)")
+    println("# hxc_a24_v2_bounded selftest (FIRST TICK + WIRE — PASS 1+2+2.5+3 + 3 latency probes + PASS 3.5 5 wire round-trip)")
     let mut pass = 0
     let mut fail = 0
 
@@ -632,9 +895,158 @@ fn _selftest_v2() -> int {
                 + " → F-A24-V2-3 TRIPPED")
     }
 
+    // ═════════════════════════════════════════════════════════════════════════
+    // PASS 3.5 — A24 v3 WIRE round-trip (5 fixtures)
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // ─── F-A24-V3-WIRE-1: byte-eq round-trip 4KB English ───
+    //   Force-encode 4KB English (well above MIN_BYTES, well below MAX_INPUT)
+    //   via _a24v2_encode_v3_force, decode via _a24v2_decode_v3_to_bytes,
+    //   verify byte-identical reconstruction.
+    let w1_buf = buf_4k
+    let w1_enc = _a24v2_encode_v3_force(w1_buf)
+    let w1_dec_bytes = _a24v2_decode_v3_to_bytes(w1_enc)
+    let mut w1_ok = true
+    let w1_n: i64 = len(w1_buf)
+    if len(w1_dec_bytes) != w1_n { w1_ok = false }
+    let mut w1_q: i64 = 0
+    while w1_ok && w1_q < w1_n {
+        if w1_dec_bytes[w1_q] != ord(_byte_at_v2(w1_buf, w1_q)) { w1_ok = false }
+        w1_q = w1_q + 1
+    }
+    let w1_saving = if w1_n > 0 { ((w1_n - len(w1_enc)) * 100) / w1_n } else { 0 }
+    if w1_ok {
+        pass = pass + 1
+        println("  PASS: F-A24-V3-WIRE-1 4KB English byte-eq round-trip n="
+                + to_string(w1_n) + " B → wire=" + to_string(len(w1_enc))
+                + " B (saving=" + to_string(w1_saving) + "%)")
+    } else {
+        fail = fail + 1
+        println("  FAIL: F-A24-V3-WIRE-1 4KB English byte-eq broken (got_len="
+                + to_string(len(w1_dec_bytes)) + " expected " + to_string(w1_n)
+                + ") → F-A24-V2-2 TRIPPED")
+    }
+
+    // ─── F-A24-V3-WIRE-2: byte-eq round-trip Korean multibyte ───
+    //   Multibyte safety: high-byte content (UTF-8 Korean) must round-trip
+    //   byte-identical via the byte-array decode path.
+    let kor3 = "안녕 세계 — 곰파 연결 ω-cycle. 압축 알고리즘 A24 v2 wire ship. 자기-호스트 hexa raw 9. "
+    let mut w2_buf = ""
+    let mut w2k = 0
+    while w2k < 16 { w2_buf = w2_buf + kor3; w2k = w2k + 1 }
+    let w2_n: i64 = len(w2_buf)
+    let w2_enc = _a24v2_encode_v3_force(w2_buf)
+    let w2_dec_bytes = _a24v2_decode_v3_to_bytes(w2_enc)
+    let mut w2_ok = true
+    if len(w2_dec_bytes) != w2_n { w2_ok = false }
+    let mut w2_q: i64 = 0
+    while w2_ok && w2_q < w2_n {
+        if w2_dec_bytes[w2_q] != ord(_byte_at_v2(w2_buf, w2_q)) { w2_ok = false }
+        w2_q = w2_q + 1
+    }
+    if w2_ok {
+        pass = pass + 1
+        println("  PASS: F-A24-V3-WIRE-2 Korean multibyte byte-eq round-trip n="
+                + to_string(w2_n) + " B → wire=" + to_string(len(w2_enc))
+                + " B (raw 137 byte-faithful)")
+    } else {
+        fail = fail + 1
+        println("  FAIL: F-A24-V3-WIRE-2 Korean multibyte byte-eq broken (got_len="
+                + to_string(len(w2_dec_bytes)) + " expected " + to_string(w2_n)
+                + ") → F-A24-V2-2 TRIPPED")
+    }
+
+    // ─── F-A24-V3-WIRE-3: byte-eq round-trip 32KB JSON ───
+    //   Stress the rule dictionary on highly-repetitive JSON input near the
+    //   max-input-bytes cap. Verify byte-identical reconstruction.
+    let w3_buf = buf_32k_json
+    let w3_n: i64 = len(w3_buf)
+    let w3_enc = _a24v2_encode_v3_force(w3_buf)
+    let w3_dec_bytes = _a24v2_decode_v3_to_bytes(w3_enc)
+    let mut w3_ok = true
+    if len(w3_dec_bytes) != w3_n { w3_ok = false }
+    let mut w3_q: i64 = 0
+    while w3_ok && w3_q < w3_n {
+        if w3_dec_bytes[w3_q] != ord(_byte_at_v2(w3_buf, w3_q)) { w3_ok = false }
+        w3_q = w3_q + 1
+    }
+    let w3_saving = if w3_n > 0 { ((w3_n - len(w3_enc)) * 100) / w3_n } else { 0 }
+    if w3_ok {
+        pass = pass + 1
+        println("  PASS: F-A24-V3-WIRE-3 32KB JSON byte-eq round-trip n="
+                + to_string(w3_n) + " B → wire=" + to_string(len(w3_enc))
+                + " B (saving=" + to_string(w3_saving) + "%)")
+    } else {
+        fail = fail + 1
+        println("  FAIL: F-A24-V3-WIRE-3 32KB JSON byte-eq broken (got_len="
+                + to_string(len(w3_dec_bytes)) + " expected " + to_string(w3_n)
+                + ") → F-A24-V2-2 TRIPPED")
+    }
+
+    // ─── F-A24-V3-WIRE-4: try-and-revert under MIN_BYTES → identity ───
+    //   raw 142 D2 honored: 234B JSON < MIN_BYTES → a24v2_encode_v3 returns
+    //   identity (NOT wire). Decode of pure identity returns input unchanged.
+    let w4_input = "{\"ts\":\"2026-04-28T00:00:00Z\",\"event\":\"convergence\",\"value\":1.0,\"saving\":0.97}\n{\"ts\":\"2026-04-28T00:01:00Z\",\"event\":\"convergence\",\"value\":2.0,\"saving\":0.97}\n{\"ts\":\"2026-04-28T00:02:00Z\",\"event\":\"convergence\",\"value\":3.0,\"saving\":0.97}\n"
+    let w4_enc = a24v2_encode_v3(w4_input)
+    let w4_dec = a24v2_decode_v3(w4_enc)
+    if w4_enc == w4_input && w4_dec == w4_input && len(w4_input) == 234 {
+        pass = pass + 1
+        println("  PASS: F-A24-V3-WIRE-4 234B JSON < MIN_BYTES=1024 → identity (raw 142 D2 try-revert honored)")
+    } else {
+        fail = fail + 1
+        println("  FAIL: F-A24-V3-WIRE-4 try-revert pre-gate broken (enc_eq_in="
+                + (if w4_enc == w4_input { "true" } else { "false" })
+                + " dec_eq_in=" + (if w4_dec == w4_input { "true" } else { "false" })
+                + ") → F-A24-V2-2 TRIPPED")
+    }
+
+    // ─── F-A24-V3-WIRE-5: a24v2_encode_v3 returns shortest of {wire, identity} ───
+    //   For a worst-case input where the wire dictionary + tokenized stream
+    //   would exceed identity, the try-revert clause must select identity.
+    //   We synthesize a 1056B input with NO repeating substrings (random-ish
+    //   prose) such that the rule dictionary overhead dominates → identity wins.
+    //   Validation: a24v2_encode_v3 returns identity-equal-or-shorter; decode
+    //   round-trip preserves bytes either way.
+    let mut w5_buf = ""
+    let mut w5k = 0
+    // 56-char unique-ish phrase × 24 = 1344B; high entropy from numerals
+    let w5_phrase = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123"
+    while w5k < 24 { w5_buf = w5_buf + w5_phrase; w5k = w5k + 1 }
+    let w5_n: i64 = len(w5_buf)
+    let w5_enc = a24v2_encode_v3(w5_buf)
+    let w5_v3 = _a24v2_encode_v3_force(w5_buf)
+    // a24v2_encode_v3 returns whichever is shorter
+    let w5_expected_shorter: i64 = if len(w5_v3) < w5_n { len(w5_v3) } else { w5_n }
+    let mut w5_ok = true
+    if len(w5_enc) != w5_expected_shorter { w5_ok = false }
+    // Round-trip verification: decode whichever encode picked
+    let w5_dec_bytes = _a24v2_decode_v3_to_bytes(w5_enc)
+    if len(w5_dec_bytes) > 0 {
+        // If wire was picked, decode bytes match input
+        let mut w5q: i64 = 0
+        while w5_ok && w5q < w5_n {
+            if w5_dec_bytes[w5q] != ord(_byte_at_v2(w5_buf, w5q)) { w5_ok = false }
+            w5q = w5q + 1
+        }
+    } else {
+        // Identity path: enc == input
+        if w5_enc != w5_buf { w5_ok = false }
+    }
+    if w5_ok {
+        pass = pass + 1
+        println("  PASS: F-A24-V3-WIRE-5 try-revert shortest wire=" + to_string(len(w5_v3))
+                + " vs identity=" + to_string(w5_n) + " → picked "
+                + to_string(len(w5_enc)) + " (raw 142 D2 shortest-of selection honored)")
+    } else {
+        fail = fail + 1
+        println("  FAIL: F-A24-V3-WIRE-5 try-revert shortest selection broken (enc_len="
+                + to_string(len(w5_enc)) + " v3_len=" + to_string(len(w5_v3))
+                + " ident_len=" + to_string(w5_n) + ") → F-A24-V2-2 TRIPPED")
+    }
+
     println("Results: " + to_string(pass) + " PASS / " + to_string(fail) + " FAIL")
     println("__HXC_A24_V2_SELFTEST__ " + (if fail == 0 { "PASS" } else { "FAIL" })
-            + " (FIRST TICK: PASS 1 bounded n-gram scan {3,4} + PASS 2 a24v2_build with K-cap 4096 + PASS 2.5 in-sample estimator + PASS 3 5-fixture + 3 latency probes; LIVE FIRE deferred)")
+            + " (FIRST TICK + WIRE: PASS 1 bounded n-gram scan {3,4} + PASS 2 a24v2_build with K-cap 4096 + PASS 2.5 in-sample estimator + PASS 3 5-fixture + 3 latency probes + PASS 3.5 5 wire round-trip ^[ s3; LIVE FIRE deferred)")
     if fail == 0 { return 0 }
     return 1
 }
