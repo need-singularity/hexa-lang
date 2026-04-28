@@ -1,0 +1,387 @@
+// self/stdlib/openai_sdk.hexa — OpenAI Chat Completions API shim
+//
+// AI-NATIVE COMMENT BLOCK
+// ─────────────────────────────────────────────────────────────────
+// RATIONALE
+//   Second of 5 vendor SDK shims (raw 91 INDEP-3) unblocking the hive
+//   packages/ai/ port. Hive .ts side imports `openai` and calls
+//   `client.chat.completions.create(params, { stream: true })`. We
+//   provide pure-hexa request build + SSE parse + delta extractors,
+//   plus a curl-shellout send().
+//
+// ENDPOINTS
+//   POST {base_url}/v1/chat/completions
+//     Header:  Authorization: Bearer <OPENAI_API_KEY>
+//     Header:  content-type: application/json
+//     Header:  OpenAI-Organization: <org>             (optional)
+//     Header:  OpenAI-Project: <proj>                 (optional)
+//     Body:    JSON { model, messages, tools?, tool_choice?,
+//                     temperature?, max_tokens?, stream?,
+//                     reasoning_effort? }
+//     Stream:  SSE frames with bare `data: {ChatCompletionChunk}` and
+//              a terminating `data: [DONE]` sentinel. No `event:` line.
+//
+// AUTH SCHEME
+//   Bearer token — env OPENAI_API_KEY (or provider-specific override
+//   like XAI_API_KEY, GROQ_API_KEY when base_url is overridden). The
+//   shim is base-URL agnostic — caller chooses the endpoint.
+//
+// CAVEATS (raw 91 honest C3)
+//   C1. Same TLS-via-curl shellout as anthropic_sdk. Pure-hexa for
+//       request build + response parse.
+//   C2. OpenAI omits `event:` in SSE — only `data:` lines. The parser
+//       flushes one event per blank-line frame, ignoring the `[DONE]`
+//       sentinel automatically (caller sees N data events, not N+1).
+//   C3. Function calling uses `tool_calls` deltas with index/function
+//       /arguments fragments. The aggregator reassembles arguments
+//       string but does NOT json_parse it — the OpenAI API streams
+//       partial JSON that may not be parseable until complete.
+//   C4. Reasoning effort (`minimal`/`low`/`medium`/`high`) supported
+//       passively — caller sets opts.reasoning_effort and we pass
+//       through. No model-specific clamping here (do that upstream).
+//   C5. Multi-modal image_url / input_audio blocks pass through as
+//       caller-built structures.
+//
+// raw 159 GAP
+//   Same as anthropic_sdk: GAP-A (HTTPS native) + GAP-B (streaming
+//   subprocess line iterator). See rfc_010_https_client.
+//
+// EXPORTS
+//   openai_build_request(opts: map) -> string
+//   openai_parse_sse_lines(lines: [string]) -> [map]
+//       Each event: {data: parsed_json | void, data_raw: string,
+//                    is_done: bool}
+//   openai_extract_text(events: [map]) -> string
+//   openai_extract_tool_calls(events: [map]) -> [map]
+//   openai_send(api_key, body_json, base_url, extra_headers) -> [bool, string]
+//   openai_selftest() -> int
+
+use "self/stdlib/json"
+use "self/stdlib/shell_escape"
+
+fn _has_key(d, k) -> bool {
+    if type_of(d) == "void" { return false }
+    let ks = d.keys()
+    let mut i = 0
+    let n = len(ks)
+    while i < n {
+        if ks[i] == k { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ─── request builder ────────────────────────────────────────
+pub fn openai_build_request(opts) -> string {
+    if !_has_key(opts, "model") {
+        eprintln("openai_build_request: missing 'model'")
+        exit(1)
+    }
+    if !_has_key(opts, "messages") {
+        eprintln("openai_build_request: missing 'messages'")
+        exit(1)
+    }
+    return json_stringify(opts)
+}
+
+// ─── SSE parser ─────────────────────────────────────────────
+//
+// OpenAI SSE has only `data:` lines (no `event:`). Frames are
+// blank-line separated. The terminal frame is `data: [DONE]`.
+// We surface that as a single event with is_done=true and data=void.
+pub fn openai_parse_sse_lines(lines) -> array {
+    let mut events = []
+    let mut cur_data_parts = []
+    let mut i = 0
+    let n = len(lines)
+    while i < n {
+        let raw = to_string(lines[i])
+        let mut line = raw
+        let ll = len(line)
+        if ll > 0 && line.substring(ll - 1, ll) == "\r" {
+            line = line.substring(0, ll - 1)
+        }
+        if line == "" {
+            if len(cur_data_parts) > 0 {
+                let joined = cur_data_parts.join("\n")
+                if joined == "[DONE]" {
+                    events.push(#{"data": void, "data_raw": joined, "is_done": true})
+                } else {
+                    let parsed = json_parse_safe(joined)
+                    let mut payload = void
+                    if parsed[0] {
+                        payload = parsed[1]
+                    }
+                    events.push(#{"data": payload, "data_raw": joined, "is_done": false})
+                }
+            }
+            cur_data_parts = []
+        } else {
+            if line.substring(0, 1) == ":" {
+                // comment — skip
+            } else {
+                let colon = line.find(":")
+                if colon >= 0 {
+                    let field = line.substring(0, colon)
+                    let mut value = line.substring(colon + 1, len(line))
+                    if len(value) > 0 && value.substring(0, 1) == " " {
+                        value = value.substring(1, len(value))
+                    }
+                    if field == "data" {
+                        cur_data_parts.push(value)
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    if len(cur_data_parts) > 0 {
+        let joined = cur_data_parts.join("\n")
+        if joined == "[DONE]" {
+            events.push(#{"data": void, "data_raw": joined, "is_done": true})
+        } else {
+            let parsed = json_parse_safe(joined)
+            let mut payload = void
+            if parsed[0] {
+                payload = parsed[1]
+            }
+            events.push(#{"data": payload, "data_raw": joined, "is_done": false})
+        }
+    }
+    return events
+}
+
+// ─── text extractor ────────────────────────────────────────
+//
+// Walks events, picks chunk.choices[0].delta.content, concatenates.
+pub fn openai_extract_text(events) -> string {
+    let mut chunks = []
+    let mut i = 0
+    let n = len(events)
+    while i < n {
+        let ev = events[i]
+        let d = ev["data"]
+        if type_of(d) != "void" && _has_key(d, "choices") {
+            let choices = d["choices"]
+            if type_of(choices) != "void" && len(choices) > 0 {
+                let choice0 = choices[0]
+                if _has_key(choice0, "delta") {
+                    let delta = choice0["delta"]
+                    if type_of(delta) != "void" && _has_key(delta, "content") {
+                        let c = delta["content"]
+                        if type_of(c) != "void" {
+                            chunks.push(to_string(c))
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return chunks.join("")
+}
+
+// ─── tool-call extractor ───────────────────────────────────
+//
+// OpenAI streams tool_calls as deltas:
+//   choices[0].delta.tool_calls = [
+//     { index: 0, id?: "call_..", type?: "function",
+//       function: { name?: "Read", arguments?: "{\"path\":" } }
+//   ]
+// We aggregate per-index and surface {id, name, arguments_json}.
+pub fn openai_extract_tool_calls(events) -> array {
+    let mut by_index = #{}
+    let mut order = []
+    let mut i = 0
+    let n = len(events)
+    while i < n {
+        let ev = events[i]
+        let d = ev["data"]
+        if type_of(d) != "void" && _has_key(d, "choices") {
+            let choices = d["choices"]
+            if type_of(choices) != "void" && len(choices) > 0 {
+                let choice0 = choices[0]
+                if _has_key(choice0, "delta") {
+                    let delta = choice0["delta"]
+                    if type_of(delta) != "void" && _has_key(delta, "tool_calls") {
+                        let tcs = delta["tool_calls"]
+                        if type_of(tcs) != "void" {
+                            let mut j = 0
+                            while j < len(tcs) {
+                                let tc = tcs[j]
+                                let idx = to_string(tc["index"])
+                                let mut entry = #{"id": "", "name": "", "arguments_json": ""}
+                                let mut existed = false
+                                if _has_key(by_index, idx) {
+                                    entry = by_index[idx]
+                                    existed = true
+                                }
+                                if !existed {
+                                    order.push(idx)
+                                }
+                                if _has_key(tc, "id") {
+                                    let v = to_string(tc["id"])
+                                    if v != "" { entry["id"] = v }
+                                }
+                                if _has_key(tc, "function") {
+                                    let f = tc["function"]
+                                    if type_of(f) != "void" {
+                                        if _has_key(f, "name") {
+                                            let nm = to_string(f["name"])
+                                            if nm != "" { entry["name"] = nm }
+                                        }
+                                        if _has_key(f, "arguments") {
+                                            entry["arguments_json"] = to_string(entry["arguments_json"]) + to_string(f["arguments"])
+                                        }
+                                    }
+                                }
+                                by_index[idx] = entry
+                                j = j + 1
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    let mut out = []
+    let mut k = 0
+    while k < len(order) {
+        out.push(by_index[order[k]])
+        k = k + 1
+    }
+    return out
+}
+
+// ─── send (curl exec) ───────────────────────────────────────
+pub fn openai_send(api_key: string, body_json: string, base_url: string, extra_headers: array) -> array {
+    let url = base_url + "/v1/chat/completions"
+    let mut header_args = ""
+    header_args = header_args + " -H " + shell_escape("Authorization: Bearer " + api_key)
+    header_args = header_args + " -H " + shell_escape("content-type: application/json")
+    let mut hi = 0
+    while hi < len(extra_headers) {
+        header_args = header_args + " -H " + shell_escape(to_string(extra_headers[hi]))
+        hi = hi + 1
+    }
+    let cmd = "curl -fsN --max-time 600 -X POST" + header_args +
+              " --data-binary " + shell_escape(body_json) +
+              " " + shell_escape(url)
+    let result = exec_with_status(cmd)
+    let body = to_string(result[0])
+    let rc = result[1]
+    if rc != 0 {
+        return [false, "curl rc=" + to_string(rc) + " body=" + body]
+    }
+    return [true, body]
+}
+
+// ─── selftest ───────────────────────────────────────────────
+pub fn openai_selftest() -> i64 {
+    let mut fail = 0
+    let mut n = 0
+
+    // T1: builder produces JSON containing model
+    n = n + 1
+    let req = openai_build_request(#{
+        "model": "gpt-4o",
+        "messages": [#{"role": "user", "content": "hi"}],
+        "stream": true
+    })
+    if req.find("gpt-4o") < 0 {
+        eprintln("FAIL T1 builder model")
+        fail = fail + 1
+    }
+
+    // T2: SSE parse — content delta accumulation
+    n = n + 1
+    let lines2 = [
+        "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}",
+        "",
+        "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"}}]}",
+        "",
+        "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" there\"}}]}",
+        "",
+        "data: [DONE]",
+        ""
+    ]
+    let evs2 = openai_parse_sse_lines(lines2)
+    if len(evs2) != 4 {
+        eprintln("FAIL T2 frame count=" + to_string(len(evs2)))
+        fail = fail + 1
+    }
+
+    // T3: text extract
+    n = n + 1
+    let txt = openai_extract_text(evs2)
+    if txt != "Hi there" {
+        eprintln("FAIL T3 text=" + txt)
+        fail = fail + 1
+    }
+
+    // T4: [DONE] flagged is_done
+    n = n + 1
+    let last = evs2[len(evs2) - 1]
+    if !last["is_done"] {
+        eprintln("FAIL T4 is_done not set on terminal")
+        fail = fail + 1
+    }
+
+    // T5: tool_calls aggregation across deltas
+    n = n + 1
+    let lines5 = [
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_x\",\"type\":\"function\",\"function\":{\"name\":\"Read\",\"arguments\":\"\"}}]}}]}",
+        "",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"path\\\":\"}}]}}]}",
+        "",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"/etc\\\"}\"}}]}}]}",
+        ""
+    ]
+    let evs5 = openai_parse_sse_lines(lines5)
+    let tcs = openai_extract_tool_calls(evs5)
+    if len(tcs) != 1 {
+        eprintln("FAIL T5 tc count=" + to_string(len(tcs)))
+        fail = fail + 1
+    } else {
+        let t = tcs[0]
+        if to_string(t["id"]) != "call_x" {
+            eprintln("FAIL T5b id=" + to_string(t["id"]))
+            fail = fail + 1
+        }
+        if to_string(t["name"]) != "Read" {
+            eprintln("FAIL T5c name=" + to_string(t["name"]))
+            fail = fail + 1
+        }
+    }
+
+    // T6: bare `data:` field-only lines (OpenAI sometimes sends keepalives)
+    n = n + 1
+    let lines6 = [": OPENROUTER PROCESSING", "", "data: [DONE]", ""]
+    let evs6 = openai_parse_sse_lines(lines6)
+    // The first frame is comment-only — produces no event. Then [DONE].
+    if len(evs6) != 1 {
+        eprintln("FAIL T6 keepalive count=" + to_string(len(evs6)))
+        fail = fail + 1
+    }
+
+    if fail == 0 {
+        println("__OPENAI_SDK_SELFTEST__ PASS n=" + to_string(n) + " fail=0")
+    } else {
+        println("__OPENAI_SDK_SELFTEST__ FAIL n=" + to_string(n) + " fail=" + to_string(fail))
+    }
+    return fail
+}
+
+// ─── --selftest argv gate ───────────────────────────────────
+let _oai_argv = args()
+let mut _oai_run = false
+let mut _oai_i = 0
+while _oai_i < len(_oai_argv) {
+    if _oai_argv[_oai_i] == "--selftest" { _oai_run = true }
+    if _oai_argv[_oai_i] == "--selftest-openai" { _oai_run = true }
+    _oai_i = _oai_i + 1
+}
+if _oai_run {
+    openai_selftest()
+}

@@ -1,0 +1,429 @@
+// self/stdlib/anthropic_sdk.hexa — Anthropic Messages API shim
+//
+// AI-NATIVE COMMENT BLOCK
+// ─────────────────────────────────────────────────────────────────
+// RATIONALE
+//   First of 5 vendor SDK shims (raw 91 INDEP-3) unblocking the hive
+//   packages/ai/ port (112 .ts files). The hive .ts side imports
+//   `@anthropic-ai/sdk` and calls `client.messages.stream(params)`.
+//   For hexa-native parity we expose:
+//     - request-body builders (pure-hexa, deterministic)
+//     - SSE response parser (pure-hexa, deterministic)
+//     - send() fn that invokes system `curl` for the actual HTTPS
+//       call (raw 91 honest: hexa runtime has no native TLS yet —
+//       see raw 159 GAP below).
+//
+// ENDPOINTS
+//   POST https://api.anthropic.com/v1/messages
+//     Header:  x-api-key: <ANTHROPIC_API_KEY>
+//     Header:  anthropic-version: 2023-06-01
+//     Header:  content-type: application/json
+//     Header:  anthropic-beta: <comma-separated-beta-features>     (optional)
+//     Body:    JSON { model, messages, max_tokens, system?, tools?,
+//                     stream?, temperature?, thinking?, ... }
+//     Stream:  Server-Sent Events with frames:
+//                event: message_start    data: {...}
+//                event: content_block_start  data: {...}
+//                event: content_block_delta  data: {type:"text_delta",...}
+//                event: content_block_stop   data: {...}
+//                event: message_delta    data: {...}
+//                event: message_stop     data: {...}
+//
+// AUTH SCHEME
+//   API-key bearer: env ANTHROPIC_API_KEY -> request header `x-api-key`.
+//   No SigV4 / OAuth / SDK middleware.
+//
+// CAVEATS (raw 91 honest C3)
+//   C1. Pure-hexa for request build + response parse. send() exec's
+//       /usr/bin/curl. Hard requirement: curl must be on PATH.
+//   C2. Streaming is NOT incremental: anthropic_send collects full
+//       stdout from curl before parsing. True line-by-line streaming
+//       requires hexa-runtime process_spawn (RFC-001 streaming form,
+//       not yet shipped).
+//   C3. tool_use / tool_result blocks are mapped to JSON dicts —
+//       caller code is responsible for tool execution + reply.
+//   C4. SSE retry / network flake handling is delegated to curl.
+//       This shim does NOT auto-retry on 429 / 529.
+//   C5. The fine-grained-tool-streaming / interleaved-thinking betas
+//       are passed via beta_features array — caller decides which.
+//
+// raw 159 GAP (hexa-lang upstream-proposal-mandate)
+//   GAP-A: native HTTPS client (TLS 1.2+, HTTP/1.1+H2 fallback, SSE
+//          chunked-transfer iterator). Currently shell out to curl.
+//          Tracked as upstream proposal `rfc_010_https_client`.
+//   GAP-B: streaming subprocess line iterator (RFC-001 §4 streaming
+//          form). Required for true incremental SSE consumption from
+//          curl stdout. Without this, send_stream() buffers fully.
+//
+// EXPORTS
+//   anthropic_build_request(opts: map) -> string
+//   anthropic_parse_sse_lines(lines: [string]) -> [map]
+//   anthropic_extract_text(events: [map]) -> string
+//   anthropic_extract_tool_calls(events: [map]) -> [map]
+//   anthropic_send(api_key, body_json, beta, base_url) -> [bool, string]
+//   anthropic_selftest() -> int  (0 on PASS)
+
+use "self/stdlib/json"
+use "self/stdlib/shell_escape"
+
+// ─── helpers ────────────────────────────────────────────────
+//
+// Map-key probe via the canonical JSON serialization. Avoids relying
+// on a `.has()` runtime that is not present on every hexa map type
+// (raw 91 L1 honest: `m.keys()` returns an array of strings; we walk
+// it). False-positive is impossible — keys are exact strings.
+fn _has_key(d, k) -> bool {
+    if type_of(d) == "void" { return false }
+    let ks = d.keys()
+    let mut i = 0
+    let n = len(ks)
+    while i < n {
+        if ks[i] == k { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ─── request builder ────────────────────────────────────────
+pub fn anthropic_build_request(opts) -> string {
+    if !_has_key(opts, "model") {
+        eprintln("anthropic_build_request: missing 'model'")
+        exit(1)
+    }
+    if !_has_key(opts, "messages") {
+        eprintln("anthropic_build_request: missing 'messages'")
+        exit(1)
+    }
+    if !_has_key(opts, "max_tokens") {
+        eprintln("anthropic_build_request: missing 'max_tokens'")
+        exit(1)
+    }
+    return json_stringify(opts)
+}
+
+// ─── SSE parser ─────────────────────────────────────────────
+//
+// Input: array of raw SSE lines as received from `curl -N` stdout.
+// Output: array of maps {event, data, data_raw} where `data` is
+// the parsed JSON value (or void if data was unparseable).
+pub fn anthropic_parse_sse_lines(lines) -> array {
+    let mut events = []
+    let mut cur_event = ""
+    let mut cur_data_parts = []
+    let mut i = 0
+    let n = len(lines)
+    while i < n {
+        let raw = to_string(lines[i])
+        let mut line = raw
+        let ll = len(line)
+        if ll > 0 && line.substring(ll - 1, ll) == "\r" {
+            line = line.substring(0, ll - 1)
+        }
+        if line == "" {
+            if cur_event != "" || len(cur_data_parts) > 0 {
+                let data_joined = cur_data_parts.join("\n")
+                let parsed = json_parse_safe(data_joined)
+                let mut payload = void
+                if parsed[0] {
+                    payload = parsed[1]
+                }
+                events.push(#{
+                    "event": cur_event,
+                    "data": payload,
+                    "data_raw": data_joined
+                })
+            }
+            cur_event = ""
+            cur_data_parts = []
+        } else {
+            if line.substring(0, 1) == ":" {
+                // comment — skip
+            } else {
+                let colon = line.find(":")
+                if colon < 0 {
+                    // field-name-only line; skip
+                } else {
+                    let field = line.substring(0, colon)
+                    let mut value = line.substring(colon + 1, len(line))
+                    if len(value) > 0 && value.substring(0, 1) == " " {
+                        value = value.substring(1, len(value))
+                    }
+                    if field == "event" {
+                        cur_event = value
+                    }
+                    if field == "data" {
+                        cur_data_parts.push(value)
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    if cur_event != "" || len(cur_data_parts) > 0 {
+        let data_joined = cur_data_parts.join("\n")
+        let parsed = json_parse_safe(data_joined)
+        let mut payload = void
+        if parsed[0] {
+            payload = parsed[1]
+        }
+        events.push(#{
+            "event": cur_event,
+            "data": payload,
+            "data_raw": data_joined
+        })
+    }
+    return events
+}
+
+// ─── extractors ─────────────────────────────────────────────
+//
+// Note: `.type` is a hexa keyword — we use bracket access d["type"].
+pub fn anthropic_extract_text(events) -> string {
+    let mut chunks = []
+    let mut i = 0
+    let n = len(events)
+    while i < n {
+        let ev = events[i]
+        if to_string(ev["event"]) == "content_block_delta" {
+            let d = ev["data"]
+            if type_of(d) != "void" {
+                if _has_key(d, "delta") {
+                    let delta = d["delta"]
+                    if type_of(delta) != "void" && _has_key(delta, "type") {
+                        if to_string(delta["type"]) == "text_delta" {
+                            if _has_key(delta, "text") {
+                                chunks.push(to_string(delta["text"]))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return chunks.join("")
+}
+
+// Tool-use aggregation: walk content_block_start (type=tool_use, id,
+// name) and accompanying content_block_delta of type=input_json_delta
+// to reassemble the tool input JSON string.
+pub fn anthropic_extract_tool_calls(events) -> array {
+    let mut by_index = #{}
+    let mut order = []
+    let mut i = 0
+    let n = len(events)
+    while i < n {
+        let ev = events[i]
+        let evname = to_string(ev["event"])
+        if evname == "content_block_start" {
+            let d = ev["data"]
+            if type_of(d) != "void" && _has_key(d, "content_block") {
+                let cb = d["content_block"]
+                if type_of(cb) != "void" && _has_key(cb, "type") {
+                    if to_string(cb["type"]) == "tool_use" {
+                        let idx = to_string(d["index"])
+                        let entry = #{
+                            "id": to_string(cb["id"]),
+                            "name": to_string(cb["name"]),
+                            "input_json": ""
+                        }
+                        by_index[idx] = entry
+                        order.push(idx)
+                    }
+                }
+            }
+        }
+        if evname == "content_block_delta" {
+            let d = ev["data"]
+            if type_of(d) != "void" && _has_key(d, "delta") {
+                let delta = d["delta"]
+                if type_of(delta) != "void" && _has_key(delta, "type") {
+                    if to_string(delta["type"]) == "input_json_delta" {
+                        let idx = to_string(d["index"])
+                        if _has_key(by_index, idx) {
+                            let cur = by_index[idx]
+                            cur["input_json"] = to_string(cur["input_json"]) + to_string(delta["partial_json"])
+                            by_index[idx] = cur
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    let mut out = []
+    let mut k = 0
+    let nk = len(order)
+    while k < nk {
+        out.push(by_index[order[k]])
+        k = k + 1
+    }
+    return out
+}
+
+// ─── send (curl exec) ───────────────────────────────────────
+pub fn anthropic_send(api_key: string, body_json: string, beta_features: array, base_url: string) -> array {
+    let url = base_url + "/v1/messages"
+    let mut header_args = ""
+    header_args = header_args + " -H " + shell_escape("x-api-key: " + api_key)
+    header_args = header_args + " -H " + shell_escape("anthropic-version: 2023-06-01")
+    header_args = header_args + " -H " + shell_escape("content-type: application/json")
+    if len(beta_features) > 0 {
+        let mut betas = []
+        let mut bi = 0
+        while bi < len(beta_features) {
+            betas.push(to_string(beta_features[bi]))
+            bi = bi + 1
+        }
+        header_args = header_args + " -H " + shell_escape("anthropic-beta: " + betas.join(","))
+    }
+    let cmd = "curl -fsN --max-time 600 -X POST" + header_args +
+              " --data-binary " + shell_escape(body_json) +
+              " " + shell_escape(url)
+    let result = exec_with_status(cmd)
+    let body = to_string(result[0])
+    let rc = result[1]
+    if rc != 0 {
+        return [false, "curl rc=" + to_string(rc) + " body=" + body]
+    }
+    return [true, body]
+}
+
+// ─── selftest ───────────────────────────────────────────────
+pub fn anthropic_selftest() -> i64 {
+    let mut fail = 0
+    let mut n = 0
+
+    // T1: build with required keys produces JSON containing model
+    n = n + 1
+    let req = anthropic_build_request(#{
+        "model": "claude-opus-4-7",
+        "messages": [#{"role": "user", "content": "hi"}],
+        "max_tokens": 64
+    })
+    if req.find("claude-opus-4-7") < 0 {
+        eprintln("FAIL T1 build missing model")
+        fail = fail + 1
+    }
+
+    // T2: SSE parse of canonical 3-frame stream
+    n = n + 1
+    let lines2 = [
+        "event: message_start",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\"}}",
+        "",
+        "event: content_block_delta",
+        "data: {\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}",
+        "",
+        "event: content_block_delta",
+        "data: {\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" world\"}}",
+        ""
+    ]
+    let evs2 = anthropic_parse_sse_lines(lines2)
+    if len(evs2) != 3 {
+        eprintln("FAIL T2 sse frame count=" + to_string(len(evs2)))
+        fail = fail + 1
+    }
+
+    // T3: text extraction concatenates deltas
+    n = n + 1
+    let txt = anthropic_extract_text(evs2)
+    if txt != "Hello world" {
+        eprintln("FAIL T3 text=" + txt)
+        fail = fail + 1
+    }
+
+    // T4: tool_use aggregation
+    n = n + 1
+    let lines4 = [
+        "event: content_block_start",
+        "data: {\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"Read\"}}",
+        "",
+        "event: content_block_delta",
+        "data: {\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\"}}",
+        "",
+        "event: content_block_delta",
+        "data: {\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"/etc\\\"}\"}}",
+        ""
+    ]
+    let evs4 = anthropic_parse_sse_lines(lines4)
+    let tools = anthropic_extract_tool_calls(evs4)
+    if len(tools) != 1 {
+        eprintln("FAIL T4 tool count=" + to_string(len(tools)))
+        fail = fail + 1
+    } else {
+        let t0 = tools[0]
+        if to_string(t0["id"]) != "tu_1" {
+            eprintln("FAIL T4b tool id=" + to_string(t0["id"]))
+            fail = fail + 1
+        }
+        if to_string(t0["name"]) != "Read" {
+            eprintln("FAIL T4c tool name=" + to_string(t0["name"]))
+            fail = fail + 1
+        }
+    }
+
+    // T5: comment lines and CRLF tolerance
+    n = n + 1
+    let lines5 = [
+        ": this is a comment\r",
+        "event: ping\r",
+        "data: {}\r",
+        "\r"
+    ]
+    let evs5 = anthropic_parse_sse_lines(lines5)
+    if len(evs5) != 1 {
+        eprintln("FAIL T5 comment/crlf count=" + to_string(len(evs5)))
+        fail = fail + 1
+    }
+
+    // T6: empty data line is ignored (no spurious event)
+    n = n + 1
+    let lines6 = ["", "", ""]
+    let evs6 = anthropic_parse_sse_lines(lines6)
+    if len(evs6) != 0 {
+        eprintln("FAIL T6 spurious empty events=" + to_string(len(evs6)))
+        fail = fail + 1
+    }
+
+    // T7: multi-line data: re-join
+    n = n + 1
+    let lines7 = [
+        "event: x",
+        "data: {",
+        "data: \"k\":1",
+        "data: }",
+        ""
+    ]
+    let evs7 = anthropic_parse_sse_lines(lines7)
+    if len(evs7) != 1 {
+        eprintln("FAIL T7 multiline frame count")
+        fail = fail + 1
+    } else {
+        let raw = to_string(evs7[0]["data_raw"])
+        if raw.find("\"k\":1") < 0 {
+            eprintln("FAIL T7b raw=" + raw)
+            fail = fail + 1
+        }
+    }
+
+    if fail == 0 {
+        println("__ANTHROPIC_SDK_SELFTEST__ PASS n=" + to_string(n) + " fail=0")
+    } else {
+        println("__ANTHROPIC_SDK_SELFTEST__ FAIL n=" + to_string(n) + " fail=" + to_string(fail))
+    }
+    return fail
+}
+
+// ─── --selftest argv gate ───────────────────────────────────
+let _anth_argv = args()
+let mut _anth_run = false
+let mut _anth_i = 0
+while _anth_i < len(_anth_argv) {
+    if _anth_argv[_anth_i] == "--selftest" { _anth_run = true }
+    if _anth_argv[_anth_i] == "--selftest-anthropic" { _anth_run = true }
+    _anth_i = _anth_i + 1
+}
+if _anth_run {
+    anthropic_selftest()
+}

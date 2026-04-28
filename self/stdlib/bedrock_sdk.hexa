@@ -1,0 +1,400 @@
+// self/stdlib/bedrock_sdk.hexa — AWS Bedrock Runtime API shim (DEFER + bearer-only)
+//
+// AI-NATIVE COMMENT BLOCK
+// ─────────────────────────────────────────────────────────────────
+// RATIONALE
+//   Fifth of 5 vendor SDK shims (raw 91 INDEP-3) for the hive
+//   packages/ai/ port. Bedrock is the heaviest blocker because the
+//   .ts side imports `@aws-sdk/client-bedrock-runtime` which depends
+//   on:
+//     1. SigV4 request signing (HMAC-SHA256 chain + canonical request)
+//     2. AWS event-stream binary framing (vnd.amazon.eventstream)
+//     3. Bedrock ConverseStream typed-message vocabulary
+//   Hexa-lang stdlib has neither HMAC-SHA256 nor a binary event-stream
+//   parser — see raw 159 GAP-D / GAP-E below.
+//
+//   raw 91 honest C3 (concrete-clear-conservative) decision:
+//     SigV4 path: DEFER (return exit-1 stub with explicit unblock
+//                 condition).
+//     Bearer-token path: LANDED (Bedrock now supports
+//                 AWS_BEARER_TOKEN_BEDROCK as a first-class auth
+//                 mode that bypasses SigV4 entirely, requiring only
+//                 `Authorization: Bearer <token>` and the IAM
+//                 permission `bedrock:CallWithBearerToken`).
+//     Event-stream parser: DEFER for binary `application/vnd.amazon.
+//                 eventstream`. Provided JSON-payload extractors
+//                 work on the inner `bytes` field after a future
+//                 binary-framing parser hands them to us.
+//
+// ENDPOINTS
+//   POST https://bedrock-runtime.{region}.amazonaws.com/model/{modelId}/converse-stream
+//     Header (bearer): Authorization: Bearer <token>
+//     Header (sigv4):  Authorization: AWS4-HMAC-SHA256 Credential=...
+//                      x-amz-date: <ISO8601-basic>
+//                      x-amz-security-token: <session_token>     (if STS)
+//     Header:  content-type: application/json
+//     Header:  accept: application/vnd.amazon.eventstream
+//     Body:    JSON { messages, system?, inferenceConfig?, toolConfig?,
+//                     additionalModelRequestFields?, requestMetadata? }
+//     Stream:  application/vnd.amazon.eventstream binary frames.
+//              Each frame wraps a JSON payload of one of:
+//                {messageStart}, {contentBlockStart},
+//                {contentBlockDelta}, {contentBlockStop},
+//                {messageStop}, {metadata}.
+//
+// AUTH SCHEME
+//   PRIMARY (LANDED): Bearer token auth.
+//     env AWS_BEARER_TOKEN_BEDROCK -> Authorization: Bearer <token>.
+//     Required IAM action: bedrock:CallWithBearerToken on the
+//     identity tied to the token. No regional STS roundtrip.
+//   SECONDARY (DEFERRED): SigV4 with AWS access-key/secret/session.
+//     Requires HMAC-SHA256 + SHA256 hex-digest builtins not present
+//     in the hexa runtime today. See raw 159 GAP-D.
+//
+// CAVEATS (raw 91 honest C3)
+//   C1. The bearer-token send() works for plain converse (non-stream)
+//       and for converse-stream IF the caller writes their own binary
+//       event-stream parser. We provide JSON extractors that work on
+//       the post-decode payload — the binary frame splitter itself is
+//       NOT in this shim (raw 159 GAP-E).
+//   C2. SigV4 send is a DEFER stub: it eprintln's a structured ai-err
+//       message and exit-1's. This is intentionally LOUD — raw 91
+//       no_silent_errors. Caller must use bearer auth or call out to
+//       the AWS CLI as a workaround.
+//   C3. Region is part of the URL host: the caller passes `region` as
+//       an explicit string. No default us-east-1 — caller must choose.
+//   C4. Pure-hexa for build + JSON-payload extract. send_bearer() exec's
+//       /usr/bin/curl. Same TLS-via-curl shellout as siblings.
+//
+// raw 159 GAP
+//   GAP-D (NEW, this shim): native crypto.hmac_sha256 + crypto.sha256
+//          builtins required for SigV4 chain:
+//             k_date    = HMAC(k_secret, date)
+//             k_region  = HMAC(k_date,   region)
+//             k_service = HMAC(k_region, service)
+//             k_signing = HMAC(k_service,"aws4_request")
+//             signature = HMAC(k_signing, string_to_sign).hex()
+//          Plus SHA256(canonical_request).hex() for the payload-hash
+//          line. Tracked as upstream proposal `rfc_011_crypto_hmac`.
+//   GAP-E (NEW, this shim): vnd.amazon.eventstream binary frame
+//          decoder. Frame layout:
+//             [4B total_length BE][4B headers_length BE]
+//             [4B prelude_crc BE]
+//             [N headers (TLV)] [M payload bytes] [4B msg_crc BE]
+//          Tracked as upstream proposal `rfc_012_aws_eventstream`.
+//   GAP-A (HTTPS native), GAP-B (streaming subprocess line iter) —
+//   shared with all sibling shims.
+//
+// EXPORTS
+//   bedrock_build_request(opts: map) -> string
+//   bedrock_url(region: string, model_id: string) -> string
+//   bedrock_extract_text_from_payloads(payloads: [map]) -> string
+//   bedrock_extract_tool_calls_from_payloads(payloads: [map]) -> [map]
+//   bedrock_send_bearer(token, body_json, region, model_id, streaming) -> [bool, string]
+//   bedrock_send_sigv4(...) -> [bool, string]   // DEFER stub — exit 1
+//   bedrock_selftest() -> int
+
+use "self/stdlib/json"
+use "self/stdlib/shell_escape"
+use "self/stdlib/ai_err"
+
+fn _has_key(d, k) -> bool {
+    if type_of(d) == "void" { return false }
+    let ks = d.keys()
+    let mut i = 0
+    let n = len(ks)
+    while i < n {
+        if ks[i] == k { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ─── request builder ────────────────────────────────────────
+//
+// Bedrock ConverseStream input shape:
+//   { modelId, messages: [...], system?: [{text}], inferenceConfig?,
+//     toolConfig?, additionalModelRequestFields?, requestMetadata? }
+//
+// Note: modelId travels in the URL path AND the body for some
+// invocation paths. For Converse, it's URL-only — but caller may
+// still want it in the body for logging. We require `messages` and
+// pass the rest through.
+pub fn bedrock_build_request(opts) -> string {
+    if !_has_key(opts, "messages") {
+        eprintln("bedrock_build_request: missing 'messages'")
+        exit(1)
+    }
+    return json_stringify(opts)
+}
+
+pub fn bedrock_url(region: string, model_id: string) -> string {
+    // ConverseStream endpoint shape per AWS docs.
+    return "https://bedrock-runtime." + region + ".amazonaws.com/model/" + model_id + "/converse-stream"
+}
+
+// ─── JSON-payload extractors ───────────────────────────────
+//
+// PRECONDITION: caller has already binary-decoded the event-stream
+// frames into a list of JSON payloads. Each payload is one of:
+//   {messageStart: {role}}
+//   {contentBlockStart: {start: {toolUse: {toolUseId, name}}, contentBlockIndex}}
+//   {contentBlockDelta: {delta: {text: "..."} | {toolUse: {input: "..."}},
+//                        contentBlockIndex}}
+//   {contentBlockStop: {contentBlockIndex}}
+//   {messageStop: {stopReason}}
+//   {metadata: {usage, metrics}}
+pub fn bedrock_extract_text_from_payloads(payloads) -> string {
+    let mut chunks = []
+    let mut i = 0
+    while i < len(payloads) {
+        let p = payloads[i]
+        if type_of(p) != "void" && _has_key(p, "contentBlockDelta") {
+            let cbd = p["contentBlockDelta"]
+            if type_of(cbd) != "void" && _has_key(cbd, "delta") {
+                let delta = cbd["delta"]
+                if type_of(delta) != "void" && _has_key(delta, "text") {
+                    chunks.push(to_string(delta["text"]))
+                }
+            }
+        }
+        i = i + 1
+    }
+    return chunks.join("")
+}
+
+pub fn bedrock_extract_tool_calls_from_payloads(payloads) -> array {
+    let mut by_index = #{}
+    let mut order = []
+    let mut i = 0
+    while i < len(payloads) {
+        let p = payloads[i]
+        // contentBlockStart with toolUse seeds the entry
+        if type_of(p) != "void" && _has_key(p, "contentBlockStart") {
+            let cbs = p["contentBlockStart"]
+            if type_of(cbs) != "void" {
+                let mut idx_str = "0"
+                if _has_key(cbs, "contentBlockIndex") {
+                    idx_str = to_string(cbs["contentBlockIndex"])
+                }
+                if _has_key(cbs, "start") {
+                    let st = cbs["start"]
+                    if type_of(st) != "void" && _has_key(st, "toolUse") {
+                        let tu = st["toolUse"]
+                        if type_of(tu) != "void" {
+                            let mut id = ""
+                            if _has_key(tu, "toolUseId") { id = to_string(tu["toolUseId"]) }
+                            let mut nm = ""
+                            if _has_key(tu, "name") { nm = to_string(tu["name"]) }
+                            by_index[idx_str] = #{
+                                "id": id,
+                                "name": nm,
+                                "arguments_json": ""
+                            }
+                            order.push(idx_str)
+                        }
+                    }
+                }
+            }
+        }
+        // contentBlockDelta with toolUse.input appends to arguments_json
+        if type_of(p) != "void" && _has_key(p, "contentBlockDelta") {
+            let cbd = p["contentBlockDelta"]
+            if type_of(cbd) != "void" {
+                let mut idx_str = "0"
+                if _has_key(cbd, "contentBlockIndex") {
+                    idx_str = to_string(cbd["contentBlockIndex"])
+                }
+                if _has_key(cbd, "delta") {
+                    let delta = cbd["delta"]
+                    if type_of(delta) != "void" && _has_key(delta, "toolUse") {
+                        let tu = delta["toolUse"]
+                        if type_of(tu) != "void" && _has_key(tu, "input") {
+                            if _has_key(by_index, idx_str) {
+                                let cur = by_index[idx_str]
+                                cur["arguments_json"] = to_string(cur["arguments_json"]) + to_string(tu["input"])
+                                by_index[idx_str] = cur
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    let mut out = []
+    let mut k = 0
+    while k < len(order) {
+        out.push(by_index[order[k]])
+        k = k + 1
+    }
+    return out
+}
+
+// ─── send (bearer token — LANDED) ──────────────────────────
+//
+// Returns [ok, body]. When streaming=true, body is the raw
+// vnd.amazon.eventstream binary blob (caller must decode with the
+// future event-stream parser — raw 159 GAP-E). When streaming=false
+// caller should set body opts.streaming=false and POST to the
+// /converse endpoint instead — we currently always hit converse-
+// stream. (Alternate /converse endpoint is left as a follow-up
+// since the hive .ts code path here is exclusively streaming.)
+pub fn bedrock_send_bearer(token: string, body_json: string, region: string, model_id: string, streaming: bool) -> array {
+    let mut url = bedrock_url(region, model_id)
+    if !streaming {
+        // Non-stream variant: replace converse-stream with converse.
+        url = "https://bedrock-runtime." + region + ".amazonaws.com/model/" + model_id + "/converse"
+    }
+    let mut header_args = ""
+    header_args = header_args + " -H " + shell_escape("Authorization: Bearer " + token)
+    header_args = header_args + " -H " + shell_escape("content-type: application/json")
+    if streaming {
+        header_args = header_args + " -H " + shell_escape("accept: application/vnd.amazon.eventstream")
+    } else {
+        header_args = header_args + " -H " + shell_escape("accept: application/json")
+    }
+    let cmd = "curl -fsN --max-time 600 -X POST" + header_args +
+              " --data-binary " + shell_escape(body_json) +
+              " " + shell_escape(url)
+    let result = exec_with_status(cmd)
+    let body = to_string(result[0])
+    let rc = result[1]
+    if rc != 0 {
+        return [false, "curl rc=" + to_string(rc) + " body=" + body]
+    }
+    return [true, body]
+}
+
+// ─── send (SigV4 — DEFERRED) ────────────────────────────────
+//
+// HONEST DEFER (raw 91 no_silent_errors): emit ai-native error and
+// exit 1. The caller cannot proceed silently — they must either:
+//   (a) set AWS_BEARER_TOKEN_BEDROCK and use bedrock_send_bearer
+//   (b) shell out to `aws bedrock-runtime invoke-model` themselves
+//   (c) wait for raw 159 GAP-D (rfc_011_crypto_hmac) to land
+pub fn bedrock_send_sigv4(access_key: string, secret_key: string, session_token: string, body_json: string, region: string, model_id: string, streaming: bool) -> array {
+    ai_err_exit("bedrock-sdk", "sigv4-deferred", [
+        ["cause", "hexa runtime lacks HMAC-SHA256 + SHA256 builtins required for AWS SigV4 signing"],
+        ["remedy", "set AWS_BEARER_TOKEN_BEDROCK and call bedrock_send_bearer instead"],
+        ["remedy", "or shell out to 'aws bedrock-runtime invoke-model' from caller"],
+        ["remedy", "or wait for rfc_011_crypto_hmac (raw 159 GAP-D)"],
+        ["ref", "self/stdlib/bedrock_sdk.hexa raw-159-GAP-D"],
+        ["region", region],
+        ["model_id", model_id]
+    ], 1)
+    return [false, "unreachable — ai_err_exit always exits"]
+}
+
+// ─── selftest ───────────────────────────────────────────────
+pub fn bedrock_selftest() -> i64 {
+    let mut fail = 0
+    let mut n = 0
+
+    // T1: builder requires messages
+    n = n + 1
+    let req = bedrock_build_request(#{
+        "messages": [#{"role": "user", "content": [#{"text": "hi"}]}],
+        "inferenceConfig": #{"maxTokens": 1024}
+    })
+    if req.find("\"messages\"") < 0 {
+        eprintln("FAIL T1 builder")
+        fail = fail + 1
+    }
+
+    // T2: URL constructor
+    n = n + 1
+    let u = bedrock_url("us-east-1", "anthropic.claude-3-5-sonnet-20241022-v2:0")
+    let expected = "https://bedrock-runtime.us-east-1.amazonaws.com/model/anthropic.claude-3-5-sonnet-20241022-v2:0/converse-stream"
+    if u != expected {
+        eprintln("FAIL T2 url=" + u)
+        fail = fail + 1
+    }
+
+    // T3: text extraction from JSON payload list
+    n = n + 1
+    let payloads3 = [
+        #{"messageStart": #{"role": "assistant"}},
+        #{"contentBlockDelta": #{"contentBlockIndex": 0, "delta": #{"text": "Hello"}}},
+        #{"contentBlockDelta": #{"contentBlockIndex": 0, "delta": #{"text": " bedrock"}}},
+        #{"messageStop": #{"stopReason": "end_turn"}}
+    ]
+    let txt = bedrock_extract_text_from_payloads(payloads3)
+    if txt != "Hello bedrock" {
+        eprintln("FAIL T3 text=" + txt)
+        fail = fail + 1
+    }
+
+    // T4: tool_use extraction across start + delta payloads
+    n = n + 1
+    let payloads4 = [
+        #{"contentBlockStart": #{
+            "contentBlockIndex": 1,
+            "start": #{"toolUse": #{"toolUseId": "tu_42", "name": "Read"}}
+        }},
+        #{"contentBlockDelta": #{
+            "contentBlockIndex": 1,
+            "delta": #{"toolUse": #{"input": "{\"path\":"}}
+        }},
+        #{"contentBlockDelta": #{
+            "contentBlockIndex": 1,
+            "delta": #{"toolUse": #{"input": "\"/etc\"}"}}
+        }}
+    ]
+    let tools = bedrock_extract_tool_calls_from_payloads(payloads4)
+    if len(tools) != 1 {
+        eprintln("FAIL T4 tool count=" + to_string(len(tools)))
+        fail = fail + 1
+    } else {
+        let t = tools[0]
+        if to_string(t["id"]) != "tu_42" {
+            eprintln("FAIL T4b id=" + to_string(t["id"]))
+            fail = fail + 1
+        }
+        if to_string(t["arguments_json"]).find("/etc") < 0 {
+            eprintln("FAIL T4c args=" + to_string(t["arguments_json"]))
+            fail = fail + 1
+        }
+    }
+
+    // T5: empty payload list -> empty text
+    n = n + 1
+    let txt5 = bedrock_extract_text_from_payloads([])
+    if txt5 != "" {
+        eprintln("FAIL T5 empty text=" + txt5)
+        fail = fail + 1
+    }
+
+    // T6: bearer endpoint for non-stream switches to /converse
+    // (Cannot exec curl in selftest — we synthesize the URL only.)
+    // Smoke check: request shape passes through inferenceConfig.
+    n = n + 1
+    let req6 = bedrock_build_request(#{
+        "messages": [#{"role": "user", "content": [#{"text": "x"}]}],
+        "inferenceConfig": #{"temperature": 0.5, "maxTokens": 256}
+    })
+    if req6.find("\"temperature\":0.5") < 0 {
+        eprintln("FAIL T6 inferenceConfig passthrough: " + req6)
+        fail = fail + 1
+    }
+
+    if fail == 0 {
+        println("__BEDROCK_SDK_SELFTEST__ PASS n=" + to_string(n) + " fail=0")
+    } else {
+        println("__BEDROCK_SDK_SELFTEST__ FAIL n=" + to_string(n) + " fail=" + to_string(fail))
+    }
+    return fail
+}
+
+// ─── --selftest argv gate ───────────────────────────────────
+let _br_argv = args()
+let mut _br_run = false
+let mut _br_i = 0
+while _br_i < len(_br_argv) {
+    if _br_argv[_br_i] == "--selftest" { _br_run = true }
+    if _br_argv[_br_i] == "--selftest-bedrock" { _br_run = true }
+    _br_i = _br_i + 1
+}
+if _br_run {
+    bedrock_selftest()
+}

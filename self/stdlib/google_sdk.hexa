@@ -1,0 +1,366 @@
+// self/stdlib/google_sdk.hexa — Google Generative AI (Gemini) shim
+//
+// AI-NATIVE COMMENT BLOCK
+// ─────────────────────────────────────────────────────────────────
+// RATIONALE
+//   Third of 5 vendor SDK shims (raw 91 INDEP-3) unblocking the hive
+//   packages/ai/ port. Hive .ts side imports `@google/genai` and
+//   calls `client.models.generateContentStream(params)`. We expose
+//   pure-hexa request build + streaming parse + delta extractors,
+//   plus a curl-shellout send().
+//
+// ENDPOINTS
+//   POST {base_url}/v1beta/models/{model}:streamGenerateContent?alt=sse
+//     Header:  x-goog-api-key: <GOOGLE_API_KEY>
+//     Header:  content-type: application/json
+//     Body:    JSON { contents, systemInstruction?, tools?,
+//                     toolConfig?, safetySettings?,
+//                     generationConfig: { temperature?, maxOutputTokens?,
+//                                         thinkingConfig? } }
+//     Stream:  When `?alt=sse`, returns SSE-style frames:
+//                data: {GenerateContentResponse}
+//              one chunk per blank-line-terminated frame.
+//              Without `?alt=sse` it returns `application/json` as
+//              a streaming array `[ {chunk}, {chunk}, ... ]` — caller
+//              must request alt=sse to use the SSE parser here.
+//
+// AUTH SCHEME
+//   API-key bearer: env GOOGLE_API_KEY -> header x-goog-api-key.
+//   The Vertex AI variant uses Google Application Default Credentials
+//   (OAuth2 + IAM) — that's a separate `vertex_sdk` port (deferred).
+//
+// CAVEATS (raw 91 honest C3)
+//   C1. Same TLS-via-curl shellout. Pure-hexa for build + parse.
+//   C2. Function calling: parts[i].functionCall.{name,args} arrives
+//       complete in a single chunk (Google does NOT delta-stream the
+//       arguments JSON). Aggregator emits one tool call per part.
+//   C3. Thinking: parts[i].thought=true marks summarized thinking
+//       text (when thinkingConfig.includeThoughts=true). Caller can
+//       distinguish via google_extract_thinking().
+//   C4. The SSE parser here ASSUMES `?alt=sse` is in the URL. If the
+//       caller forgets, the body is a streaming JSON array and the
+//       parser will see `data: [...]` only at frame boundaries —
+//       a no-op. Defense: google_send injects `?alt=sse` automatically.
+//   C5. No incremental streaming — same RFC-001 streaming GAP-B.
+//
+// raw 159 GAP
+//   GAP-A (HTTPS native), GAP-B (streaming subprocess line iter).
+//   Plus: Vertex AI = OAuth2 ADC + GCP project routing — deferred to
+//   future `vertex_sdk` port (depends on GAP-A and Google ADC chain).
+//
+// EXPORTS
+//   google_build_request(opts: map) -> string
+//   google_parse_sse_lines(lines: [string]) -> [map]
+//   google_extract_text(events: [map]) -> string
+//   google_extract_thinking(events: [map]) -> string
+//   google_extract_tool_calls(events: [map]) -> [map]
+//   google_send(api_key, model, body_json, base_url) -> [bool, string]
+//   google_selftest() -> int
+
+use "self/stdlib/json"
+use "self/stdlib/shell_escape"
+
+fn _has_key(d, k) -> bool {
+    if type_of(d) == "void" { return false }
+    let ks = d.keys()
+    let mut i = 0
+    let n = len(ks)
+    while i < n {
+        if ks[i] == k { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ─── request builder ────────────────────────────────────────
+//
+// The Gemini API uses `contents` (NOT `messages`). Each entry has
+// {role, parts:[{text} | {functionCall} | {functionResponse} |
+// {inlineData}]}. We require `contents` here and pass the rest
+// through.
+pub fn google_build_request(opts) -> string {
+    if !_has_key(opts, "contents") {
+        eprintln("google_build_request: missing 'contents'")
+        exit(1)
+    }
+    return json_stringify(opts)
+}
+
+// ─── SSE parser (alt=sse mode) ─────────────────────────────
+pub fn google_parse_sse_lines(lines) -> array {
+    let mut events = []
+    let mut cur_data_parts = []
+    let mut i = 0
+    let n = len(lines)
+    while i < n {
+        let raw = to_string(lines[i])
+        let mut line = raw
+        let ll = len(line)
+        if ll > 0 && line.substring(ll - 1, ll) == "\r" {
+            line = line.substring(0, ll - 1)
+        }
+        if line == "" {
+            if len(cur_data_parts) > 0 {
+                let joined = cur_data_parts.join("\n")
+                let parsed = json_parse_safe(joined)
+                let mut payload = void
+                if parsed[0] {
+                    payload = parsed[1]
+                }
+                events.push(#{"data": payload, "data_raw": joined})
+            }
+            cur_data_parts = []
+        } else {
+            if line.substring(0, 1) == ":" {
+                // skip
+            } else {
+                let colon = line.find(":")
+                if colon >= 0 {
+                    let field = line.substring(0, colon)
+                    let mut value = line.substring(colon + 1, len(line))
+                    if len(value) > 0 && value.substring(0, 1) == " " {
+                        value = value.substring(1, len(value))
+                    }
+                    if field == "data" {
+                        cur_data_parts.push(value)
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    if len(cur_data_parts) > 0 {
+        let joined = cur_data_parts.join("\n")
+        let parsed = json_parse_safe(joined)
+        let mut payload = void
+        if parsed[0] {
+            payload = parsed[1]
+        }
+        events.push(#{"data": payload, "data_raw": joined})
+    }
+    return events
+}
+
+// Internal: walk events, yield array of `parts` arrays with thought-
+// flag boolean attached (so extractors can split text vs thinking).
+fn _google_parts(events) -> array {
+    let mut all = []
+    let mut i = 0
+    while i < len(events) {
+        let ev = events[i]
+        let d = ev["data"]
+        if type_of(d) != "void" && _has_key(d, "candidates") {
+            let cands = d["candidates"]
+            if type_of(cands) != "void" && len(cands) > 0 {
+                let c0 = cands[0]
+                if _has_key(c0, "content") {
+                    let cont = c0["content"]
+                    if type_of(cont) != "void" && _has_key(cont, "parts") {
+                        let parts = cont["parts"]
+                        if type_of(parts) != "void" {
+                            let mut j = 0
+                            while j < len(parts) {
+                                all.push(parts[j])
+                                j = j + 1
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return all
+}
+
+pub fn google_extract_text(events) -> string {
+    let parts = _google_parts(events)
+    let mut chunks = []
+    let mut i = 0
+    while i < len(parts) {
+        let p = parts[i]
+        let mut is_thought = false
+        if _has_key(p, "thought") {
+            // p.thought is a bool — to_string() yields "true"/"false"
+            if to_string(p["thought"]) == "true" { is_thought = true }
+        }
+        if !is_thought && _has_key(p, "text") {
+            chunks.push(to_string(p["text"]))
+        }
+        i = i + 1
+    }
+    return chunks.join("")
+}
+
+pub fn google_extract_thinking(events) -> string {
+    let parts = _google_parts(events)
+    let mut chunks = []
+    let mut i = 0
+    while i < len(parts) {
+        let p = parts[i]
+        let mut is_thought = false
+        if _has_key(p, "thought") {
+            if to_string(p["thought"]) == "true" { is_thought = true }
+        }
+        if is_thought && _has_key(p, "text") {
+            chunks.push(to_string(p["text"]))
+        }
+        i = i + 1
+    }
+    return chunks.join("")
+}
+
+pub fn google_extract_tool_calls(events) -> array {
+    let parts = _google_parts(events)
+    let mut out = []
+    let mut i = 0
+    while i < len(parts) {
+        let p = parts[i]
+        if _has_key(p, "functionCall") {
+            let fc = p["functionCall"]
+            if type_of(fc) != "void" {
+                let mut id = ""
+                if _has_key(fc, "id") { id = to_string(fc["id"]) }
+                let name = to_string(fc["name"])
+                // args is a structured object; we stringify for parity
+                // with anthropic/openai aggregators (caller can json_parse).
+                let mut args_json = "{}"
+                if _has_key(fc, "args") {
+                    args_json = json_stringify(fc["args"])
+                }
+                out.push(#{
+                    "id": id,
+                    "name": name,
+                    "arguments_json": args_json
+                })
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── send (curl exec) ───────────────────────────────────────
+pub fn google_send(api_key: string, model_id: string, body_json: string, base_url: string) -> array {
+    // Force alt=sse so the SSE parser is correct.
+    let url = base_url + "/v1beta/models/" + model_id + ":streamGenerateContent?alt=sse"
+    let mut header_args = ""
+    header_args = header_args + " -H " + shell_escape("x-goog-api-key: " + api_key)
+    header_args = header_args + " -H " + shell_escape("content-type: application/json")
+    let cmd = "curl -fsN --max-time 600 -X POST" + header_args +
+              " --data-binary " + shell_escape(body_json) +
+              " " + shell_escape(url)
+    let result = exec_with_status(cmd)
+    let body = to_string(result[0])
+    let rc = result[1]
+    if rc != 0 {
+        return [false, "curl rc=" + to_string(rc) + " body=" + body]
+    }
+    return [true, body]
+}
+
+// ─── selftest ───────────────────────────────────────────────
+pub fn google_selftest() -> i64 {
+    let mut fail = 0
+    let mut n = 0
+
+    // T1: builder requires `contents`
+    n = n + 1
+    let req = google_build_request(#{
+        "contents": [#{"role": "user", "parts": [#{"text": "hi"}]}],
+        "generationConfig": #{"temperature": 0.2}
+    })
+    if req.find("\"contents\"") < 0 {
+        eprintln("FAIL T1 builder")
+        fail = fail + 1
+    }
+
+    // T2: SSE parse — text deltas across two frames
+    n = n + 1
+    let lines2 = [
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hello\"}],\"role\":\"model\"}}]}",
+        "",
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\" world\"}],\"role\":\"model\"}}]}",
+        ""
+    ]
+    let evs2 = google_parse_sse_lines(lines2)
+    if len(evs2) != 2 {
+        eprintln("FAIL T2 frames=" + to_string(len(evs2)))
+        fail = fail + 1
+    }
+    let txt = google_extract_text(evs2)
+    if txt != "Hello world" {
+        eprintln("FAIL T2b text=" + txt)
+        fail = fail + 1
+    }
+
+    // T3: thinking parts split via thought=true flag
+    n = n + 1
+    let lines3 = [
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"reasoning here\",\"thought\":true},{\"text\":\"final answer\"}]}}]}",
+        ""
+    ]
+    let evs3 = google_parse_sse_lines(lines3)
+    let think = google_extract_thinking(evs3)
+    let answer = google_extract_text(evs3)
+    if think != "reasoning here" {
+        eprintln("FAIL T3 thinking=" + think)
+        fail = fail + 1
+    }
+    if answer != "final answer" {
+        eprintln("FAIL T3b answer=" + answer)
+        fail = fail + 1
+    }
+
+    // T4: functionCall extraction (Google delivers complete args, not deltas)
+    n = n + 1
+    let lines4 = [
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"Read\",\"args\":{\"path\":\"/etc\"}}}]}}]}",
+        ""
+    ]
+    let evs4 = google_parse_sse_lines(lines4)
+    let tools = google_extract_tool_calls(evs4)
+    if len(tools) != 1 {
+        eprintln("FAIL T4 tool count=" + to_string(len(tools)))
+        fail = fail + 1
+    } else {
+        let t = tools[0]
+        if to_string(t["name"]) != "Read" {
+            eprintln("FAIL T4b name=" + to_string(t["name"]))
+            fail = fail + 1
+        }
+        if to_string(t["arguments_json"]).find("/etc") < 0 {
+            eprintln("FAIL T4c args=" + to_string(t["arguments_json"]))
+            fail = fail + 1
+        }
+    }
+
+    // T5: empty stream (server hung up after headers)
+    n = n + 1
+    let lines5 = []
+    let evs5 = google_parse_sse_lines(lines5)
+    if len(evs5) != 0 {
+        eprintln("FAIL T5 empty stream")
+        fail = fail + 1
+    }
+
+    if fail == 0 {
+        println("__GOOGLE_SDK_SELFTEST__ PASS n=" + to_string(n) + " fail=0")
+    } else {
+        println("__GOOGLE_SDK_SELFTEST__ FAIL n=" + to_string(n) + " fail=" + to_string(fail))
+    }
+    return fail
+}
+
+// ─── --selftest argv gate ───────────────────────────────────
+let _g_argv = args()
+let mut _g_run = false
+let mut _g_i = 0
+while _g_i < len(_g_argv) {
+    if _g_argv[_g_i] == "--selftest" { _g_run = true }
+    if _g_argv[_g_i] == "--selftest-google" { _g_run = true }
+    _g_i = _g_i + 1
+}
+if _g_run {
+    google_selftest()
+}

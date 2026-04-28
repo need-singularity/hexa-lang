@@ -1,0 +1,217 @@
+// self/stdlib/mistral_sdk.hexa — Mistral La Plateforme API shim
+//
+// AI-NATIVE COMMENT BLOCK
+// ─────────────────────────────────────────────────────────────────
+// RATIONALE
+//   Fourth of 5 vendor SDK shims (raw 91 INDEP-3) unblocking the hive
+//   packages/ai/ port. Hive .ts side imports `@mistralai/mistralai`
+//   and calls `mistral.chat.stream(payload)`. Mistral's wire shape
+//   is an OpenAI-compat chat-completions superset with a couple of
+//   provider-specific fields (promptMode, reasoningEffort, x-affinity
+//   header). We provide pure-hexa request build + SSE parse + delta
+//   extractors, plus a curl-shellout send().
+//
+// ENDPOINTS
+//   POST {base_url}/v1/chat/completions
+//     Header:  Authorization: Bearer <MISTRAL_API_KEY>
+//     Header:  content-type: application/json
+//     Header:  x-affinity: <sessionId>                  (optional, KV cache)
+//     Body:    JSON { model, messages, tools?, toolChoice?,
+//                     temperature?, maxTokens?, promptMode?,
+//                     reasoningEffort?, stream: true }
+//     Stream:  SSE frames `data: {chunk}` with terminal `data: [DONE]`.
+//
+// AUTH SCHEME
+//   Bearer token — env MISTRAL_API_KEY -> Authorization header.
+//
+// CAVEATS (raw 91 honest C3)
+//   C1. Same TLS-via-curl shellout. Pure-hexa for build + parse.
+//   C2. Mistral tool-call IDs are constrained to 9 alphanum chars
+//       (MISTRAL_TOOL_CALL_ID_LENGTH=9). Caller should pre-normalize
+//       IDs before send() — this shim does NOT enforce ID shape.
+//   C3. SSE wire format is OpenAI-compatible — we DELEGATE the parser
+//       to openai_parse_sse_lines / openai_extract_text /
+//       openai_extract_tool_calls (see openai_sdk.hexa). Re-exported
+//       under mistral_* names for naming uniformity in caller code.
+//   C4. promptMode="reasoning" + reasoningEffort gating is model-
+//       specific (Magistral / Codestral / Mistral Large 2.x). This
+//       shim passes them through unconditionally — caller MUST check
+//       model capabilities upstream (raw 91 no_silent_errors).
+//
+// raw 159 GAP
+//   GAP-A (HTTPS native), GAP-B (streaming subprocess line iter).
+//   GAP-C: short hash for Mistral tool-call ID coercion. A 9-char
+//          deterministic hash function is needed when caller IDs
+//          exceed length / contain non-alphanum. hive ports
+//          `utils/hash.shortHash` — recommend porting to
+//          self/stdlib/hash (separate module, raw 159 follow-up).
+//
+// EXPORTS
+//   mistral_build_request(opts: map) -> string
+//   mistral_parse_sse_lines(lines: [string]) -> [map]      (delegates)
+//   mistral_extract_text(events: [map]) -> string          (delegates)
+//   mistral_extract_tool_calls(events: [map]) -> [map]     (delegates)
+//   mistral_send(api_key, body_json, base_url, session_id) -> [bool, string]
+//   mistral_selftest() -> int
+
+use "self/stdlib/json"
+use "self/stdlib/shell_escape"
+use "self/stdlib/openai_sdk"
+
+fn _has_key(d, k) -> bool {
+    if type_of(d) == "void" { return false }
+    let ks = d.keys()
+    let mut i = 0
+    let n = len(ks)
+    while i < n {
+        if ks[i] == k { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ─── request builder ────────────────────────────────────────
+pub fn mistral_build_request(opts) -> string {
+    if !_has_key(opts, "model") {
+        eprintln("mistral_build_request: missing 'model'")
+        exit(1)
+    }
+    if !_has_key(opts, "messages") {
+        eprintln("mistral_build_request: missing 'messages'")
+        exit(1)
+    }
+    return json_stringify(opts)
+}
+
+// ─── SSE parser + extractors (delegate to openai_sdk) ──────
+//
+// Mistral wire format == OpenAI chat-completions wire format.
+// Re-export under mistral_* names so caller code reads as mistral-
+// flavoured without the sister-module knowledge.
+pub fn mistral_parse_sse_lines(lines) -> array {
+    return openai_parse_sse_lines(lines)
+}
+
+pub fn mistral_extract_text(events) -> string {
+    return openai_extract_text(events)
+}
+
+pub fn mistral_extract_tool_calls(events) -> array {
+    return openai_extract_tool_calls(events)
+}
+
+// ─── send (curl exec) ───────────────────────────────────────
+pub fn mistral_send(api_key: string, body_json: string, base_url: string, session_id: string) -> array {
+    let url = base_url + "/v1/chat/completions"
+    let mut header_args = ""
+    header_args = header_args + " -H " + shell_escape("Authorization: Bearer " + api_key)
+    header_args = header_args + " -H " + shell_escape("content-type: application/json")
+    if session_id != "" {
+        header_args = header_args + " -H " + shell_escape("x-affinity: " + session_id)
+    }
+    let cmd = "curl -fsN --max-time 600 -X POST" + header_args +
+              " --data-binary " + shell_escape(body_json) +
+              " " + shell_escape(url)
+    let result = exec_with_status(cmd)
+    let body = to_string(result[0])
+    let rc = result[1]
+    if rc != 0 {
+        return [false, "curl rc=" + to_string(rc) + " body=" + body]
+    }
+    return [true, body]
+}
+
+// ─── selftest ───────────────────────────────────────────────
+pub fn mistral_selftest() -> i64 {
+    let mut fail = 0
+    let mut n = 0
+
+    // T1: builder
+    n = n + 1
+    let req = mistral_build_request(#{
+        "model": "mistral-large-latest",
+        "messages": [#{"role": "user", "content": "hi"}],
+        "stream": true
+    })
+    if req.find("mistral-large-latest") < 0 {
+        eprintln("FAIL T1 builder")
+        fail = fail + 1
+    }
+
+    // T2: text extraction (OpenAI-compat wire)
+    n = n + 1
+    let lines2 = [
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"}}]}",
+        "",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\" mistral\"}}]}",
+        "",
+        "data: [DONE]",
+        ""
+    ]
+    let evs2 = mistral_parse_sse_lines(lines2)
+    let txt = mistral_extract_text(evs2)
+    if txt != "Hi mistral" {
+        eprintln("FAIL T2 text=" + txt)
+        fail = fail + 1
+    }
+
+    // T3: tool_calls aggregation (delta arguments)
+    n = n + 1
+    let lines3 = [
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"abc123def\",\"type\":\"function\",\"function\":{\"name\":\"Search\",\"arguments\":\"\"}}]}}]}",
+        "",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"q\\\":\\\"hi\\\"}\"}}]}}]}",
+        ""
+    ]
+    let evs3 = mistral_parse_sse_lines(lines3)
+    let tcs = mistral_extract_tool_calls(evs3)
+    if len(tcs) != 1 {
+        eprintln("FAIL T3 tc count=" + to_string(len(tcs)))
+        fail = fail + 1
+    } else {
+        let t = tcs[0]
+        if to_string(t["id"]) != "abc123def" {
+            eprintln("FAIL T3b id=" + to_string(t["id"]))
+            fail = fail + 1
+        }
+        if to_string(t["arguments_json"]).find("\"q\":\"hi\"") < 0 {
+            eprintln("FAIL T3c args=" + to_string(t["arguments_json"]))
+            fail = fail + 1
+        }
+    }
+
+    // T4: builder enforces required key
+    // (Cannot exit-test from in-process selftest; we instead probe
+    //  that with a valid input the JSON includes promptMode pass-through.)
+    n = n + 1
+    let req2 = mistral_build_request(#{
+        "model": "magistral-medium-2509",
+        "messages": [#{"role": "user", "content": "x"}],
+        "promptMode": "reasoning",
+        "reasoningEffort": "high"
+    })
+    if req2.find("\"promptMode\":\"reasoning\"") < 0 {
+        eprintln("FAIL T4 promptMode passthrough: " + req2)
+        fail = fail + 1
+    }
+
+    if fail == 0 {
+        println("__MISTRAL_SDK_SELFTEST__ PASS n=" + to_string(n) + " fail=0")
+    } else {
+        println("__MISTRAL_SDK_SELFTEST__ FAIL n=" + to_string(n) + " fail=" + to_string(fail))
+    }
+    return fail
+}
+
+// ─── --selftest argv gate ───────────────────────────────────
+let _m_argv = args()
+let mut _m_run = false
+let mut _m_i = 0
+while _m_i < len(_m_argv) {
+    if _m_argv[_m_i] == "--selftest" { _m_run = true }
+    if _m_argv[_m_i] == "--selftest-mistral" { _m_run = true }
+    _m_i = _m_i + 1
+}
+if _m_run {
+    mistral_selftest()
+}
