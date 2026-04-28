@@ -1,0 +1,354 @@
+// self/stdlib/bench.hexa — pure-hexa benchmark framework (vitest/mitata parity).
+//
+// Resolves hive blocker `goal_hexa_native_bench_framework`. Provides the
+// statistical-sampling primitives that hive's 10 axis-B bench harnesses
+// need to port from .mjs (vitest bench / mitata) → .hexa with no carve-out
+// (raw `hexa-only`, GOAL-HEXA-NATIVE strict mode).
+//
+// raw 9 (pure-hexa):  external libs = 0. mono_ns() / sleep_s / exec only.
+// raw 91 (no_silent_errors): bench() prints register line + per-bench stats
+//   to stdout immediately; run_all() emits aggregated table — both honest.
+// raw 18 (self-host fixpoint): zero new builtins required; module is pure
+//   .hexa — no codegen_c2.hexa / runtime.c surface delta. Fixpoint preserved.
+// raw 159 (hexa-lang-upstream-proposal-mandate): hive ports `use
+//   "self/stdlib/bench"` and never re-implements bench timing.
+//
+// ── Why per-call timing instead of registry-then-run ────────────────────
+// Inside the current hexa interp, fn references can be passed as args and
+// re-bound to local names within the receiving fn's scope, but they cannot
+// be persisted into module-level arrays/maps for later replay (storing a
+// fn into a container silently aborts). So bench() runs the timing loop
+// *immediately* on the supplied closure, accumulates statistics into a
+// module-level result table, and run_all() / report_json() emit the table.
+// This matches mitata's behaviour where each `bench()` call also runs.
+//
+// ── Public API ────────────────────────────────────────────────────────
+//   bench(name, f)                    — warmup + sample + record stats
+//   bench_with(name, f, opts)         — same with opts={warmup,iters,quiet}
+//   bench_compare(name_a, fa, name_b, fb) — A/B + ratio + significance
+//   run_all()                         — print aggregated table
+//   report_json()                     — return JSON string of all results
+//   bench_clear()                     — reset registry (for re-runs)
+//
+// ── Output format (vitest bench parity) ───────────────────────────────
+//   "  name                     mean=NNNns  p50=NNNns  p90=NNNns  p99=NNNns  n=N"
+//   ratio: "  A vs B  ratio=Rx  Δp50=±N%  significant=YES|NO"
+//
+// ── --selftest ────────────────────────────────────────────────────────
+//   hexa run self/stdlib/bench.hexa --selftest
+//     → emits __BENCH_SELFTEST__ <PASS|FAIL> n=<N> fail=<M>
+//
+//   selftest fixture: two pure-hexa workloads with known size ratio
+//   (loop_n100 vs loop_n200) — verifies recorded p50 ratio ≈ 2x.
+
+// ─── module-level state ────────────────────────────────────────────────
+// Each row: [name, p50_ns, p90_ns, p99_ns, mean_ns, stddev_ns, iters]
+let mut _bench_results = []
+
+// ─── statistical helpers ───────────────────────────────────────────────
+fn _bench_bubble_sort(arr) {
+    // O(n²) — fine for iters ≤ 1000. Avoids bringing in a sort dep.
+    let n = len(arr)
+    let mut a = 0
+    while a < n {
+        let mut b = 0
+        while b < n - a - 1 {
+            if arr[b] > arr[b + 1] {
+                let tmp = arr[b]
+                arr[b] = arr[b + 1]
+                arr[b + 1] = tmp
+            }
+            b = b + 1
+        }
+        a = a + 1
+    }
+    return arr
+}
+
+fn _bench_percentile(sorted, pct_num, pct_den) {
+    // sorted[(n * pct_num) / pct_den], guarded for n=0.
+    let n = len(sorted)
+    if n == 0 { return 0 }
+    let mut idx = (n * pct_num) / pct_den
+    if idx >= n { idx = n - 1 }
+    if idx < 0 { idx = 0 }
+    return sorted[idx]
+}
+
+fn _bench_mean(samples) {
+    let n = len(samples)
+    if n == 0 { return 0 }
+    let mut sum = 0
+    let mut i = 0
+    while i < n { sum = sum + samples[i]; i = i + 1 }
+    return sum / n
+}
+
+fn _bench_stddev(samples, mean_v) {
+    // Population stddev (sqrt(variance)). Uses Newton iteration since
+    // sqrt() availability varies across interp paths — float arithmetic
+    // is fine for ns-scale variance.
+    let n = len(samples)
+    if n == 0 { return 0 }
+    let mut sq_sum = 0
+    let mut i = 0
+    while i < n {
+        let d = samples[i] - mean_v
+        sq_sum = sq_sum + d * d
+        i = i + 1
+    }
+    let variance = sq_sum / n
+    // Integer Newton sqrt — avoids float dep + rounds toward floor.
+    if variance <= 0 { return 0 }
+    let mut x = variance
+    let mut y = (x + 1) / 2
+    while y < x {
+        x = y
+        y = (x + variance / x) / 2
+    }
+    return x
+}
+
+// ─── core: time one fn N iters + record ────────────────────────────────
+fn _bench_run_inner(name, f, warmup, iters, quiet) {
+    // warmup phase (no recording)
+    let mut i = 0
+    while i < warmup { f(); i = i + 1 }
+    // sampling phase
+    let mut samples = []
+    let mut j = 0
+    while j < iters {
+        let t0 = mono_ns()
+        f()
+        let t1 = mono_ns()
+        samples.push(t1 - t0)
+        j = j + 1
+    }
+    let sorted = _bench_bubble_sort(samples)
+    let p50 = _bench_percentile(sorted, 50, 100)
+    let p90 = _bench_percentile(sorted, 90, 100)
+    let p99 = _bench_percentile(sorted, 99, 100)
+    let mean_v = _bench_mean(sorted)
+    let std_v = _bench_stddev(sorted, mean_v)
+    _bench_results.push([name, p50, p90, p99, mean_v, std_v, iters])
+    if quiet == 0 {
+        println("  bench " + name
+            + "  mean=" + to_string(mean_v) + "ns"
+            + "  p50=" + to_string(p50) + "ns"
+            + "  p90=" + to_string(p90) + "ns"
+            + "  p99=" + to_string(p99) + "ns"
+            + "  ±" + to_string(std_v) + "ns"
+            + "  n=" + to_string(iters))
+    }
+    return p50
+}
+
+// ─── public API ────────────────────────────────────────────────────────
+fn bench(name, f) {
+    // defaults: warmup=100, iters=1000 (matches mitata defaults). For very
+    // slow workloads (>1ms each) the caller should use bench_with() with
+    // smaller iters to bound total run time.
+    return _bench_run_inner(name, f, 100, 1000, 0)
+}
+
+// bench_with: caller-controlled warmup/iters/quiet.
+//   opts is a 3-element array [warmup, iters, quiet].
+//   We keep array form (not map) because the array path is the most
+//   battle-tested across hexa interp + AOT.
+fn bench_with(name, f, opts) {
+    let mut w = 100
+    let mut it = 1000
+    let mut q = 0
+    if len(opts) >= 1 { w = opts[0] }
+    if len(opts) >= 2 { it = opts[1] }
+    if len(opts) >= 3 { q = opts[2] }
+    return _bench_run_inner(name, f, w, it, q)
+}
+
+// bench_compare: A vs B. Runs both under the same defaults, then prints
+// ratio + delta + significance verdict (significance = |Δp50| > 2σ).
+fn bench_compare(name_a, fa, name_b, fb) {
+    let p50_a = _bench_run_inner(name_a, fa, 100, 1000, 0)
+    let p50_b = _bench_run_inner(name_b, fb, 100, 1000, 0)
+    if p50_b == 0 {
+        println("  compare " + name_a + " vs " + name_b + ": p50_b=0 — ratio undefined")
+        return 0
+    }
+    // Integer-scaled ratio: ratio_x100 = (p50_a * 100) / p50_b
+    // → human form "X.YY"
+    let ratio_x100 = (p50_a * 100) / p50_b
+    let ratio_int = ratio_x100 / 100
+    let ratio_frac = ratio_x100 - ratio_int * 100
+    let mut frac_str = to_string(ratio_frac)
+    while len(frac_str) < 2 { frac_str = "0" + frac_str }
+    // significance: locate stddev for B (second-most-recent row)
+    let n_rows = len(_bench_results)
+    let mut sig = "?"
+    if n_rows >= 2 {
+        let row_b = _bench_results[n_rows - 1]
+        let std_b = row_b[5]
+        let delta = if p50_a > p50_b { p50_a - p50_b } else { p50_b - p50_a }
+        if delta > std_b * 2 { sig = "YES" } else { sig = "NO" }
+    }
+    println("  compare " + name_a + " vs " + name_b
+        + "  ratio=" + to_string(ratio_int) + "." + frac_str + "x"
+        + "  Δ=" + to_string(p50_a - p50_b) + "ns"
+        + "  significant=" + sig)
+    return ratio_x100
+}
+
+// ─── reporting ─────────────────────────────────────────────────────────
+fn run_all() {
+    println("")
+    println("── bench summary (n=" + to_string(len(_bench_results)) + ") ──")
+    let mut i = 0
+    while i < len(_bench_results) {
+        let row = _bench_results[i]
+        println("  " + row[0]
+            + "  mean=" + to_string(row[4]) + "ns"
+            + "  p50=" + to_string(row[1]) + "ns"
+            + "  p90=" + to_string(row[2]) + "ns"
+            + "  p99=" + to_string(row[3]) + "ns"
+            + "  ±" + to_string(row[5]) + "ns"
+            + "  n=" + to_string(row[6]))
+        i = i + 1
+    }
+}
+
+// JSON-serialise the results table (vitest --json compatible shape).
+//   { "results": [
+//       {"name":"x","mean_ns":N,"p50_ns":N,"p90_ns":N,"p99_ns":N,
+//        "stddev_ns":N,"iters":N}, ... ] }
+fn report_json() {
+    let mut out = "{\"results\":["
+    let mut i = 0
+    while i < len(_bench_results) {
+        let row = _bench_results[i]
+        if i > 0 { out = out + "," }
+        out = out + "{\"name\":\"" + row[0] + "\""
+        out = out + ",\"mean_ns\":" + to_string(row[4])
+        out = out + ",\"p50_ns\":" + to_string(row[1])
+        out = out + ",\"p90_ns\":" + to_string(row[2])
+        out = out + ",\"p99_ns\":" + to_string(row[3])
+        out = out + ",\"stddev_ns\":" + to_string(row[5])
+        out = out + ",\"iters\":" + to_string(row[6]) + "}"
+        i = i + 1
+    }
+    out = out + "]}"
+    return out
+}
+
+fn bench_clear() {
+    _bench_results = []
+}
+
+// ─── --selftest ────────────────────────────────────────────────────────
+// Fixture: two pure-hexa workloads that scale linearly with N. Verifies
+// (a) framework runs end-to-end, (b) p50_n200 / p50_n100 ≈ 2x, (c) JSON
+// output is well-formed and contains both names. No exec/sleep — keeps
+// run time deterministic + fast (<1s).
+// Use N large enough that loop body dominates mono_ns() granularity (~1μs
+// in interp). N=2000 vs N=4000 keeps per-iter time in the 100μs+ band so
+// the 2x workload ratio is recoverable without timer-floor distortion.
+fn _bench_loop_n2000() {
+    let mut s = 0
+    let mut i = 0
+    while i < 2000 { s = s + i * 7; i = i + 1 }
+    return s
+}
+fn _bench_loop_n4000() {
+    let mut s = 0
+    let mut i = 0
+    while i < 4000 { s = s + i * 7; i = i + 1 }
+    return s
+}
+
+fn _bench_selftest() {
+    let mut fail = 0
+    let mut n = 0
+
+    bench_clear()
+
+    // 1. bench() with quiet opts records a row.
+    n = n + 1
+    bench_with("self_n2000", _bench_loop_n2000, [5, 30, 1])
+    if len(_bench_results) != 1 {
+        eprintln("FAIL 1 expected 1 row, got " + to_string(len(_bench_results)))
+        fail = fail + 1
+    }
+
+    // 2. second bench adds row (now 2).
+    n = n + 1
+    bench_with("self_n4000", _bench_loop_n4000, [5, 30, 1])
+    if len(_bench_results) != 2 {
+        eprintln("FAIL 2 expected 2 rows, got " + to_string(len(_bench_results)))
+        fail = fail + 1
+    }
+
+    // 3. p50 of n4000 should be > p50 of n2000.
+    n = n + 1
+    let row1 = _bench_results[0]
+    let row2 = _bench_results[1]
+    let p50_a = row1[1]
+    let p50_b = row2[1]
+    if p50_b <= p50_a {
+        eprintln("FAIL 3 p50_n4000=" + to_string(p50_b) + " <= p50_n2000=" + to_string(p50_a))
+        fail = fail + 1
+    }
+
+    // 4. mean ratio should reflect 2x workload. Wide band (1.4x..3.0x):
+    //    interp adds non-linear overhead at small Ns (mono_ns floor +
+    //    GC), but at N≥2000 the body dominates and ratio settles near 2x.
+    n = n + 1
+    let mean_a = row1[4]
+    let mean_b = row2[4]
+    if mean_a == 0 {
+        // workloads completed under interp clock granularity — accept.
+    } else {
+        let ratio_x100 = (mean_b * 100) / mean_a
+        if ratio_x100 < 140 || ratio_x100 > 300 {
+            eprintln("FAIL 4 mean ratio out of band: "
+                + to_string(ratio_x100) + "/100  (mean_a=" + to_string(mean_a)
+                + " mean_b=" + to_string(mean_b) + ")")
+            fail = fail + 1
+        }
+    }
+
+    // 5. report_json contains both names + valid bracket structure.
+    n = n + 1
+    let js = report_json()
+    if !js.contains("self_n2000") || !js.contains("self_n4000") {
+        eprintln("FAIL 5 report_json missing names: " + js)
+        fail = fail + 1
+    }
+    if !js.contains("\"results\":[") {
+        eprintln("FAIL 5 report_json bad shape: " + js)
+        fail = fail + 1
+    }
+
+    // 6. bench_clear resets the registry.
+    n = n + 1
+    bench_clear()
+    if len(_bench_results) != 0 {
+        eprintln("FAIL 6 bench_clear left rows: " + to_string(len(_bench_results)))
+        fail = fail + 1
+    }
+
+    if fail == 0 {
+        println("__BENCH_SELFTEST__ PASS n=" + to_string(n) + " fail=0")
+    } else {
+        println("__BENCH_SELFTEST__ FAIL n=" + to_string(n) + " fail=" + to_string(fail))
+    }
+}
+
+let _bench_argv = args()
+let mut _bench_selftest_flag = false
+let mut _bench_ai = 0
+while _bench_ai < len(_bench_argv) {
+    if _bench_argv[_bench_ai] == "--selftest-bench" { _bench_selftest_flag = true }
+    if _bench_argv[_bench_ai] == "--selftest" { _bench_selftest_flag = true }
+    _bench_ai = _bench_ai + 1
+}
+if _bench_selftest_flag {
+    _bench_selftest()
+}
