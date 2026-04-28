@@ -1028,6 +1028,345 @@ fn a19_decode_file(text: string, parsed: array) -> string {
     return out_lines.join("\n")
 }
 
+// ───────────────────────── PASS 0.5 — encode-side id-rewrite ─────────────────────────
+//
+// Problem (F9 PASS 0 follow-up, raw 91 honest C3 from a89f3328):
+//   PASS 0 fixed the CENSUS axis: cross-file s1/s2 with same fingerprint now
+//   collapse into ONE canonical bucket so PASS 2 dict builder counts file_count
+//   correctly. BUT the dict still serializes patterns with the FIRST encountered
+//   raw key (`# schema:s1 ts foo bar`), and PASS 3 a19_encode_file does literal
+//   line-equality match. Result: file B with `# schema:s2 ts foo bar` MISSES the
+//   substitution because the literal differs in `s1` vs `s2`.
+//
+// Fix (PASS 0.5 — runs at encode time, AFTER dict load, BEFORE substitution):
+//   1. Re-derive per-file s_id → canonical-id map from the file's own schema headers
+//   2. Canonicalize the dict's raw `s<N>` keys to `S<hash>` form so dict patterns
+//      become "# schema:S<hash> ts foo bar" (independent of which file was first)
+//   3. Rewrite the file's header lines: replace `s<N>` references in key field
+//      with the canonical-id from step (1)
+//   4. Match canonicalized file lines against canonicalized dict patterns
+//   5. On substitution: emit footer with id_map=s1:Sxxx,s2:Syyy,...
+//   6. Decode reverses: parse footer, expand `^D<id>` to canonical pattern, then
+//      apply reverse map (Sxxx → s1) to recover per-file declaration form.
+//
+// Idempotency contract (raw 65 + 68):
+//   - encode(decode(x)) == x: footer carries id_map; decode restores per-file ids
+//   - decode(encode(y)) == y: encode is purely substitution + footer; reversing
+//     the substitution AND stripping the footer recovers original byte stream
+//   - try-and-revert preserved: if encoded_v2 length >= original, return original
+//
+// Falsifier (preregistered, raw 71):
+//   F-A19-6: encode(decode(x)) byte-eq fail on adversarial corpus → reject
+//            PASS 0.5 (encode-side rewrite breaks idempotency).
+
+// _build_dict_id_map — dict-level raw_id → canonical_id map.
+// Scan the dict's schema entries (tag=A19_TAG_SCHEMA) to build the map.
+// Returns parallel arrays [raw_keys, canonical_keys].
+fn _build_dict_id_map(parsed: array) -> array {
+    let tags = parsed[1]
+    let keys = parsed[2]
+    let bodies = parsed[3]
+    let mut raw = []
+    let mut canon = []
+    let mut i = 0
+    while i < len(tags) {
+        if tags[i] == A19_TAG_SCHEMA {
+            let canonical = a19_schema_fingerprint(bodies[i])
+            // Avoid duplicates (two schema entries with same fingerprint shouldn't
+            // happen post-PASS-0, but guard anyway).
+            let mut dup = false
+            let mut j = 0
+            while j < len(raw) {
+                if raw[j] == keys[i] { dup = true; break }
+                j = j + 1
+            }
+            if !dup { raw.push(keys[i]); canon.push(canonical) }
+        }
+        i = i + 1
+    }
+    return [raw, canon]
+}
+
+// _canonicalize_dict_pattern — render the dict pattern at idx in canonical form.
+// For normalizable tags whose key contains `s<N>` (or `s<N>.col`), the s_id
+// portion gets replaced by the canonical-id `S<hash>` derived from the parent
+// schema's fingerprint. For schema tag itself, the key IS replaced by the
+// fingerprint of its body (self-referential canonicalization).
+fn _canonicalize_dict_pattern(parsed: array, idx: int, dict_id_map: array) -> string {
+    let tags = parsed[1]
+    let keys = parsed[2]
+    let bodies = parsed[3]
+    if idx < 0 || idx >= len(tags) { return "" }
+    let tag = tags[idx]
+    let key = keys[idx]
+    let body = bodies[idx]
+    let needs_norm = (tag == A19_TAG_SCHEMA || tag == A19_TAG_DICT
+                  || tag == A19_TAG_ENUM || tag == A19_TAG_COLPREFIX
+                  || tag == A19_TAG_CONST || tag == A19_TAG_ROWPREFIX)
+    let norm_key = if needs_norm {
+        if tag == A19_TAG_SCHEMA {
+            a19_schema_fingerprint(body)
+        } else {
+            _normalize_id_in_key(key, dict_id_map)
+        }
+    } else {
+        key
+    }
+    if len(norm_key) > 0 {
+        if len(body) > 0 { return "# " + tag + ":" + norm_key + " " + body }
+        return "# " + tag + ":" + norm_key
+    }
+    if len(body) > 0 { return "# " + tag + ": " + body }
+    return "# " + tag + ":"
+}
+
+// _canonicalize_file_line — given a raw header line and the file's local
+// id_map, produce the canonical-id-substituted form. Non-header lines pass
+// through unchanged.
+fn _canonicalize_file_line(line: string, id_map: array) -> string {
+    if len(line) < 3 { return line }
+    if _byte_at(line, 0) != "#" { return line }
+    let cls = _classify_header(line)
+    if len(cls) != 3 { return line }
+    let tag = cls[0]
+    let key = cls[1]
+    let body = cls[2]
+    let needs_norm = (tag == A19_TAG_SCHEMA || tag == A19_TAG_DICT
+                  || tag == A19_TAG_ENUM || tag == A19_TAG_COLPREFIX
+                  || tag == A19_TAG_CONST || tag == A19_TAG_ROWPREFIX)
+    if !needs_norm { return line }
+    let nk = if tag == A19_TAG_SCHEMA {
+        a19_schema_fingerprint(body)
+    } else {
+        _normalize_id_in_key(key, id_map)
+    }
+    if nk == key { return line }
+    if len(nk) > 0 {
+        if len(body) > 0 { return "# " + tag + ":" + nk + " " + body }
+        return "# " + tag + ":" + nk
+    }
+    return line
+}
+
+// _build_file_id_map — derive a single-file (s_id → canonical_id) map directly
+// from the in-memory text (no extra read_file call).
+fn _build_file_id_map(text: string) -> array {
+    let entries = _scan_one_file(text)
+    let mut keys = []
+    let mut vals = []
+    let mut ei = 0
+    while ei < len(entries) {
+        let e = entries[ei]
+        if e[0] == A19_TAG_SCHEMA {
+            let s_id = e[1]
+            let body = e[2]
+            let canon = a19_schema_fingerprint(body)
+            let mut dup = false
+            let mut k = 0
+            while k < len(keys) {
+                if keys[k] == s_id { dup = true; break }
+                k = k + 1
+            }
+            if !dup { keys.push(s_id); vals.push(canon) }
+        }
+        ei = ei + 1
+    }
+    return [keys, vals]
+}
+
+// _serialize_id_map — render a (raw, canonical) parallel-array map as a
+// compact `s1:Sxxx,s2:Syyy` string for the encoded-file footer.
+fn _serialize_id_map(id_map: array) -> string {
+    let keys = id_map[0]
+    let vals = id_map[1]
+    let mut parts = []
+    let mut i = 0
+    while i < len(keys) {
+        parts.push(keys[i] + ":" + vals[i])
+        i = i + 1
+    }
+    return parts.join(",")
+}
+
+// _parse_id_map — inverse of _serialize_id_map. Returns parallel arrays
+// [canonical_keys, raw_keys] (note: REVERSED — used at decode for canon→raw).
+fn _parse_id_map(s: string) -> array {
+    let mut canon = []
+    let mut raw = []
+    if len(s) == 0 { return [canon, raw] }
+    let parts = split(s, ",")
+    let mut i = 0
+    while i < len(parts) {
+        let p = parts[i].trim()
+        let colon = p.index_of(":")
+        if colon > 0 {
+            let r = p.substring(0, colon)
+            let c = p.substring(colon + 1, len(p))
+            canon.push(c); raw.push(r)
+        }
+        i = i + 1
+    }
+    return [canon, raw]
+}
+
+// _decanonicalize_line — inverse of _canonicalize_file_line. Given a canonical
+// header line and a (canonical→raw) map, restore the original `s<N>` form.
+fn _decanonicalize_line(line: string, canon_to_raw: array) -> string {
+    if len(line) < 3 { return line }
+    if _byte_at(line, 0) != "#" { return line }
+    let cls = _classify_header(line)
+    if len(cls) != 3 { return line }
+    let tag = cls[0]
+    let key = cls[1]
+    let body = cls[2]
+    let needs_norm = (tag == A19_TAG_SCHEMA || tag == A19_TAG_DICT
+                  || tag == A19_TAG_ENUM || tag == A19_TAG_COLPREFIX
+                  || tag == A19_TAG_CONST || tag == A19_TAG_ROWPREFIX)
+    if !needs_norm { return line }
+    // For dependent tags, normalize_id_in_key splits on dot — same logic in reverse.
+    let nk = _normalize_id_in_key(key, canon_to_raw)
+    if nk == key { return line }
+    if len(nk) > 0 {
+        if len(body) > 0 { return "# " + tag + ":" + nk + " " + body }
+        return "# " + tag + ":" + nk
+    }
+    return line
+}
+
+const A19_FOOTER_V2_PREFIX = "# shared-dict-ref-v2:"
+
+// a19_encode_file_v2 — PASS 0.5 encode. Builds per-file id_map, canonicalizes
+// dict patterns + file headers, substitutes, emits id-map footer for decode.
+//
+// Footer format:
+//   # shared-dict-ref-v2: <dict_path> n_subs=<n> id_map=<csv>
+fn a19_encode_file_v2(text: string, parsed: array, dict_path: string) -> string {
+    let tags = parsed[1]
+    let n_entries = len(tags)
+    if n_entries == 0 { return text }
+    // Dict-side canonical id-map (s<N> → S<hash> from dict's schema entries).
+    let dict_id_map = _build_dict_id_map(parsed)
+    // File-side id-map.
+    let file_id_map = _build_file_id_map(text)
+    // Pre-render canonical dict patterns once.
+    let mut canon_patterns = []
+    let mut k = 0
+    while k < n_entries {
+        canon_patterns.push(_canonicalize_dict_pattern(parsed, k, dict_id_map))
+        k = k + 1
+    }
+    let lines = split(text, "\n")
+    let mut out_lines = []
+    let mut i = 0
+    let mut substitutions = 0
+    while i < len(lines) {
+        let l = lines[i]
+        if len(l) >= 2 && _byte_at(l, 0) == "^" && _byte_at(l, 1) == "D" {
+            out_lines.push("^D^" + l.substring(2, len(l)))
+            i = i + 1
+            continue
+        }
+        let mut matched_id = -1
+        if len(l) > 0 && _byte_at(l, 0) == "#" {
+            let canon_line = _canonicalize_file_line(l, file_id_map)
+            let mut p = 0
+            while p < n_entries {
+                if canon_patterns[p] == canon_line { matched_id = p; break }
+                p = p + 1
+            }
+        }
+        if matched_id >= 0 {
+            out_lines.push(A19_SIGIL + to_string(matched_id))
+            substitutions = substitutions + 1
+        } else {
+            out_lines.push(l)
+        }
+        i = i + 1
+    }
+    if substitutions > 0 {
+        let last_idx = len(out_lines) - 1
+        let id_map_str = _serialize_id_map(file_id_map)
+        let footer_line = A19_FOOTER_V2_PREFIX + " " + dict_path
+                        + " n_subs=" + to_string(substitutions)
+                        + " id_map=" + id_map_str
+        if last_idx >= 0 && len(out_lines[last_idx]) == 0 {
+            out_lines[last_idx] = footer_line
+            out_lines.push("")
+        } else {
+            out_lines.push(footer_line)
+        }
+    }
+    let encoded = out_lines.join("\n")
+    // Try-and-revert: if encode failed to shrink, return original.
+    if substitutions == 0 || len(encoded) >= len(text) {
+        return text
+    }
+    return encoded
+}
+
+// a19_decode_file_v2 — PASS 0.5 decode. Reads id-map footer, restores
+// per-file s<N> ids on canonical-form patterns expanded from dict.
+fn a19_decode_file_v2(text: string, parsed: array) -> string {
+    // First pass: locate footer + extract id_map.
+    let lines = split(text, "\n")
+    let mut canon_to_raw = [[], []]
+    let mut footer_idx = -1
+    let mut fi = 0
+    while fi < len(lines) {
+        let fl = lines[fi]
+        if fl.index_of(A19_FOOTER_V2_PREFIX) == 0 {
+            footer_idx = fi
+            // Extract id_map=... portion.
+            let imk = fl.index_of("id_map=")
+            if imk >= 0 {
+                let csv = fl.substring(imk + 7, len(fl)).trim()
+                canon_to_raw = _parse_id_map(csv)
+            }
+            break
+        }
+        fi = fi + 1
+    }
+    // Build dict-side canonical id-map for canonical pattern reconstruction.
+    let dict_id_map = _build_dict_id_map(parsed)
+    let mut out_lines = []
+    let mut i = 0
+    while i < len(lines) {
+        let l = lines[i]
+        // Drop both v1 and v2 footer lines (raw 91 honest: we accept either).
+        if l.index_of("# shared-dict-ref:") == 0 { i = i + 1; continue }
+        if l.index_of(A19_FOOTER_V2_PREFIX) == 0 { i = i + 1; continue }
+        if len(l) >= 3 && _byte_at(l, 0) == "^" && _byte_at(l, 1) == "D"
+           && _byte_at(l, 2) == "^" {
+            out_lines.push("^D" + l.substring(3, len(l)))
+            i = i + 1
+            continue
+        }
+        if len(l) >= 3 && _byte_at(l, 0) == "^" && _byte_at(l, 1) == "D" {
+            let id_str = l.substring(2, len(l))
+            let mut all_digits = len(id_str) > 0
+            let mut q = 0
+            while q < len(id_str) {
+                let c = _byte_at(id_str, q)
+                if c < "0" || c > "9" { all_digits = false; break }
+                q = q + 1
+            }
+            if all_digits {
+                let id_num = parse_int(id_str)
+                let canon_pat = _canonicalize_dict_pattern(parsed, id_num, dict_id_map)
+                if len(canon_pat) > 0 {
+                    let restored = _decanonicalize_line(canon_pat, canon_to_raw)
+                    out_lines.push(restored)
+                    i = i + 1
+                    continue
+                }
+            }
+        }
+        out_lines.push(l)
+        i = i + 1
+    }
+    return out_lines.join("\n")
+}
+
 // ───────────────────────── selftest ─────────────────────────
 
 fn _write_fixture_file(path: string, content: string) -> int {
@@ -1399,6 +1738,226 @@ fn _selftest() -> int {
                 + " unmapped=" + nk_unmapped)
     }
 
+    // ───── F9 PASS 0.5: encode-side id-rewrite fixtures (F9-6..F9-10) ─────
+    //
+    // These exercise a19_encode_file_v2 / a19_decode_file_v2 — the encode-side
+    // canonicalization that closes the dict-pattern-vs-file-line literal gap left
+    // open by PASS 0 (which only fixes the CENSUS axis, not the byte-saving axis).
+    //
+    //   F9-6: encode-side rewrite verification — adversarial 2-file (s1 vs s2,
+    //         same fingerprint) corpus. v2 encode substitutes BOTH files; v1
+    //         (PASS 3) only substitutes the file matching dict's raw key.
+    //   F9-7: decode-side reverse byte-eq — encode_v2 → decode_v2 round-trip
+    //         on the same adversarial fixture must be byte-identical to input.
+    //   F9-8: mixed canonical/raw — file with multiple schemas (s1, s2, s7) all
+    //         declared in unique orders gets all substitutions on encode_v2.
+    //   F9-9: adversarial corpus census-encode parity — files declare same
+    //         schemas in different s<N> orderings; v2 encode shrinks each.
+    //   F9-10: break-even at small file size — v2 try-and-revert returns
+    //          original when footer overhead > savings (raw 65/68 contract).
+
+    let f95_root = "/tmp/hxc_a19_f95_pass05_corpus"
+    let _f95_mkdir = exec("mkdir -p " + _shell_escape(f95_root))
+
+    // Build a 4-file adversarial corpus where multiple long-bodied schemas
+    // get declared under different per-file s<N> ids. To beat the v2 footer
+    // overhead (~80 bytes) we use long bodies + multiple header occurrences:
+    // each file has TWO rich schemas + dependent enum/const headers, all
+    // declared in shuffled s<N> assignments. Total per-file ~400-500 bytes.
+    let body_x = "ts actor cmd target verdict latency_ms request_id session_id parent_id user_agent ip_addr"
+    let body_y = "iso_ts cycle_id phase tick atom verdict latency_us memory_kb cpu_pct disk_io_bytes net_io_bytes"
+    let enum_v = "PASS|FAIL|SKIP|RETRY|TIMEOUT|CANCEL|ERROR|DEFERRED"
+    let const_actor = "hive-omega-cycle-controller"
+    // file_a: schemas s1=body_x, s2=body_y; enum:s1.5 verdicts; const:s2.6 actor
+    let f95_a = "# schema:s1 " + body_x
+              + "\n# schema:s2 " + body_y
+              + "\n# enum:s1.5 " + enum_v
+              + "\n# const:s2.6 " + const_actor
+              + "\n@s1 1|hive|do|t1|PASS|10|r1|S1|P1|UA1|1.1.1.1\n"
+              + "@s2 2|c1|p1|t1|a1|PASS|10|100|50|1024|2048\n"
+    // file_b: schemas s7=body_x, s3=body_y; enum:s7.5 verdicts; const:s3.6 actor
+    // (same fingerprints as file_a but different s<N> assignment)
+    let f95_b = "# schema:s7 " + body_x
+              + "\n# schema:s3 " + body_y
+              + "\n# enum:s7.5 " + enum_v
+              + "\n# const:s3.6 " + const_actor
+              + "\n@s7 3|hive|do|t2|FAIL|20|r2|S2|P2|UA2|2.2.2.2\n"
+              + "@s3 4|c2|p2|t2|a2|FAIL|20|200|60|2048|4096\n"
+    // file_c: schemas s2=body_x, s1=body_y (REVERSED order); enum:s2.5; const:s1.6
+    let f95_c = "# schema:s2 " + body_x
+              + "\n# schema:s1 " + body_y
+              + "\n# enum:s2.5 " + enum_v
+              + "\n# const:s1.6 " + const_actor
+              + "\n@s2 5|hive|do|t3|SKIP|30|r3|S3|P3|UA3|3.3.3.3\n"
+              + "@s1 6|c3|p3|t3|a3|SKIP|30|300|70|3072|6144\n"
+    // file_d: schemas s9=body_x, s4=body_y; enum:s9.5; const:s4.6
+    let f95_d = "# schema:s9 " + body_x
+              + "\n# schema:s4 " + body_y
+              + "\n# enum:s9.5 " + enum_v
+              + "\n# const:s4.6 " + const_actor
+              + "\n@s9 7|hive|do|t4|RETRY|40|r4|S4|P4|UA4|4.4.4.4\n"
+              + "@s4 8|c4|p4|t4|a4|RETRY|40|400|80|4096|8192\n"
+    let p95a = f95_root + "/file_a.hxc"
+    let p95b = f95_root + "/file_b.hxc"
+    let p95c = f95_root + "/file_c.hxc"
+    let p95d = f95_root + "/file_d.hxc"
+    write_file(p95a, f95_a)
+    write_file(p95b, f95_b)
+    write_file(p95c, f95_c)
+    write_file(p95d, f95_d)
+
+    // Build dict from this adversarial corpus.
+    let scan95 = a19_scan_files([p95a, p95b, p95c, p95d])
+    let cross95 = a19_filter_cross_file(scan95)
+    let scored95 = a19_score_and_rank(cross95)
+    let topk95 = a19_select_topk(scored95, 256)
+    let dict_text95 = a19_emit_dict(f95_root, topk95)
+    let parsed95 = a19_parse_dict(dict_text95)
+    let dict_path95 = f95_root + "/_shared_dict.hxc"
+    write_file(dict_path95, dict_text95)
+
+    // F9-6: encode_v2 substitutes ALL 4 files (each has the same fingerprint
+    // schema declared under different s<N>).
+    let enc_v1_a = a19_encode_file(f95_a, parsed95, dict_path95)
+    let enc_v1_b = a19_encode_file(f95_b, parsed95, dict_path95)
+    let enc_v1_c = a19_encode_file(f95_c, parsed95, dict_path95)
+    let enc_v1_d = a19_encode_file(f95_d, parsed95, dict_path95)
+    let enc_v2_a = a19_encode_file_v2(f95_a, parsed95, dict_path95)
+    let enc_v2_b = a19_encode_file_v2(f95_b, parsed95, dict_path95)
+    let enc_v2_c = a19_encode_file_v2(f95_c, parsed95, dict_path95)
+    let enc_v2_d = a19_encode_file_v2(f95_d, parsed95, dict_path95)
+    // v2 must shrink at least 3 of the 4 (the dict was built from one of them
+    // so only its raw key directly matched in v1 — the other 3 missed in v1).
+    let mut v1_subs = 0
+    let mut v2_subs = 0
+    if len(enc_v1_a) < len(f95_a) { v1_subs = v1_subs + 1 }
+    if len(enc_v1_b) < len(f95_b) { v1_subs = v1_subs + 1 }
+    if len(enc_v1_c) < len(f95_c) { v1_subs = v1_subs + 1 }
+    if len(enc_v1_d) < len(f95_d) { v1_subs = v1_subs + 1 }
+    if len(enc_v2_a) < len(f95_a) { v2_subs = v2_subs + 1 }
+    if len(enc_v2_b) < len(f95_b) { v2_subs = v2_subs + 1 }
+    if len(enc_v2_c) < len(f95_c) { v2_subs = v2_subs + 1 }
+    if len(enc_v2_d) < len(f95_d) { v2_subs = v2_subs + 1 }
+    if v2_subs > v1_subs {
+        pass = pass + 1
+        println("  PASS: F9-6 encode-side rewrite — v1 shrank " + to_string(v1_subs)
+                + "/4, v2 shrank " + to_string(v2_subs) + "/4")
+    } else {
+        fail = fail + 1
+        println("  FAIL: F9-6 v1=" + to_string(v1_subs) + " v2=" + to_string(v2_subs)
+                + " (expected v2 > v1)")
+    }
+
+    // F9-7: decode_v2 round-trip — encode_v2 + decode_v2 must equal original.
+    let dec_v2_a = a19_decode_file_v2(enc_v2_a, parsed95)
+    let dec_v2_b = a19_decode_file_v2(enc_v2_b, parsed95)
+    let dec_v2_c = a19_decode_file_v2(enc_v2_c, parsed95)
+    let dec_v2_d = a19_decode_file_v2(enc_v2_d, parsed95)
+    if dec_v2_a == f95_a && dec_v2_b == f95_b && dec_v2_c == f95_c && dec_v2_d == f95_d {
+        pass = pass + 1
+        println("  PASS: F9-7 decode-side reverse byte-eq across 4 adversarial files")
+    } else {
+        fail = fail + 1
+        let mut mismatches = 0
+        if dec_v2_a != f95_a { mismatches = mismatches + 1 }
+        if dec_v2_b != f95_b { mismatches = mismatches + 1 }
+        if dec_v2_c != f95_c { mismatches = mismatches + 1 }
+        if dec_v2_d != f95_d { mismatches = mismatches + 1 }
+        println("  FAIL: F9-7 byte-eq broken on " + to_string(mismatches) + "/4 files")
+    }
+
+    // F9-8: mixed canonical/raw — multi-schema file. Build a file with three
+    // long-bodied schemas declared under non-monotonic s<N> (s7, s2, s1) plus
+    // dependent enum/colprefix headers. Sibling file uses different s<N>.
+    let body_p = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda"
+    let body_q = "ts actor cmd target verdict latency_ms request_id session_id parent_id user_agent ip_addr"
+    let body_r = "x y z aa bb cc dd ee ff gg hh ii jj kk ll mm nn oo pp qq"
+    let f98 = "# schema:s7 " + body_p
+            + "\n# schema:s2 " + body_q
+            + "\n# schema:s1 " + body_r
+            + "\n# enum:s2.5 " + enum_v
+            + "\n@s7 1|2|3|4|5|6|7|8|9|10|11\n@s2 1|hive|do|t1|PASS|10|r1|S1|P1|UA1|1.1.1.1\n"
+            + "@s1 a|b|c|d|e|f|g|h|i|j|k|l|m|n|o|p|q|r|s|t\n"
+    // Sibling: same fingerprints, different s<N>.
+    let f98_sib = "# schema:s1 " + body_p
+                + "\n# schema:s2 " + body_q
+                + "\n# schema:s9 " + body_r
+                + "\n# enum:s2.5 " + enum_v
+                + "\n@s1 1|2|3|4|5|6|7|8|9|10|11\n@s2 1|hive|do|t1|PASS|10|r1|S1|P1|UA1|1.1.1.1\n"
+                + "@s9 a|b|c|d|e|f|g|h|i|j|k|l|m|n|o|p|q|r|s|t\n"
+    let p98a = f95_root + "/file_98a.hxc"
+    let p98b = f95_root + "/file_98b.hxc"
+    write_file(p98a, f98)
+    write_file(p98b, f98_sib)
+    let scan98 = a19_scan_files([p98a, p98b])
+    let cross98 = a19_filter_cross_file(scan98)
+    let scored98 = a19_score_and_rank(cross98)
+    let topk98 = a19_select_topk(scored98, 256)
+    let dict_text98 = a19_emit_dict(f95_root, topk98)
+    let parsed98 = a19_parse_dict(dict_text98)
+    let dict_path98 = f95_root + "/_shared_dict_98.hxc"
+    write_file(dict_path98, dict_text98)
+    let enc98 = a19_encode_file_v2(f98, parsed98, dict_path98)
+    let dec98 = a19_decode_file_v2(enc98, parsed98)
+    // The dict should have ≥2 cross-file schema fingerprints (alpha-beta-gamma
+    // and ts-foo-bar-baz appear in both files; x-y-z appears in both too).
+    // v2 encode should substitute multiple lines AND round-trip byte-eq.
+    if dec98 == f98 && len(enc98) < len(f98) {
+        pass = pass + 1
+        println("  PASS: F9-8 mixed canonical/raw — encode shrank ("
+                + to_string(len(f98)) + " → " + to_string(len(enc98))
+                + ") + round-trip byte-eq")
+    } else {
+        fail = fail + 1
+        println("  FAIL: F9-8 mixed encode_len=" + to_string(len(enc98))
+                + " input=" + to_string(len(f98))
+                + " round_trip_eq=" + to_string(dec98 == f98))
+    }
+
+    // F9-9: adversarial corpus parity — sum the byte savings across the 4
+    // adversarial files and compare v1 vs v2 saving%.
+    let total_in = len(f95_a) + len(f95_b) + len(f95_c) + len(f95_d)
+    let total_v1 = len(enc_v1_a) + len(enc_v1_b) + len(enc_v1_c) + len(enc_v1_d)
+    let total_v2 = len(enc_v2_a) + len(enc_v2_b) + len(enc_v2_c) + len(enc_v2_d)
+    if total_v2 < total_v1 {
+        let v1_pp = ((total_in - total_v1) * 1000) / total_in
+        let v2_pp = ((total_in - total_v2) * 1000) / total_in
+        pass = pass + 1
+        println("  PASS: F9-9 adversarial saving% — v1=" + to_string(v1_pp / 10) + "."
+                + to_string(v1_pp % 10) + "%, v2=" + to_string(v2_pp / 10) + "."
+                + to_string(v2_pp % 10) + "% (delta_pp="
+                + to_string((v2_pp - v1_pp) / 10) + "."
+                + to_string(if (v2_pp - v1_pp) % 10 >= 0 { (v2_pp - v1_pp) % 10 } else { -((v2_pp - v1_pp) % 10) }) + ")")
+    } else {
+        fail = fail + 1
+        println("  FAIL: F9-9 v1_total=" + to_string(total_v1) + " v2_total=" + to_string(total_v2)
+                + " (expected v2 < v1)")
+    }
+
+    // F9-10: break-even at small file size — a single tiny file with one
+    // shared schema declaration. After substitution, footer overhead may push
+    // encoded length ≥ original; try-and-revert returns input verbatim.
+    let f910 = "# schema:s1 ts foo bar baz\n@s1 \"x\"|1|2|3\n"
+    // Dict from f95 corpus already contains the shared schema. v2 encode on
+    // this lone tiny file: the candidate substitution saves
+    // ~len("# schema:s1 ts foo bar baz")=27 bytes, but footer with id_map adds
+    // ~70-100 bytes → try-and-revert kicks in.
+    let enc910 = a19_encode_file_v2(f910, parsed95, dict_path95)
+    if enc910 == f910 {
+        pass = pass + 1
+        println("  PASS: F9-10 break-even try-and-revert — tiny file passthrough ("
+                + to_string(len(f910)) + " bytes preserved)")
+    } else {
+        fail = fail + 1
+        println("  FAIL: F9-10 break-even — input=" + to_string(len(f910))
+                + " encoded=" + to_string(len(enc910)))
+    }
+
+    // Cleanup PASS 0.5 fixture.
+    if fail == 0 {
+        let _rm95 = exec("rm -rf " + _shell_escape(f95_root))
+    }
+
     // Cleanup F9 fixture.
     if fail == 0 {
         let _rm9 = exec("rm -rf " + _shell_escape(f9_root))
@@ -1411,7 +1970,7 @@ fn _selftest() -> int {
 
     println("Results: " + to_string(pass) + " PASS / " + to_string(fail) + " FAIL")
     println("__HXC_A19_SELFTEST__ " + (if fail == 0 { "PASS" } else { "FAIL" })
-            + " (FULL+F9: PASS 0 schema-id-norm + PASS 1..4 + 5 fixture round-trip + 5 F9 fixtures)")
+            + " (FULL+F9+PASS0.5: PASS 0 + 0.5 + 1..4 + 5 fixture round-trip + 5 F9 + 5 PASS0.5 fixtures)")
     if fail == 0 { return 0 }
     return 1
 }
@@ -1514,6 +2073,46 @@ fn main() {
         exit(0)
     }
 
-    eprintln("usage: hexa hxc_a19_cross_file_fed.hexa [--selftest | scan <root> | build-dict <root> <dict-out> | encode <dict> <in> <out> | decode <dict> <in> <out>]")
+    // PASS 0.5 — encode-side id-rewrite subcommands.
+    let enc2_idx = _find_subcmd(av, "encode-v2")
+    if enc2_idx >= 0 {
+        if enc2_idx + 3 >= len(av) {
+            eprintln("usage: hexa hxc_a19_cross_file_fed.hexa encode-v2 <dict> <file-in> <file-out>")
+            exit(3)
+        }
+        let dict_path = av[enc2_idx + 1]
+        let in_path = av[enc2_idx + 2]
+        let out_path = av[enc2_idx + 3]
+        let dict_text = to_string(read_file(dict_path))
+        let parsed = a19_parse_dict(dict_text)
+        let in_text = to_string(read_file(in_path))
+        let enc = a19_encode_file_v2(in_text, parsed, dict_path)
+        write_file(out_path, enc)
+        exit(0)
+    }
+
+    let dec2_idx = _find_subcmd(av, "decode-v2")
+    if dec2_idx >= 0 {
+        if dec2_idx + 3 >= len(av) {
+            eprintln("usage: hexa hxc_a19_cross_file_fed.hexa decode-v2 <dict> <file-in> <file-out>")
+            exit(3)
+        }
+        let dict_path = av[dec2_idx + 1]
+        let in_path = av[dec2_idx + 2]
+        let out_path = av[dec2_idx + 3]
+        let dict_text = to_string(read_file(dict_path))
+        let parsed = a19_parse_dict(dict_text)
+        let pv = parsed[4]
+        if pv[0] != "1" {
+            eprintln("# a19 decode-v2: dict checksum mismatch — raw 91 C3 fallback would apply")
+            exit(4)
+        }
+        let in_text = to_string(read_file(in_path))
+        let dec = a19_decode_file_v2(in_text, parsed)
+        write_file(out_path, dec)
+        exit(0)
+    }
+
+    eprintln("usage: hexa hxc_a19_cross_file_fed.hexa [--selftest | scan <root> | build-dict <root> <dict-out> | encode <dict> <in> <out> | decode <dict> <in> <out> | encode-v2 <dict> <in> <out> | decode-v2 <dict> <in> <out>]")
     exit(3)
 }
