@@ -1,0 +1,676 @@
+// self/stdlib/markdown.hexa — CommonMark-subset markdown → HTML.
+//
+// Resolves part of hive blocker `goal_hexa_native_html_templating`.
+// Replaces vendored `marked.min.js` (used by export-html/template.js
+// via `marked.parse(text)`) with a pure-hexa renderer covering the
+// ~80% surface that hive's chat-history export actually exercises.
+//
+// Block-level coverage:
+//   - ATX heading  (#, ##, ..., ######)
+//   - paragraph    (consecutive non-blank lines)
+//   - fenced code block (```lang ... ```)
+//   - bulleted list   (- item, * item, + item)
+//   - ordered list    (1. item, 2. item, ...)
+//   - blockquote      (> ...)
+//   - horizontal rule (---, ***, ___ on own line)
+//
+// Inline coverage (within paragraphs/list items/headings):
+//   - bold       (**text** or __text__)
+//   - italic     (*text*  or _text_)
+//   - code       (`text`)
+//   - link       ([text](url))
+//   - image      (![alt](url))
+//   - line break (two trailing spaces  → <br>)
+//
+// Out of scope (deliberate — caller can post-process if needed):
+//   - HTML pass-through (mirrors marked's TUI mode in hive: tags shown verbatim)
+//   - tables / footnotes / definition lists / task lists / strikethrough
+//   - autolinks, reference-style links, nested lists deeper than 1 level
+//
+// raw 9 (pure hexa): zero exec(), zero external libs.
+// raw 91 (no_silent_errors): malformed inline (unmatched `**`, `[`, `(`)
+//   falls back to literal text — never throws and never silently drops.
+// raw 159 (hexa-lang-upstream-proposal-mandate): hive ports
+//   `use "self/stdlib/markdown"` and never re-implements these.
+//
+// --selftest mode:
+//   hexa run self/stdlib/markdown.hexa --selftest
+//     → emits __MARKDOWN_SELFTEST__ <PASS|FAIL> n=<N> fail=<M>
+//
+// Exports:
+//   markdown_to_html(src: string) -> string
+//       Render full markdown document to HTML fragment.
+//   markdown_inline(src: string) -> string
+//       Render inline-only span (no block wrappers).
+//   markdown_escape_html(text: string) -> string
+//       Local copy of html_escape (deliberate — keeps this module
+//       self-contained for porting). Mirrors html_template.html_escape.
+
+// ── _md_escape ─────────────────────────────────────────────
+fn _md_escape(text) {
+    let s = to_string(text)
+    let mut out = ""
+    let mut i = 0
+    let n = len(s)
+    while i < n {
+        let ch = s[i]
+        if ch == "&" {
+            out = out + "&amp;"
+        } else {
+            if ch == "<" {
+                out = out + "&lt;"
+            } else {
+                if ch == ">" {
+                    out = out + "&gt;"
+                } else {
+                    if ch == "\"" {
+                        out = out + "&quot;"
+                    } else {
+                        if ch == "'" {
+                            out = out + "&#39;"
+                        } else {
+                            out = out + ch
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn markdown_escape_html(text) {
+    return _md_escape(text)
+}
+
+// ── _is_unsafe_url ─────────────────────────────────────────
+// Mirror template.js sanitization (line 1497, 1510): block javascript:,
+// vbscript:, data: schemes to prevent XSS via link/img.
+fn _is_unsafe_url(url) {
+    let u = to_string(url).trim().to_lower()
+    if u.starts_with("javascript:") { return true }
+    if u.starts_with("vbscript:")   { return true }
+    if u.starts_with("data:")       { return true }
+    return false
+}
+
+// ── _str_substr ────────────────────────────────────────────
+// Slice characters [start, end). Pure hexa (no lib dep).
+fn _str_substr(s, start, end) {
+    let n = len(s)
+    let mut a = start
+    let mut b = end
+    if a < 0 { a = 0 }
+    if b > n { b = n }
+    if a >= b { return "" }
+    let mut out = ""
+    let mut i = a
+    while i < b {
+        out = out + s[i]
+        i = i + 1
+    }
+    return out
+}
+
+// ── _str_indexof_from ──────────────────────────────────────
+// Find index of `needle` in `s` starting at `from`. Returns -1 if absent.
+fn _str_indexof_from(s, needle, from) {
+    let n = len(s)
+    let m = len(needle)
+    if m == 0 { return from }
+    let mut i = from
+    while i + m <= n {
+        let mut j = 0
+        let mut ok = true
+        while j < m {
+            if s[i + j] != needle[j] {
+                ok = false
+                break
+            }
+            j = j + 1
+        }
+        if ok { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// ── _str_starts ────────────────────────────────────────────
+fn _str_starts(s, prefix, at) {
+    let m = len(prefix)
+    let n = len(s)
+    if at + m > n { return false }
+    let mut j = 0
+    while j < m {
+        if s[at + j] != prefix[j] { return false }
+        j = j + 1
+    }
+    return true
+}
+
+// ── _is_digit ──────────────────────────────────────────────
+fn _is_digit(ch) {
+    return ch >= "0" && ch <= "9"
+}
+
+// ── _render_inline ─────────────────────────────────────────
+// Process inline emphasis / code / links / images on a single text run.
+// Input: raw markdown text (already stripped of block markers).
+// Output: HTML with non-markdown-special chars HTML-escaped.
+fn _render_inline(text) {
+    let s = to_string(text)
+    let n = len(s)
+    let mut out = ""
+    let mut i = 0
+    while i < n {
+        let ch = s[i]
+        // Backslash escape: \X → literal X (escaped if HTML-special)
+        if ch == "\\" && i + 1 < n {
+            let nxt = s[i + 1]
+            // Markdown escapable chars per CommonMark: \`*_{}[]()#+-.!|>~
+            out = out + _md_escape(nxt)
+            i = i + 2
+            continue
+        }
+        // Inline code: `code`
+        if ch == "`" {
+            let close = _str_indexof_from(s, "`", i + 1)
+            if close >= 0 {
+                let inner = _str_substr(s, i + 1, close)
+                out = out + "<code>" + _md_escape(inner) + "</code>"
+                i = close + 1
+                continue
+            }
+            // Unmatched: treat as literal
+            out = out + "`"
+            i = i + 1
+            continue
+        }
+        // Image: ![alt](url)
+        if ch == "!" && i + 1 < n && s[i + 1] == "[" {
+            let close_br = _str_indexof_from(s, "]", i + 2)
+            if close_br >= 0 && close_br + 1 < n && s[close_br + 1] == "(" {
+                let close_pr = _str_indexof_from(s, ")", close_br + 2)
+                if close_pr >= 0 {
+                    let alt = _str_substr(s, i + 2, close_br)
+                    let url = _str_substr(s, close_br + 2, close_pr)
+                    if _is_unsafe_url(url) {
+                        out = out + _md_escape(alt)
+                    } else {
+                        out = out + "<img src=\"" + _md_escape(url.trim()) + "\" alt=\"" + _md_escape(alt) + "\">"
+                    }
+                    i = close_pr + 1
+                    continue
+                }
+            }
+            out = out + "!"
+            i = i + 1
+            continue
+        }
+        // Link: [text](url)
+        if ch == "[" {
+            let close_br = _str_indexof_from(s, "]", i + 1)
+            if close_br >= 0 && close_br + 1 < n && s[close_br + 1] == "(" {
+                let close_pr = _str_indexof_from(s, ")", close_br + 2)
+                if close_pr >= 0 {
+                    let txt = _str_substr(s, i + 1, close_br)
+                    let url = _str_substr(s, close_br + 2, close_pr)
+                    if _is_unsafe_url(url) {
+                        // Render link text only (no anchor) — XSS guard
+                        out = out + _render_inline(txt)
+                    } else {
+                        out = out + "<a href=\"" + _md_escape(url.trim()) + "\">" + _render_inline(txt) + "</a>"
+                    }
+                    i = close_pr + 1
+                    continue
+                }
+            }
+            out = out + _md_escape("[")
+            i = i + 1
+            continue
+        }
+        // Bold: ** or __
+        if (ch == "*" || ch == "_") && i + 1 < n && s[i + 1] == ch {
+            let mark = ch + ch
+            let close = _str_indexof_from(s, mark, i + 2)
+            if close >= 0 {
+                let inner = _str_substr(s, i + 2, close)
+                out = out + "<strong>" + _render_inline(inner) + "</strong>"
+                i = close + 2
+                continue
+            }
+            // Unmatched
+            out = out + _md_escape(mark)
+            i = i + 2
+            continue
+        }
+        // Italic: * or _
+        if ch == "*" || ch == "_" {
+            let close = _str_indexof_from(s, ch, i + 1)
+            if close >= 0 && close > i + 1 {
+                let inner = _str_substr(s, i + 1, close)
+                out = out + "<em>" + _render_inline(inner) + "</em>"
+                i = close + 1
+                continue
+            }
+            out = out + _md_escape(ch)
+            i = i + 1
+            continue
+        }
+        // Two trailing spaces + newline → <br>
+        if ch == " " && i + 2 < n && s[i + 1] == " " && s[i + 2] == "\n" {
+            out = out + "<br>\n"
+            i = i + 3
+            continue
+        }
+        // Default: HTML-escape and emit
+        if ch == "&" || ch == "<" || ch == ">" || ch == "\"" || ch == "'" {
+            out = out + _md_escape(ch)
+        } else {
+            out = out + ch
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn markdown_inline(src) {
+    return _render_inline(src)
+}
+
+// ── _heading_level ─────────────────────────────────────────
+// If line starts with 1–6 '#' followed by space, return level. Else 0.
+fn _heading_level(line) {
+    let n = len(line)
+    let mut i = 0
+    while i < n && i < 6 && line[i] == "#" {
+        i = i + 1
+    }
+    if i == 0 { return 0 }
+    if i >= n { return 0 }
+    if line[i] != " " { return 0 }
+    return i
+}
+
+// ── _is_hr ─────────────────────────────────────────────────
+// Three or more of -, *, or _ on their own line (with optional spaces).
+fn _is_hr(line) {
+    let s = line.trim()
+    let n = len(s)
+    if n < 3 { return false }
+    let ch = s[0]
+    if ch != "-" && ch != "*" && ch != "_" { return false }
+    let mut i = 0
+    let mut count = 0
+    while i < n {
+        let c = s[i]
+        if c == ch {
+            count = count + 1
+        } else {
+            if c != " " { return false }
+        }
+        i = i + 1
+    }
+    return count >= 3
+}
+
+// ── _list_marker ───────────────────────────────────────────
+// Returns:
+//   ["ul", indent_after, content]      for - * +
+//   ["ol", indent_after, content]      for 1. 2. ...
+//   []                                 if not a list line.
+fn _list_marker(line) {
+    let n = len(line)
+    if n == 0 { return [] }
+    // Skip leading spaces (max 3 — CommonMark)
+    let mut i = 0
+    while i < n && i < 3 && line[i] == " " {
+        i = i + 1
+    }
+    if i >= n { return [] }
+    let ch = line[i]
+    if (ch == "-" || ch == "*" || ch == "+") && i + 1 < n && line[i + 1] == " " {
+        return ["ul", i + 2, _str_substr(line, i + 2, n)]
+    }
+    if _is_digit(ch) {
+        let mut j = i
+        while j < n && _is_digit(line[j]) {
+            j = j + 1
+        }
+        if j > i && j < n && line[j] == "." && j + 1 < n && line[j + 1] == " " {
+            return ["ol", j + 2, _str_substr(line, j + 2, n)]
+        }
+    }
+    return []
+}
+
+// ── _is_blank ──────────────────────────────────────────────
+fn _is_blank(line) {
+    return line.trim() == ""
+}
+
+// ── _is_code_fence ─────────────────────────────────────────
+// Returns lang string if fenced (```), else void.
+fn _is_code_fence(line) {
+    let s = line
+    let n = len(s)
+    if n < 3 { return "" }
+    if s[0] != "`" || s[1] != "`" || s[2] != "`" { return "" }
+    // Lang is everything after the fence, trimmed
+    return _str_substr(s, 3, n).trim()
+}
+
+// ── _is_blockquote ─────────────────────────────────────────
+fn _is_blockquote(line) {
+    let s = line
+    let n = len(s)
+    if n == 0 { return false }
+    let mut i = 0
+    while i < n && i < 3 && s[i] == " " {
+        i = i + 1
+    }
+    if i >= n { return false }
+    return s[i] == ">"
+}
+
+// ── _strip_blockquote ──────────────────────────────────────
+fn _strip_blockquote(line) {
+    let n = len(line)
+    let mut i = 0
+    while i < n && i < 3 && line[i] == " " {
+        i = i + 1
+    }
+    if i < n && line[i] == ">" {
+        i = i + 1
+        if i < n && line[i] == " " { i = i + 1 }
+    }
+    return _str_substr(line, i, n)
+}
+
+// ── markdown_to_html ───────────────────────────────────────
+fn markdown_to_html(src) {
+    let s = to_string(src)
+    let lines = s.split("\n")
+    let total = len(lines)
+    let mut out = ""
+    let mut i = 0
+
+    while i < total {
+        let line = lines[i]
+
+        // Blank line — skip
+        if _is_blank(line) {
+            i = i + 1
+            continue
+        }
+
+        // Fenced code block
+        let fence_lang = _is_code_fence(line)
+        if fence_lang != "" || (len(line) >= 3 && line[0] == "`" && line[1] == "`" && line[2] == "`") {
+            let lang = fence_lang
+            let mut body = ""
+            let mut j = i + 1
+            let mut found_close = false
+            while j < total {
+                let l2 = lines[j]
+                if len(l2) >= 3 && l2[0] == "`" && l2[1] == "`" && l2[2] == "`" {
+                    found_close = true
+                    break
+                }
+                if len(body) > 0 { body = body + "\n" }
+                body = body + l2
+                j = j + 1
+            }
+            let lang_class = ""
+            let mut cls_attr = ""
+            if lang != "" {
+                cls_attr = " class=\"language-" + _md_escape(lang) + "\""
+            }
+            out = out + "<pre><code" + cls_attr + ">" + _md_escape(body) + "</code></pre>\n"
+            if found_close {
+                i = j + 1
+            } else {
+                // Unterminated fence — consume rest as code (raw 91: visible)
+                i = j
+            }
+            continue
+        }
+
+        // Horizontal rule
+        if _is_hr(line) {
+            out = out + "<hr>\n"
+            i = i + 1
+            continue
+        }
+
+        // Heading
+        let hl = _heading_level(line)
+        if hl > 0 {
+            let txt = _str_substr(line, hl + 1, len(line)).trim()
+            // Strip optional trailing #'s (closing-style ATX)
+            let mut t2 = txt
+            let mut tn = len(t2)
+            while tn > 0 && t2[tn - 1] == "#" {
+                tn = tn - 1
+            }
+            t2 = _str_substr(t2, 0, tn).trim()
+            out = out + "<h" + to_string(hl) + ">" + _render_inline(t2) + "</h" + to_string(hl) + ">\n"
+            i = i + 1
+            continue
+        }
+
+        // Blockquote (consume contiguous > lines)
+        if _is_blockquote(line) {
+            let mut bq_body = ""
+            let mut j = i
+            while j < total && _is_blockquote(lines[j]) {
+                if len(bq_body) > 0 { bq_body = bq_body + "\n" }
+                bq_body = bq_body + _strip_blockquote(lines[j])
+                j = j + 1
+            }
+            // Recursively render inner
+            out = out + "<blockquote>\n" + markdown_to_html(bq_body) + "</blockquote>\n"
+            i = j
+            continue
+        }
+
+        // List (ul / ol)
+        let lm = _list_marker(line)
+        if len(lm) > 0 {
+            let kind = lm[0]
+            let tag = kind
+            out = out + "<" + tag + ">\n"
+            let mut j = i
+            while j < total {
+                let lm2 = _list_marker(lines[j])
+                if len(lm2) == 0 { break }
+                if lm2[0] != kind { break }
+                let item_text = lm2[2]
+                // Continuation lines: indented further than marker
+                let mut item_buf = item_text
+                let mut k = j + 1
+                while k < total {
+                    let nl = lines[k]
+                    if _is_blank(nl) { break }
+                    let lm3 = _list_marker(nl)
+                    if len(lm3) > 0 { break }
+                    if len(nl) > 0 && nl[0] == " " {
+                        item_buf = item_buf + " " + nl.trim()
+                        k = k + 1
+                        continue
+                    }
+                    break
+                }
+                out = out + "<li>" + _render_inline(item_buf) + "</li>\n"
+                j = k
+            }
+            out = out + "</" + tag + ">\n"
+            i = j
+            continue
+        }
+
+        // Paragraph: consume until blank line / block construct
+        let mut para = line
+        let mut j = i + 1
+        while j < total {
+            let nl = lines[j]
+            if _is_blank(nl) { break }
+            if _heading_level(nl) > 0 { break }
+            if _is_hr(nl) { break }
+            if _is_blockquote(nl) { break }
+            if len(_list_marker(nl)) > 0 { break }
+            if len(nl) >= 3 && nl[0] == "`" && nl[1] == "`" && nl[2] == "`" { break }
+            para = para + "\n" + nl
+            j = j + 1
+        }
+        out = out + "<p>" + _render_inline(para) + "</p>\n"
+        i = j
+    }
+
+    return out
+}
+
+// ── --selftest ──────────────────────────────────────────────
+fn _md_selftest() {
+    let mut fail = 0
+    let mut n = 0
+
+    // 1. heading h1
+    n = n + 1
+    let r1 = markdown_to_html("# Hello")
+    if r1 != "<h1>Hello</h1>\n" {
+        eprintln("FAIL 1 h1: " + r1)
+        fail = fail + 1
+    }
+
+    // 2. heading h3 with inline bold
+    n = n + 1
+    let r2 = markdown_to_html("### **bold** title")
+    if !r2.contains("<h3>") || !r2.contains("<strong>bold</strong>") {
+        eprintln("FAIL 2 h3+bold: " + r2)
+        fail = fail + 1
+    }
+
+    // 3. paragraph with italic + code
+    n = n + 1
+    let r3 = markdown_to_html("hello *world* `x=1`")
+    if !r3.contains("<p>") || !r3.contains("<em>world</em>") || !r3.contains("<code>x=1</code>") {
+        eprintln("FAIL 3 para: " + r3)
+        fail = fail + 1
+    }
+
+    // 4. fenced code block with lang class
+    n = n + 1
+    let r4 = markdown_to_html("```js\nlet x = 1;\n```")
+    if !r4.contains("<pre><code class=\"language-js\">") || !r4.contains("let x = 1;") {
+        eprintln("FAIL 4 code: " + r4)
+        fail = fail + 1
+    }
+
+    // 5. unordered list
+    n = n + 1
+    let r5 = markdown_to_html("- a\n- b\n- c")
+    if !r5.contains("<ul>") || !r5.contains("<li>a</li>") || !r5.contains("<li>c</li>") {
+        eprintln("FAIL 5 ul: " + r5)
+        fail = fail + 1
+    }
+
+    // 6. ordered list
+    n = n + 1
+    let r6 = markdown_to_html("1. one\n2. two")
+    if !r6.contains("<ol>") || !r6.contains("<li>one</li>") {
+        eprintln("FAIL 6 ol: " + r6)
+        fail = fail + 1
+    }
+
+    // 7. blockquote
+    n = n + 1
+    let r7 = markdown_to_html("> quoted text")
+    if !r7.contains("<blockquote>") || !r7.contains("quoted text") {
+        eprintln("FAIL 7 bq: " + r7)
+        fail = fail + 1
+    }
+
+    // 8. horizontal rule
+    n = n + 1
+    let r8 = markdown_to_html("---")
+    if r8 != "<hr>\n" {
+        eprintln("FAIL 8 hr: " + r8)
+        fail = fail + 1
+    }
+
+    // 9. link
+    n = n + 1
+    let r9 = markdown_to_html("see [docs](https://x.io)")
+    if !r9.contains("<a href=\"https://x.io\">docs</a>") {
+        eprintln("FAIL 9 link: " + r9)
+        fail = fail + 1
+    }
+
+    // 10. unsafe link → text only (XSS guard)
+    n = n + 1
+    let r10 = markdown_to_html("[bad](javascript:alert(1))")
+    if r10.contains("javascript:") {
+        eprintln("FAIL 10 xss: " + r10)
+        fail = fail + 1
+    }
+
+    // 11. image
+    n = n + 1
+    let r11 = markdown_to_html("![alt](pic.png)")
+    if !r11.contains("<img src=\"pic.png\"") || !r11.contains("alt=\"alt\"") {
+        eprintln("FAIL 11 img: " + r11)
+        fail = fail + 1
+    }
+
+    // 12. HTML escape in text
+    n = n + 1
+    let r12 = markdown_to_html("a < b & c > d")
+    if !r12.contains("&lt;") || !r12.contains("&amp;") || !r12.contains("&gt;") {
+        eprintln("FAIL 12 esc: " + r12)
+        fail = fail + 1
+    }
+
+    // 13. backslash escape
+    n = n + 1
+    let r13 = markdown_to_html("\\*not italic\\*")
+    if r13.contains("<em>") {
+        eprintln("FAIL 13 backslash: " + r13)
+        fail = fail + 1
+    }
+
+    // 14. inline-only mode
+    n = n + 1
+    let r14 = markdown_inline("just **bold**")
+    if !r14.contains("<strong>bold</strong>") || r14.contains("<p>") {
+        eprintln("FAIL 14 inline: " + r14)
+        fail = fail + 1
+    }
+
+    // 15. paragraph followed by heading
+    n = n + 1
+    let r15 = markdown_to_html("para\n# heading")
+    if !r15.contains("<p>para</p>") || !r15.contains("<h1>heading</h1>") {
+        eprintln("FAIL 15 p+h: " + r15)
+        fail = fail + 1
+    }
+
+    if fail == 0 {
+        println("__MARKDOWN_SELFTEST__ PASS n=" + to_string(n) + " fail=0")
+    } else {
+        println("__MARKDOWN_SELFTEST__ FAIL n=" + to_string(n) + " fail=" + to_string(fail))
+    }
+}
+
+let _md_argv = args()
+let mut _md_selftest_flag = false
+let mut _md_ai = 0
+while _md_ai < len(_md_argv) {
+    if _md_argv[_md_ai] == "--selftest" { _md_selftest_flag = true }
+    if _md_argv[_md_ai] == "--selftest-markdown" { _md_selftest_flag = true }
+    _md_ai = _md_ai + 1
+}
+if _md_selftest_flag {
+    _md_selftest()
+}
