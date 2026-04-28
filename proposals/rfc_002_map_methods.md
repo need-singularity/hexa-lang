@@ -1,10 +1,11 @@
 # RFC 002 — map.has() / map.get(key, default) / map.keys() stdlib methods
 
-- **Status**: proposed
+- **Status**: done (P1 m.has(key) landed 2026-04-28; m.get/m.keys/m.values already present from prior work)
 - **Date**: 2026-04-28
 - **Severity**: ergonomic (workaround exists but adds string-parsing overhead and brittleness)
 - **Priority**: P1
 - **Source convergence**: convergence/hexa_lang_upstream_2026_04_28_anima_eeg_gaps.convergence (gap 2)
+- **Landing**: self/hexa_full.hexa:16699 (interp dispatch) + self/codegen_c2.hexa:2534, 4082 (AOT codegen — 2 sites: gen2_method_builtin + gen2_expr fallback) + test/regression/map_has_method.hexa (5/5 PASS — empty / present / absent / empty-string-key / parity-with-contains_key — raw#71 falsifier verified). Total: ~14 LoC added.
 
 ## Problem
 
