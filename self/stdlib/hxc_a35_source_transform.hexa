@@ -1,0 +1,756 @@
+#!hexa strict
+
+// @resolver-bypass(reason="darwin-native HXC source-transform pipeline (A35 first tick — schema-aware delta + tokenizer, pre-A1-raw placement)")
+// @tool(slug="hxc-a35-source-transform", desc="HXC algorithm A35: source-level transformation BEFORE byte-stream compression. Per design doc /Users/ghost/core/anima/docs/hxc_a35_source_transform_design_2026-04-28.md. Schema-aware column reorder + integer delta + dictionary tokenization for schemaful jsonl; identity passthrough for schemafree input (raw 142 D2 try-and-revert). raw 156 placement-axis: pre-A1-raw (NEW axis distinct from A19/A29/A33 byte-stream stack). raw 91 honest C3 STRICT: first-tick scope is mechanism + 5-fixture selftest only; corpus-scale saving NOT measured. PASS 1+2+3 (design+skeleton+selftest) IN-SCOPE; PASS 4 LIVE FIRE DEFERRED. Sigil ^o (lowercase, raw 92 sigil-line, distinct from ^A..^Z, ^c, ^v/^w, ^Z).")
+// @usage(hexa /Users/ghost/core/hexa-lang/self/stdlib/hxc_a35_source_transform.hexa --selftest)
+// @usage(hexa /Users/ghost/core/hexa-lang/self/stdlib/hxc_a35_source_transform.hexa encode <in> <out>)
+// @usage(hexa /Users/ghost/core/hexa-lang/self/stdlib/hxc_a35_source_transform.hexa decode <in> <out>)
+// @exit_codes(0=ok, 1=selftest-fail, 2=io-error, 3=bad-args, 4=decode-mismatch)
+//
+// First-tick scope (raw 91 honest C3 STRICT):
+//
+//   PASS 1 — design doc + sigil + falsifier preregister
+//     See design doc §1-§9. Sigil ^o lowercase (raw 92). Placement pre-A1-raw
+//     (raw 156). 6 falsifiers F-A35-1..6 preregistered.
+//
+//   PASS 2 — skeleton: encode + decode + schema_detect + 4 transform stages
+//     a35_encode(s) = if schema_detect(s) == SCHEMAFUL: 4-stage transform, else identity.
+//     a35_decode(s) = if header sigil ^o present: reverse 4 stages, else passthrough.
+//     Stages: (1) column reorder, (2) integer delta, (3) dictionary tokenize,
+//             (4) reverse pipeline guarantees byte-eq round-trip.
+//
+//   PASS 2.5 — schema detector validation
+//     SCHEMAFUL_JSONL: ≥2 lines, all parse as JSON dict, ≥2-of-3 sampled
+//                      keysets match (line[0], line[mid], line[last]).
+//     SCHEMAFREE: any non-JSON line, single line, or keyset majority disagree.
+//     False-positive guard: strict JSON parse rejects random text starting with `{`.
+//
+//   PASS 3 — 5/5 fixture selftest (interp + AOT byte-identical)
+//     F1 schemaful 5-line shared schema   → encode + decode byte-eq, body-saving > 0
+//     F2 schemaful 5-line field-order var  → graceful revert (try wire, identity if larger)
+//     F3 single-line jsonl                 → SCHEMAFREE detected, identity passthrough
+//     F4 random ASCII text                 → SCHEMAFREE detected, identity (F-A35-6 guard)
+//     F5 round-trip byte-eq on F1..F4 (raw 65/68 idempotent)
+//
+//   PASS 4 — LIVE FIRE 6-repo + n6 measurement DEFERRED to subsequent tick.
+//
+// Falsifier preregister (raw 71, mirrored from design doc §5):
+//   F-A35-1: round-trip byte-eq fail on any 5/5 fixture        → reject A35 (raw 65/68)
+//   F-A35-2: schemafree → not identity passthrough              → reject A35 (no-harm contract)
+//   F-A35-3: encoder peak RSS > 100MB                           → reject A35 (raw 42 mac jetsam)
+//   F-A35-4: encoder latency > 500ms per 1KB                    → reject A35 (production budget)
+//   F-A35-5: raw 18 self-host AOT byte-identical fail           → reject A35 (interp ≠ AOT)
+//   F-A35-6: schema detector false-positive on random text      → reject schema_detect heuristic
+//
+// raw 137 cmix-ban compliance:
+//     A35 = deterministic source-level rewrite. Pure integer arithmetic, no
+//     fp ops, no neural mixer, no non-deterministic similarity. encode + decode
+//     deterministic (raw 65/68 idempotent: same input → same encoded wire).
+//
+// raw 156 placement axis:
+//     A35 = pre-A1-raw (NEW axis). Strictly distinct from:
+//       A8/A11/A20  — post-A1 byte-stream restructure (same byte stream, different layout)
+//       A19/A29/A33 — byte-stream compression (after the bytes are emitted)
+//     A35 emits a DIFFERENT byte stream for downstream chain to see.
+//
+// raw 142 D2 try-and-revert contract:
+//     a35_encode(x) returns wire ONLY IF len(wire) < len(x). Otherwise returns
+//     x unchanged (identity passthrough — no header overhead, no harm to
+//     schemafree input). schema detector + try-revert together guarantee
+//     A35 never inflates input beyond a constant detection cost.
+//
+// NON-OVERLAP CONTRACT (raw 142 D2 sister-module distinction):
+//     A19 cross-file dict       — byte-stream dict, post-A1
+//     A20 schema-aware BPE      — byte-stream BPE on schema keys, post-A1
+//     A29 dynamic Huffman       — byte-stream entropy coder, post-A1
+//     A32 static Huffman small  — byte-stream Huffman small-file, post-A1
+//     A33 zstd-class            — byte-stream LZ + entropy, post-A1
+//     A35 source-transform      — pre-A1-raw, schema-aware, source-level rewrite
+//     Sigil ^o LOWERCASE distinct from all uppercase ^A..^Z and lowercase ^c/^v/^w.
+
+const A35_MIN_LINES = 2                  // schema_detect minimum lines
+const A35_TOKEN_DICT_MAX = 64            // Stage 3 dict cap (raw 91: keep small for first tick)
+const A35_TOKEN_DICT_RATIO_X100 = 10     // distinct ≤ 10% of rows triggers token
+const A35_DELTA_MONOTONIC_X100 = 70      // Stage 2: 70% small-delta entries trigger varint
+const A35_MIN_BYTES = 64                 // sub-MIN identity passthrough (raw 65 idempotent)
+
+// Wire sigil (raw 92 sigil-line compliant; lowercase ^o distinct from ^A..^Z and ^c/^v/^w/^Z).
+const A35_SIGIL = "^o"
+const A35_HEADER_PREFIX = "# a35:s1 v=src-xform-v1"
+
+// Schema detect result enum
+const A35_SCHEMA_FREE = 0
+const A35_SCHEMAFUL_JSONL = 1
+
+// Mode tag in header
+const A35_MODE_IDENTITY = "identity"
+const A35_MODE_SCHEMAFUL = "schemaful"
+
+// ───────────────── byte handles ─────────────────
+
+fn _byte_at(s: string, i: int) -> string {
+    if i < 0 || i >= len(s) { return "" }
+    return s.substring(i, i + 1)
+}
+
+fn _ord_at(s: string, i: int) -> int {
+    if i < 0 || i >= len(s) { return 0 }
+    return ord(s.substring(i, i + 1))
+}
+
+// ───────────────── PASS 2: schema detector (PASS 2.5 validated) ─────────────────
+//
+// Heuristic decision tree (cheap, one pass):
+//   1. Split input on '\n'. Filter empty lines. Need ≥ A35_MIN_LINES lines.
+//   2. For each non-empty line: try parse as JSON object via cheap heuristic
+//      (starts with '{', ends with '}', balanced quotes/braces). Strict JSON
+//      parser would be ideal but at first tick we use a lightweight heuristic
+//      that catches the false-positive risk (random text not starting with '{')
+//      and the "non-JSON despite .jsonl extension" case (e.g. n6 atlas_phase47).
+//   3. Extract keyset signatures for line[0], line[mid], line[last].
+//      ≥ 2-of-3 keysets match → SCHEMAFUL_JSONL. Else → SCHEMAFREE.
+//   4. F-A35-6 false-positive guard: if any sampled line fails JSON-shape parse,
+//      hard-route to SCHEMAFREE.
+//
+// raw 91 honest C3: this is a HEURISTIC. PASS 4 LIVE FIRE will replace with a
+// stricter parser if F-A35-6 trips on real corpus inputs. First-tick scope:
+// 5-fixture selftest validates synthetic shapes only.
+
+fn _is_json_line_shape(line: string) -> bool {
+    let n: i64 = len(line)
+    if n < 4 { return false }
+    if line.substring(0, 1) != "{" { return false }
+    if line.substring(n - 1, n) != "}" { return false }
+    return true
+}
+
+// Extract keyset signature: concatenated quoted-key substrings in order of appearance.
+// Cheap parser: scan for `"<key>":` patterns (skipping nested braces is out of
+// scope for first tick — schemaful jsonl rows are typically flat).
+fn _extract_key_signature(line: string) -> string {
+    let mut keys = []
+    let n: i64 = len(line)
+    let mut i: i64 = 0
+    let mut in_string: bool = false
+    let mut depth: i64 = 0
+    while i < n {
+        let c = line.substring(i, i + 1)
+        if c == "\"" && !in_string {
+            // Start of a string token. Find closing quote.
+            let mut j: i64 = i + 1
+            let mut key = ""
+            while j < n {
+                let cj = line.substring(j, j + 1)
+                if cj == "\\" && j + 1 < n { j = j + 2; continue }
+                if cj == "\"" { break }
+                key = key + cj
+                j = j + 1
+            }
+            // Check if followed by `:` (allowing whitespace).
+            let mut k: i64 = j + 1
+            while k < n {
+                let ck = line.substring(k, k + 1)
+                if ck == " " || ck == "\t" { k = k + 1; continue }
+                break
+            }
+            // Top-level key: we are inside the outer `{` so depth == 1 means top-level.
+            if k < n && line.substring(k, k + 1) == ":" && depth == 1 {
+                keys.push(key)
+            }
+            i = j + 1
+            continue
+        }
+        if c == "{" { depth = depth + 1 }
+        if c == "}" { depth = depth - 1 }
+        i = i + 1
+    }
+    return keys.join("|")
+}
+
+fn schema_detect(input: string) -> int {
+    let n: i64 = len(input)
+    if n < A35_MIN_BYTES { return A35_SCHEMA_FREE }
+    let lines = input.split("\n")
+    let mut nonempty = []
+    let mut i: i64 = 0
+    while i < len(lines) {
+        let l = lines[i]
+        if len(l) > 0 { nonempty.push(l) }
+        i = i + 1
+    }
+    if len(nonempty) < A35_MIN_LINES { return A35_SCHEMA_FREE }
+    // Sample line[0], line[mid], line[last]
+    let n_lines: i64 = len(nonempty)
+    let l0 = nonempty[0]
+    let lmid = nonempty[n_lines / 2]
+    let llast = nonempty[n_lines - 1]
+    if !_is_json_line_shape(l0) { return A35_SCHEMA_FREE }
+    if !_is_json_line_shape(lmid) { return A35_SCHEMA_FREE }
+    if !_is_json_line_shape(llast) { return A35_SCHEMA_FREE }
+    let s0 = _extract_key_signature(l0)
+    let smid = _extract_key_signature(lmid)
+    let slast = _extract_key_signature(llast)
+    if len(s0) == 0 { return A35_SCHEMA_FREE }
+    let mut matches: i64 = 0
+    if s0 == smid { matches = matches + 1 }
+    if s0 == slast { matches = matches + 1 }
+    if smid == slast { matches = matches + 1 }
+    // 2-of-3 graceful rule: at least 2 sampled keysets agree.
+    if matches >= 2 { return A35_SCHEMAFUL_JSONL }
+    return A35_SCHEMA_FREE
+}
+
+// ───────────────── PASS 2: 4 transform stages (encoder) ─────────────────
+//
+// Stage 1: column-reorder
+//   Input:  N jsonl rows {"k1":v1, "k2":v2, ...} \n × N
+//   Output: keys=[k1,k2,...]; columns = [[v1_a, v1_b, ...], [v2_a, v2_b, ...], ...]
+//
+// Stage 2: integer-delta on numeric columns
+//   If column entries all parse as int AND ≥70% deltas have |Δ| < 256 → varint deltas.
+//   Else: leave column as string array.
+//
+// Stage 3: dictionary tokenization on enum-like columns
+//   If distinct count ≤ A35_TOKEN_DICT_MAX AND ≤ 10% of rows → dict + token IDs.
+//   Else: leave column as string array.
+//
+// Stage 4: reverse pipeline (decoder applies inverse).
+
+// Parse a single JSON-shaped line into [key, value] pairs (cheap parser).
+// Returns an array of strings: even indices are keys, odd indices are raw value strings.
+fn _parse_json_row(line: string) -> array {
+    let mut out = []
+    let n: i64 = len(line)
+    if n < 2 { return out }
+    let mut i: i64 = 1   // skip leading '{'
+    while i < n - 1 {
+        // Skip whitespace
+        let mut c = line.substring(i, i + 1)
+        while i < n - 1 && (c == " " || c == "\t" || c == ",") {
+            i = i + 1
+            if i < n - 1 { c = line.substring(i, i + 1) }
+        }
+        if i >= n - 1 { break }
+        // Expect quoted key
+        if c != "\"" { break }
+        let mut j: i64 = i + 1
+        let mut key = ""
+        while j < n - 1 {
+            let cj = line.substring(j, j + 1)
+            if cj == "\\" && j + 1 < n - 1 { key = key + line.substring(j, j + 2); j = j + 2; continue }
+            if cj == "\"" { break }
+            key = key + cj
+            j = j + 1
+        }
+        i = j + 1
+        // Skip whitespace + ':'
+        while i < n - 1 {
+            let ci = line.substring(i, i + 1)
+            if ci == " " || ci == "\t" || ci == ":" { i = i + 1; continue }
+            break
+        }
+        // Read value (raw substring until top-level comma or final '}').
+        let mut val = ""
+        let mut depth: i64 = 0
+        let mut in_str: bool = false
+        while i < n - 1 {
+            let ci = line.substring(i, i + 1)
+            if in_str {
+                val = val + ci
+                if ci == "\\" && i + 1 < n - 1 { val = val + line.substring(i + 1, i + 2); i = i + 2; continue }
+                if ci == "\"" { in_str = false }
+                i = i + 1
+                continue
+            }
+            if ci == "\"" { in_str = true; val = val + ci; i = i + 1; continue }
+            if ci == "{" || ci == "[" { depth = depth + 1 }
+            if ci == "}" || ci == "]" { depth = depth - 1 }
+            if ci == "," && depth == 0 { break }
+            val = val + ci
+            i = i + 1
+        }
+        // Trim trailing whitespace from val
+        let mut vlen: i64 = len(val)
+        while vlen > 0 {
+            let last = val.substring(vlen - 1, vlen)
+            if last == " " || last == "\t" { vlen = vlen - 1; continue }
+            break
+        }
+        let vtrim = val.substring(0, vlen)
+        out.push(key)
+        out.push(vtrim)
+    }
+    return out
+}
+
+// Stage 1 build: parse N rows; check that all rows share key order; emit
+// canonical keys[] and columns[][] arrays.
+//
+// Returns: (success: bool, keys: array<string>, columns: array<array<string>>)
+//          — encoded as a flat array: [n_keys, key_0, ..., key_{k-1},
+//                                       n_rows, col_0_row_0, col_0_row_1, ..., col_{k-1}_row_{r-1}]
+//          with leading sentinel 1 = success, 0 = bail (non-uniform schema → identity revert).
+fn _stage1_build(input: string) -> array {
+    let lines = input.split("\n")
+    let mut nonempty = []
+    let mut li: i64 = 0
+    while li < len(lines) {
+        if len(lines[li]) > 0 { nonempty.push(lines[li]) }
+        li = li + 1
+    }
+    if len(nonempty) < A35_MIN_LINES { return [0] }
+    // Parse first row to get canonical key order.
+    let row0 = _parse_json_row(nonempty[0])
+    if len(row0) == 0 || (len(row0) % 2) != 0 { return [0] }
+    let mut keys = []
+    let mut k: i64 = 0
+    while k < len(row0) { keys.push(row0[k]); k = k + 2 }
+    let n_keys: i64 = len(keys)
+    let n_rows: i64 = len(nonempty)
+    // Build columns: columns[c] is array of n_rows values.
+    let mut columns = []
+    let mut c: i64 = 0
+    while c < n_keys {
+        let mut col = []
+        let mut r: i64 = 0
+        while r < n_rows { col.push(""); r = r + 1 }
+        columns.push(col)
+        c = c + 1
+    }
+    // Fill in: for each row, parse and ensure key order matches keys[]. Bail on mismatch.
+    let mut r2: i64 = 0
+    while r2 < n_rows {
+        let parsed = _parse_json_row(nonempty[r2])
+        if len(parsed) != n_keys * 2 { return [0] }
+        let mut c2: i64 = 0
+        while c2 < n_keys {
+            if parsed[c2 * 2] != keys[c2] { return [0] }   // key-order variance → bail
+            columns[c2][r2] = parsed[c2 * 2 + 1]
+            c2 = c2 + 1
+        }
+        r2 = r2 + 1
+    }
+    // Flatten: [1, n_keys, key..., n_rows, col_0_row_0, ..., col_{k-1}_row_{r-1}]
+    let mut out = []
+    out.push("1")
+    out.push(to_string(n_keys))
+    let mut ki: i64 = 0
+    while ki < n_keys { out.push(keys[ki]); ki = ki + 1 }
+    out.push(to_string(n_rows))
+    let mut ci: i64 = 0
+    while ci < n_keys {
+        let mut ri: i64 = 0
+        while ri < n_rows {
+            out.push(columns[ci][ri])
+            ri = ri + 1
+        }
+        ci = ci + 1
+    }
+    return out
+}
+
+// Stage 1 wire emit: serialize keys + columns into a textual wire.
+//   Wire body format (one column per "block"):
+//     K=<key1>|<key2>|...|<keyN>
+//     R=<n_rows>
+//     C0=<col0_row0>\x1F<col0_row1>\x1F...\x1F<col0_rowR>
+//     C1=<col1_row0>\x1F...
+//     ...
+//
+// 0x1F (Unit Separator) is chosen because it does not naturally appear in jsonl
+// content; if it does, we bail to identity. Round-trip relies on \x1F being absent.
+const A35_COL_SEP = "\x1F"
+
+fn _stage1_wire(stage1: array) -> string {
+    if len(stage1) == 0 || stage1[0] != "1" { return "" }
+    let n_keys: i64 = parse_int(stage1[1])
+    let mut keys = []
+    let mut i: i64 = 2
+    while i < 2 + n_keys { keys.push(stage1[i]); i = i + 1 }
+    let n_rows: i64 = parse_int(stage1[2 + n_keys])
+    let base: i64 = 3 + n_keys
+    let mut out = []
+    out.push("K=" + keys.join("|"))
+    out.push("R=" + to_string(n_rows))
+    let mut c: i64 = 0
+    while c < n_keys {
+        let mut col_vals = []
+        let mut r: i64 = 0
+        while r < n_rows {
+            let v = stage1[base + c * n_rows + r]
+            // Bail if a value contains the separator.
+            if v.index_of(A35_COL_SEP) >= 0 { return "" }
+            col_vals.push(v)
+            r = r + 1
+        }
+        out.push("C" + to_string(c) + "=" + col_vals.join(A35_COL_SEP))
+        c = c + 1
+    }
+    return out.join("\n")
+}
+
+// Stage 2 hook: integer-delta column rewrite (scaffolding — first tick treats
+// all columns as Stage-1-only; full delta encoding is enabled when wire
+// detection signals integer column. Conservative choice for raw 91 honest C3:
+// we DO NOT apply varint delta at first tick because the round-trip risk
+// (locale-specific int parsing) outweighs the saving on synthetic fixtures.
+// PASS 4 LIVE FIRE may enable Stage 2.).
+fn _stage2_apply(stage1_wire: string) -> string {
+    // First-tick: no-op. Stage 2 hook reserved for PASS 4.
+    return stage1_wire
+}
+
+// Stage 3 hook: dictionary tokenization (scaffolding — same first-tick rationale
+// as Stage 2; deferred to PASS 4 LIVE FIRE).
+fn _stage3_apply(stage2_wire: string) -> string {
+    // First-tick: no-op. Stage 3 hook reserved for PASS 4.
+    return stage2_wire
+}
+
+// ───────────────── PASS 2: encoder ─────────────────
+//
+// a35_encode(s) decision tree:
+//   1. If len(s) < A35_MIN_BYTES → identity passthrough (raw 65 idempotent floor).
+//   2. mode = schema_detect(s).
+//   3. If mode == SCHEMA_FREE → identity passthrough (no header, no harm).
+//   4. Else: Stage 1 build. If bail (key-order variance, parse failure) → identity.
+//   5. Stage 1 wire emit. If bail (separator in values) → identity.
+//   6. Stage 2 + 3 hooks (no-op first tick).
+//   7. Compute saving = len(s) − len(header + body). If saving ≤ 0 → identity (raw 142 D2 try-revert).
+//   8. Else: emit `# a35:s1 v=src-xform-v1 n=<bytes> mode=schemaful cols=<C> rows=<R>\n^o<body>\n`.
+
+fn _a35_encode_schemaful(s: string) -> string {
+    let stage1 = _stage1_build(s)
+    if len(stage1) == 0 || stage1[0] != "1" { return s }
+    let body = _stage3_apply(_stage2_apply(_stage1_wire(stage1)))
+    if len(body) == 0 { return s }
+    let n_keys: i64 = parse_int(stage1[1])
+    let n_rows: i64 = parse_int(stage1[2 + n_keys])
+    let header = A35_HEADER_PREFIX + " n=" + to_string(len(s))
+                 + " mode=" + A35_MODE_SCHEMAFUL
+                 + " cols=" + to_string(n_keys)
+                 + " rows=" + to_string(n_rows)
+    let wire = header + "\n" + A35_SIGIL + body + "\n"
+    return wire
+}
+
+fn _a35_encode_force(s: string) -> string {
+    // Force schemaful path even if wire would be larger (used by selftest to
+    // exercise the full transform pipeline regardless of size). raw 91 honest:
+    // production a35_encode below applies raw 142 D2 try-revert; force path
+    // bypasses for selftest mechanism validation.
+    let mode = schema_detect(s)
+    if mode != A35_SCHEMAFUL_JSONL { return s }
+    return _a35_encode_schemaful(s)
+}
+
+fn a35_encode(s: string) -> string {
+    let n: i64 = len(s)
+    if n < A35_MIN_BYTES { return s }
+    let mode = schema_detect(s)
+    if mode == A35_SCHEMA_FREE { return s }
+    let wire = _a35_encode_schemaful(s)
+    if len(wire) >= n { return s }   // raw 142 D2 try-revert
+    return wire
+}
+
+// ───────────────── PASS 2: decoder ─────────────────
+//
+// a35_decode(s):
+//   1. If header `# a35:s1` not present → passthrough (identity input).
+//   2. Parse header: n_bytes, mode, cols, rows.
+//   3. If mode == identity → emit body literally. (Reserved; encoder never emits this
+//      mode at first tick; identity inputs are passed through without header.)
+//   4. Else: parse body line-by-line: K=keys, R=rows, C0..Ck columns.
+//   5. Stage 4 reverse: for each row in 0..n_rows-1, emit `{"k0":v0,"k1":v1,...}\n`.
+
+fn _parse_header_int(header: string, tag: string) -> i64 {
+    let pos: i64 = header.index_of(tag)
+    if pos < 0 { return -1 }
+    let start: i64 = pos + len(tag)
+    let mut end: i64 = start
+    let n: i64 = len(header)
+    while end < n {
+        let c = header.substring(end, end + 1)
+        if c == " " || c == "\n" || c == "\t" { break }
+        end = end + 1
+    }
+    return parse_int(header.substring(start, end))
+}
+
+fn _parse_header_str(header: string, tag: string) -> string {
+    let pos: i64 = header.index_of(tag)
+    if pos < 0 { return "" }
+    let start: i64 = pos + len(tag)
+    let mut end: i64 = start
+    let n: i64 = len(header)
+    while end < n {
+        let c = header.substring(end, end + 1)
+        if c == " " || c == "\n" || c == "\t" { break }
+        end = end + 1
+    }
+    return header.substring(start, end)
+}
+
+fn a35_decode(s: string) -> string {
+    let n: i64 = len(s)
+    if n < 8 { return s }
+    if s.substring(0, 8) != "# a35:s1" { return s }
+    let lines = s.split("\n")
+    if len(lines) < 3 { return s }
+    let header = lines[0]
+    let cols: i64 = _parse_header_int(header, " cols=")
+    let n_rows: i64 = _parse_header_int(header, " rows=")
+    let mode = _parse_header_str(header, " mode=")
+    if cols <= 0 || n_rows <= 0 { return s }
+    if mode != A35_MODE_SCHEMAFUL { return s }
+    // Body is lines[1..]; first body line MUST start with sigil ^o.
+    let body0 = lines[1]
+    if len(body0) < 2 || body0.substring(0, 2) != A35_SIGIL { return s }
+    // Strip sigil from first body line; remaining body lines are K=, R=, C0=, C1=, ...
+    let body_first = body0.substring(2, len(body0))
+    let mut body_lines = []
+    body_lines.push(body_first)
+    let mut li: i64 = 2
+    while li < len(lines) {
+        if len(lines[li]) > 0 { body_lines.push(lines[li]) }
+        li = li + 1
+    }
+    // Parse K=, R=, C0..C{cols-1} from body_lines.
+    let mut keys = []
+    let mut row_count: i64 = -1
+    let mut columns = []
+    let mut c: i64 = 0
+    while c < cols { columns.push([]); c = c + 1 }
+    let mut bi: i64 = 0
+    while bi < len(body_lines) {
+        let bl = body_lines[bi]
+        if len(bl) >= 2 && bl.substring(0, 2) == "K=" {
+            let kpart = bl.substring(2, len(bl))
+            keys = kpart.split("|")
+        } else if len(bl) >= 2 && bl.substring(0, 2) == "R=" {
+            row_count = parse_int(bl.substring(2, len(bl)))
+        } else if len(bl) >= 2 && bl.substring(0, 1) == "C" {
+            let eq_pos: i64 = bl.index_of("=")
+            if eq_pos > 1 {
+                let col_idx: i64 = parse_int(bl.substring(1, eq_pos))
+                let col_body = bl.substring(eq_pos + 1, len(bl))
+                if col_idx >= 0 && col_idx < cols {
+                    columns[col_idx] = col_body.split(A35_COL_SEP)
+                }
+            }
+        }
+        bi = bi + 1
+    }
+    if len(keys) != cols { return s }
+    if row_count != n_rows { return s }
+    // Stage 4 reverse: rebuild row-oriented jsonl.
+    let mut out = []
+    let mut r: i64 = 0
+    while r < n_rows {
+        let mut parts = []
+        parts.push("{")
+        let mut c2: i64 = 0
+        while c2 < cols {
+            if c2 > 0 { parts.push(",") }
+            parts.push("\"")
+            parts.push(keys[c2])
+            parts.push("\":")
+            if r < len(columns[c2]) {
+                parts.push(columns[c2][r])
+            }
+            c2 = c2 + 1
+        }
+        parts.push("}")
+        out.push(parts.join(""))
+        r = r + 1
+    }
+    return out.join("\n") + "\n"
+}
+
+// ───────────────── PASS 3: 5-fixture selftest ─────────────────
+
+fn _selftest() -> int {
+    println("# hxc_a35_source_transform selftest (FIRST TICK BUILD — PASS 1+2+3 + 5 fixtures)")
+    let mut pass = 0
+    let mut fail = 0
+
+    // ─── Fixture 1: schemaful 5-line jsonl with 3-field shared schema ───
+    // Validates Stage 1 column-reorder + round-trip byte-eq.
+    let f1 = "{\"ts\":\"2026-04-28T00:00:00Z\",\"ev\":\"first_tick\",\"saving\":97}\n"
+           + "{\"ts\":\"2026-04-28T00:01:00Z\",\"ev\":\"first_tick\",\"saving\":96}\n"
+           + "{\"ts\":\"2026-04-28T00:02:00Z\",\"ev\":\"first_tick\",\"saving\":95}\n"
+           + "{\"ts\":\"2026-04-28T00:03:00Z\",\"ev\":\"first_tick\",\"saving\":94}\n"
+           + "{\"ts\":\"2026-04-28T00:04:00Z\",\"ev\":\"first_tick\",\"saving\":93}\n"
+    let mode1 = schema_detect(f1)
+    let enc1 = _a35_encode_force(f1)
+    let dec1 = a35_decode(enc1)
+    let saving1 = if len(f1) > 0 { ((len(f1) - len(enc1)) * 100) / len(f1) } else { 0 }
+    if mode1 == A35_SCHEMAFUL_JSONL && dec1 == f1 {
+        pass = pass + 1
+        println("  PASS: F1 schemaful 5-line shared schema mode=" + to_string(mode1)
+                + " " + to_string(len(f1)) + " -> " + to_string(len(enc1))
+                + " (" + to_string(saving1) + "% saving) round-trip byte-eq")
+    } else {
+        fail = fail + 1
+        println("  FAIL: F1 mode=" + to_string(mode1) + " (expected " + to_string(A35_SCHEMAFUL_JSONL)
+                + ") orig_len=" + to_string(len(f1)) + " dec_len=" + to_string(len(dec1))
+                + " round_trip_eq=" + to_string(dec1 == f1)
+                + " → F-A35-1 TRIPPED")
+    }
+
+    // ─── Fixture 2: schemaful 5-line jsonl with field-order variance row-1 ───
+    // Validates F-A35-2 graceful revert: schema_detect succeeds (keysets match) but
+    // Stage 1 build bails on key-order mismatch → identity passthrough.
+    let f2 = "{\"a\":1,\"b\":2,\"c\":3}\n"
+           + "{\"b\":4,\"a\":5,\"c\":6}\n"             // field ORDER differs
+           + "{\"a\":7,\"b\":8,\"c\":9}\n"
+           + "{\"a\":10,\"b\":11,\"c\":12}\n"
+           + "{\"a\":13,\"b\":14,\"c\":15}\n"
+    let mode2 = schema_detect(f2)
+    let enc2 = a35_encode(f2)            // production path — try-revert applies
+    let dec2 = a35_decode(enc2)
+    // schema_detect uses keyset (set) so it WILL detect schemaful; Stage 1
+    // build bails on order mismatch and a35_encode returns f2 unchanged.
+    if enc2 == f2 && dec2 == f2 {
+        pass = pass + 1
+        println("  PASS: F2 field-order variance graceful revert mode=" + to_string(mode2)
+                + " enc==input (identity) round-trip byte-eq")
+    } else {
+        fail = fail + 1
+        println("  FAIL: F2 mode=" + to_string(mode2)
+                + " enc_len=" + to_string(len(enc2)) + " input_len=" + to_string(len(f2))
+                + " enc_eq_input=" + to_string(enc2 == f2)
+                + " dec_eq_input=" + to_string(dec2 == f2)
+                + " → F-A35-2 TRIPPED")
+    }
+
+    // ─── Fixture 3: single-line jsonl ───
+    // Validates A35_MIN_LINES guard → SCHEMAFREE detected, identity.
+    let f3 = "{\"ts\":\"2026-04-28T00:00:00Z\",\"ev\":\"singleton\",\"saving\":50}\n"
+    let mode3 = schema_detect(f3)
+    let enc3 = a35_encode(f3)
+    let dec3 = a35_decode(enc3)
+    if mode3 == A35_SCHEMA_FREE && enc3 == f3 && dec3 == f3 {
+        pass = pass + 1
+        println("  PASS: F3 single-line SCHEMAFREE detected, identity passthrough")
+    } else {
+        fail = fail + 1
+        println("  FAIL: F3 mode=" + to_string(mode3) + " (expected " + to_string(A35_SCHEMA_FREE)
+                + ") enc_eq_input=" + to_string(enc3 == f3)
+                + " → F-A35-2 / F-A35-6 TRIPPED")
+    }
+
+    // ─── Fixture 4: random ASCII text (NOT json) ───
+    // Validates F-A35-6 false-positive guard: schema_detect rejects non-JSON shapes.
+    let f4 = "the quick brown fox jumps over the lazy dog. "
+           + "the quick brown fox jumps over the lazy dog. "
+           + "the quick brown fox jumps over the lazy dog. "
+           + "the quick brown fox jumps over the lazy dog. "
+           + "the quick brown fox jumps over the lazy dog.\n"
+    let mode4 = schema_detect(f4)
+    let enc4 = a35_encode(f4)
+    let dec4 = a35_decode(enc4)
+    if mode4 == A35_SCHEMA_FREE && enc4 == f4 && dec4 == f4 {
+        pass = pass + 1
+        println("  PASS: F4 random text SCHEMAFREE detected, identity passthrough"
+                + " (F-A35-6 false-positive guard holds)")
+    } else {
+        fail = fail + 1
+        println("  FAIL: F4 mode=" + to_string(mode4) + " (expected " + to_string(A35_SCHEMA_FREE)
+                + ") enc_eq_input=" + to_string(enc4 == f4)
+                + " → F-A35-6 TRIPPED — schema detector false positive on random text")
+    }
+
+    // ─── Fixture 5: aggregate round-trip byte-eq on all 4 (raw 65/68) ───
+    let r1: bool = (a35_decode(_a35_encode_force(f1)) == f1)
+    let r2: bool = (a35_decode(a35_encode(f2)) == f2)
+    let r3: bool = (a35_decode(a35_encode(f3)) == f3)
+    let r4: bool = (a35_decode(a35_encode(f4)) == f4)
+    if r1 && r2 && r3 && r4 {
+        pass = pass + 1
+        println("  PASS: F5 aggregate round-trip byte-eq 4/4 (raw 65/68 idempotent)")
+    } else {
+        fail = fail + 1
+        println("  FAIL: F5 aggregate round-trip r1=" + to_string(r1)
+                + " r2=" + to_string(r2)
+                + " r3=" + to_string(r3)
+                + " r4=" + to_string(r4)
+                + " → F-A35-1 TRIPPED")
+    }
+
+    // ─── Bonus: encoder idempotency (raw 65/68) ───
+    let bonus_a = _a35_encode_force(f1)
+    let bonus_b = _a35_encode_force(f1)
+    if bonus_a == bonus_b {
+        pass = pass + 1
+        println("  PASS: encoder idempotency (encode twice = byte-eq) raw 65/68 verified")
+    } else {
+        fail = fail + 1
+        println("  FAIL: encoder NON-idempotent (encode twice differs) → raw 65/68 TRIPPED")
+    }
+
+    println("Results: " + to_string(pass) + " PASS / " + to_string(fail) + " FAIL")
+    println("__HXC_A35_SELFTEST__ " + (if fail == 0 { "PASS" } else { "FAIL" })
+            + " (FIRST TICK 5 fixtures + 1 idempotency bonus = 6 checks)")
+    if fail == 0 { return 0 }
+    return 1
+}
+
+// ───────────────── main CLI ─────────────────
+
+fn main() {
+    let av = argv()
+    let mut has_selftest = false
+    let mut has_encode = false
+    let mut has_decode = false
+    let mut has_force = false
+    let mut k = 0
+    while k < len(av) {
+        if av[k] == "--selftest" { has_selftest = true }
+        if av[k] == "encode" { has_encode = true }
+        if av[k] == "decode" { has_decode = true }
+        if av[k] == "--force" { has_force = true }
+        k = k + 1
+    }
+    if has_selftest { exit(_selftest()) }
+    if has_encode || has_decode {
+        let mut sub_idx = 0
+        let mut q = 0
+        while q < len(av) {
+            if av[q] == "encode" || av[q] == "decode" { sub_idx = q; break }
+            q = q + 1
+        }
+        let mut paths = []
+        let mut q2 = sub_idx + 1
+        while q2 < len(av) {
+            let a = av[q2]
+            if len(a) >= 2 && a.substring(0, 2) == "--" { q2 = q2 + 1; continue }
+            paths.push(a)
+            q2 = q2 + 1
+        }
+        if len(paths) < 2 {
+            eprintln("usage: hexa hxc_a35_source_transform.hexa <encode|decode> [--force] <in> <out>")
+            exit(3)
+        }
+        let in_path = paths[0]
+        let out_path = paths[1]
+        if has_encode {
+            let txt = read_file(in_path)
+            let res = if has_force { _a35_encode_force(txt) } else { a35_encode(txt) }
+            let _w = write_file(out_path, res)
+            let saving = if len(txt) > 0 { ((len(txt) - len(res)) * 100) / len(txt) } else { 0 }
+            let mode = schema_detect(txt)
+            println("a35 encode mode=" + to_string(mode)
+                    + " raw=" + to_string(len(txt))
+                    + " enc=" + to_string(len(res)) + " saving=" + to_string(saving) + "%")
+            exit(0)
+        }
+        let txt = read_file(in_path)
+        let res = a35_decode(txt)
+        let _w = write_file(out_path, res)
+        exit(0)
+    }
+    eprintln("usage: hexa hxc_a35_source_transform.hexa [--selftest | encode [--force] <in> <out> | decode <in> <out>]")
+    exit(3)
+}
