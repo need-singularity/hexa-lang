@@ -282,11 +282,22 @@ fn a19_estimate_saving_pct(dict: array, file_text: string) -> int {
     return (s * 100) / n
 }
 
-// ───────────────── PASS 4: a19_encode / a19_decode (first-tick = identity) ─────────────────
+// ───────────────── PASS 4: a19_encode / a19_decode ─────────────────
 //
-// First-tick wire = identity passthrough. raw 91 honest C3: subsequent-tick
-// will introduce ^Z<idx> wire substitution + escape sigil for literal ^Z.
-// First-tick raw 65/68 idempotent: a19_encode(a19_encode(x)) == a19_encode(x).
+// First-tick wire = identity passthrough (preserved for backward compat).
+// Subsequent-tick wire-v2 = greedy ^Z<idx> substitution with externally-
+// supplied dict (corpus-built once, applied N times).
+//
+// Wire format (v2):
+//   sigil byte = chr(26) (ASCII SUB / Ctrl-Z, 0x1A)
+//   reference  = sigil + 1 byte dict index (0..255, EXCEPT 94 reserved as escape)
+//   escape     = sigil + chr(94) ('^', 0x5E) → literal sigil byte in source
+//
+// raw 91 honest C3: a19_encode keeps identity; new a19_v2_encode_with_dict /
+// a19_v2_decode_with_dict implement v2 wire and require an externally-
+// supplied dict (the dict overhead amortizes across the whole corpus, NOT
+// per-file, so we cannot rebuild dict per call without breaking the saving
+// model).
 
 fn a19_encode(text: string) -> string {
     let n: i64 = len(text)
@@ -296,6 +307,210 @@ fn a19_encode(text: string) -> string {
 
 fn a19_decode(stream: string) -> string {
     return stream
+}
+
+// ─── A19 v2 wire coder (subsequent-tick, dict-parameterized) ───
+//
+// a19_v2_encode_with_dict: greedy left-to-right pass over text. At each
+// position p:
+//   (a) if text[p] is sigil byte (chr(26)) → emit sigil + chr(94) (escape);
+//       advance p by 1.
+//   (b) else find longest dict token matching at p; if found → emit sigil +
+//       chr(idx_byte); advance p by token_len.
+//   (c) else emit raw byte; advance p by 1.
+//
+// HEXA UTF-8 STRING CONSTRAINT: hexa's chr() returns a UTF-8 sequence;
+// chr(0) is empty (broken for byte transit), chr(128..255) is 2 bytes.
+// Single-byte ASCII range chr(1..127) is what we can use for the idx byte.
+// We further reserve byte 26 (= sigil) and byte 94 (= escape marker), so
+// the usable single-byte index value range is {1..127} \ {26, 94} = 125
+// distinct values → effective A19_V2_DICT_CAP = 125.
+//
+// raw 137 cmix-ban: forward-only sweep, integer compare, deterministic.
+// raw 18 self-host: same (text, dict) → byte-identical encoded output.
+
+const A19_V2_SIGIL_BYTE = 26    // chr(26) = SUB / Ctrl-Z (0x1A)
+const A19_V2_ESCAPE_BYTE = 94   // chr(94) = '^' (0x5E)
+const A19_V2_DICT_CAP = 125     // effective max dict entries (UTF-8-safe)
+const A19_V2_REF_WIRE_BYTES_MIN_GAIN = 4    // below this length, no realistic gain
+
+// Map dict idx (0..124) → wire byte value in {1..127} \ {26, 94}.
+// Generation: walk byte values 1..127 skipping 26 and 94, assigning
+// successive idx values.
+fn _a19_v2_encode_idx_byte(idx: int) -> int {
+    if idx < 0 { return 1 }
+    // Skip-table: value at slot idx.
+    // Direct linear scan is fine (max 125 entries; called O(L) per file
+    // but L is bounded by file size, not dict size, so amortized O(1)).
+    let mut count: i64 = 0
+    let mut b: i64 = 1
+    while b <= 127 {
+        if b != A19_V2_SIGIL_BYTE && b != A19_V2_ESCAPE_BYTE {
+            if count == idx { return b }
+            count = count + 1
+        }
+        b = b + 1
+    }
+    // Out of range — return a safe fallback (idx 0 byte = 1).
+    return 1
+}
+
+fn _a19_v2_decode_idx_byte(b: int) -> int {
+    // Inverse: byte 1..127 (excluding 26, 94) → idx 0..124.
+    if b < 1 || b > 127 { return -1 }
+    if b == A19_V2_SIGIL_BYTE || b == A19_V2_ESCAPE_BYTE { return -1 }
+    let mut count: i64 = 0
+    let mut x: i64 = 1
+    while x <= 127 {
+        if x != A19_V2_SIGIL_BYTE && x != A19_V2_ESCAPE_BYTE {
+            if x == b { return count }
+            count = count + 1
+        }
+        x = x + 1
+    }
+    return -1
+}
+
+// _a19_v2_find_longest_match_skipidx: like _find_longest_match_at but
+// returns [token_str, token_len, dict_idx] where dict_idx accounts for
+// the escape-byte skip. dict_idx == -1 means no match.
+fn _a19_v2_find_longest_match_at(dict: array, text: string, p: int) -> array {
+    let nd: i64 = len(dict)
+    let nf: i64 = len(text)
+    let mut best_tok = ""
+    let mut best_len: i64 = 0
+    let mut best_idx: i64 = -1
+    let mut i: i64 = 0
+    while i < nd {
+        // Skip dict slots that would map to byte value 94 (escape collision):
+        // idx 94 → byte 95; idx 93 → byte 93. We skip the slot that produces
+        // byte 94 in the encoded stream — that's no slot under the +1 offset
+        // mapping (idx 94 maps to 95). So no slot is skipped at this layer.
+        // The idx mapping handles the offset.
+        let tok: string = dict[i][0]
+        let tl: i64 = len(tok)
+        if tl > best_len && p + tl <= nf {
+            let win = _window_at(text, p, tl)
+            if win == tok {
+                best_tok = tok
+                best_len = tl
+                best_idx = i
+            }
+        }
+        i = i + 1
+    }
+    return [best_tok, best_len, best_idx]
+}
+
+fn a19_v2_encode_with_dict(text: string, dict: array) -> string {
+    let n: i64 = len(text)
+    let nd: i64 = len(dict)
+    if n < A19_V2_REF_WIRE_BYTES_MIN_GAIN { return text }
+    if nd <= 0 { return text }
+    // UTF-8-safe cap: at most A19_V2_DICT_CAP=125 entries usable on hexa
+    // strings (chr(0)=empty + chr(128+)=2 bytes constraint).
+    let cap: i64 = if nd > A19_V2_DICT_CAP { A19_V2_DICT_CAP } else { nd }
+    let mut out = ""
+    let mut p: i64 = 0
+    let sigil_str: string = chr(A19_V2_SIGIL_BYTE)
+    let escape_str: string = chr(A19_V2_ESCAPE_BYTE)
+    while p < n {
+        let cur_byte: i64 = ord(_byte_at(text, p))
+        if cur_byte == A19_V2_SIGIL_BYTE {
+            // Literal sigil byte → emit sigil + escape.
+            out = out + sigil_str + escape_str
+            p = p + 1
+            continue
+        }
+        // Find longest dict match at p (within cap).
+        let mut best_len: i64 = 0
+        let mut best_idx: i64 = -1
+        let mut i: i64 = 0
+        while i < cap {
+            let tok: string = dict[i][0]
+            let tl: i64 = len(tok)
+            if tl > best_len && p + tl <= n {
+                let win = _window_at(text, p, tl)
+                if win == tok {
+                    best_len = tl
+                    best_idx = i
+                }
+            }
+            i = i + 1
+        }
+        if best_len >= A19_TOKEN_LEN_MIN && best_idx >= 0 {
+            let idx_byte: i64 = _a19_v2_encode_idx_byte(best_idx)
+            out = out + sigil_str + chr(idx_byte)
+            p = p + best_len
+        } else {
+            out = out + _byte_at(text, p)
+            p = p + 1
+        }
+    }
+    return out
+}
+
+fn a19_v2_decode_with_dict(stream: string, dict: array) -> string {
+    let n: i64 = len(stream)
+    let mut out = ""
+    let mut p: i64 = 0
+    let sigil_str: string = chr(A19_V2_SIGIL_BYTE)
+    while p < n {
+        let cur_byte: i64 = ord(_byte_at(stream, p))
+        if cur_byte != A19_V2_SIGIL_BYTE {
+            out = out + _byte_at(stream, p)
+            p = p + 1
+        } else if p + 1 >= n {
+            // Trailing sigil — emit as literal (defensive).
+            out = out + sigil_str
+            p = p + 1
+        } else {
+            let next_byte: i64 = ord(_byte_at(stream, p + 1))
+            if next_byte == A19_V2_ESCAPE_BYTE {
+                // Escape: emit literal sigil byte.
+                out = out + sigil_str
+                p = p + 2
+            } else {
+                let dict_idx: i64 = _a19_v2_decode_idx_byte(next_byte)
+                if dict_idx < 0 || dict_idx >= len(dict) {
+                    // Defensive: out-of-range → emit raw bytes.
+                    out = out + _byte_at(stream, p) + _byte_at(stream, p + 1)
+                    p = p + 2
+                } else {
+                    let tok: string = dict[dict_idx][0]
+                    out = out + tok
+                    p = p + 2
+                }
+            }
+        }
+    }
+    return out
+}
+
+// a19_v2_encode_with_header: full wire payload = `# a19:s2 v=cross-file-dict-v2 dict-size=<N>\n` + body.
+// Header is text-only; body contains raw sigil bytes (NOT base64-encoded for
+// max saving). Note: the dict is NOT serialized into per-file payload —
+// production usage assumes ONE dict per corpus, applied to N files,
+// distributed out-of-band (or written once to a sidecar). The header
+// records dict-size for cross-validation. This matches the design
+// "amortize dict over corpus" model.
+fn a19_v2_encode_with_header(text: string, dict: array) -> string {
+    let body = a19_v2_encode_with_dict(text, dict)
+    let n: i64 = len(text)
+    let header = "# a19:s2 v=cross-file-dict-v2 dict-size=" + to_string(len(dict)) + " n=" + to_string(n) + "\n"
+    let payload = header + body
+    if len(payload) >= n { return text }   // raw 142 D2 try-and-revert: if no gain (header+body), identity
+    return payload
+}
+
+fn a19_v2_decode_with_header(stream: string, dict: array) -> string {
+    let n: i64 = len(stream)
+    if n < 9 { return stream }
+    if stream.substring(0, 9) != "# a19:s2 " { return stream }
+    let nl_pos: i64 = stream.index_of("\n")
+    if nl_pos < 0 { return stream }
+    let body = stream.substring(nl_pos + 1, n)
+    return a19_v2_decode_with_dict(body, dict)
 }
 
 // ───────────────── dict serialization (format_witness format) ─────────────────
@@ -522,26 +737,194 @@ fn _selftest() -> int {
                 + "% < 10% gate → F-A19-1 TRIPPED (small-file attack hypothesis retracted)")
     }
 
+    // ─── Fixture 6: v2 wire round-trip byte-eq on mixed-real slice ───
+    //   Falsifier on fail: F-A19-2 (round-trip byte-eq).
+    //   Subsequent-tick wire = greedy ^Z<idx> substitution + escape.
+    let slice6 = _mixed_real_slice()
+    let dict6 = dict1   // 3-file mixed-real dict from F1
+    let enc6 = a19_v2_encode_with_dict(slice6, dict6)
+    let dec6 = a19_v2_decode_with_dict(enc6, dict6)
+    let n6: i64 = len(slice6)
+    let n6_enc: i64 = len(enc6)
+    let saving6: i64 = n6 - n6_enc
+    let pct6: i64 = if n6 > 0 { (saving6 * 100) / n6 } else { 0 }
+    if dec6 == slice6 {
+        pass = pass + 1
+        println("  PASS: fixture-6 v2 wire round-trip byte-eq mixed-real slice "
+                + to_string(n6) + " B → " + to_string(n6_enc) + " B (saving "
+                + to_string(saving6) + " B = " + to_string(pct6) + "%)")
+    } else {
+        fail = fail + 1
+        println("  FAIL: fixture-6 v2 wire round-trip byte-eq broken (raw_len="
+                + to_string(n6) + ", enc_len=" + to_string(n6_enc)
+                + ", dec_len=" + to_string(len(dec6)) + ") → F-A19-2 TRIPPED")
+    }
+
+    // ─── Fixture 7: v2 wire literal-sigil escape round-trip ───
+    //   Pathological input containing a literal sigil byte (chr(26)) MUST
+    //   round-trip via escape sigil ^Z^.
+    let lit_sigil = "abc" + chr(26) + "def" + chr(26) + chr(26) + "ghi"
+    let dict7 = dict1
+    let enc7 = a19_v2_encode_with_dict(lit_sigil, dict7)
+    let dec7 = a19_v2_decode_with_dict(enc7, dict7)
+    if dec7 == lit_sigil {
+        pass = pass + 1
+        println("  PASS: fixture-7 v2 wire literal-sigil escape round-trip ("
+                + to_string(len(lit_sigil)) + " B raw → " + to_string(len(enc7)) + " B enc)")
+    } else {
+        fail = fail + 1
+        println("  FAIL: fixture-7 v2 wire literal-sigil escape broken → F-A19-2 TRIPPED")
+    }
+
+    // ─── Fixture 8: v2 wire identity below MIN_BYTES (raw 65/68) ───
+    //   Short input MUST passthrough (saving model fails below 4 bytes).
+    let tiny8 = "ab"
+    let enc8 = a19_v2_encode_with_dict(tiny8, dict1)
+    let enc8b = a19_v2_encode_with_dict(enc8, dict1)
+    if enc8 == tiny8 && enc8b == tiny8 {
+        pass = pass + 1
+        println("  PASS: fixture-8 v2 wire short-input passthrough idempotent (raw 65 + 68)")
+    } else {
+        fail = fail + 1
+        println("  FAIL: fixture-8 v2 wire short-input idempotency broken → F-A19-2 SIGNAL")
+    }
+
+    // ─── Fixture 9: v2 wire raw 142 D2 try-and-revert (no-gain → identity) ───
+    //   Random-ish input where dict provides no match → encode-with-header
+    //   reverts to identity (output == input).
+    let nogain = "9!@#$%^&*()_+-=[]{}|;:,.<>?/~`"
+    let enc9 = a19_v2_encode_with_header(nogain, dict1)
+    if enc9 == nogain {
+        pass = pass + 1
+        println("  PASS: fixture-9 v2 wire raw 142 D2 try-and-revert (no-gain → identity, "
+                + to_string(len(nogain)) + " B)")
+    } else {
+        fail = fail + 1
+        println("  FAIL: fixture-9 v2 wire D2 try-and-revert broken (enc_len="
+                + to_string(len(enc9)) + ", expected " + to_string(len(nogain)) + ")")
+    }
+
     println("Results: " + to_string(pass) + " PASS / " + to_string(fail) + " FAIL")
     println("__HXC_A19_DICT_SELFTEST__ " + (if fail == 0 { "PASS" } else { "FAIL" })
-            + " (FIRST TICK: PASS 1 spec + PASS 2 a19_build_dict + PASS 2.5 a19_estimate_savings + PASS 3 5-fixture; LIVE FIRE deferred)")
+            + " (SUBSEQUENT TICK: PASS 1+2+2.5+3+4 v2 wire encoder/decoder + escape sigil + try-and-revert; LIVE FIRE on 6-repo gated)")
     if fail == 0 { return 0 }
     return 1
 }
 
 // ───────────────── main CLI ─────────────────
 
+// ───────────────── live-fire harness ─────────────────
+//
+// _live_fire_corpus: takes a list of file PATHS (absolute), builds dict from
+// the union, then per-file v2 encode/decode + byte-eq round-trip + saving
+// measurement. Emits per-file JSONL + aggregate verdict.
+//
+// raw 91 honest C3: this is the actual subsequent-tick wire-axis measurement.
+fn _live_fire_corpus(paths: array, dict_size_cap: int) -> int {
+    let n_files: i64 = len(paths)
+    if n_files <= 0 { return 0 }
+    // PASS 1: load all files into memory.
+    let mut texts = []
+    let mut total_raw: i64 = 0
+    let mut i: i64 = 0
+    while i < n_files {
+        let txt = read_file(paths[i])
+        texts.push(txt)
+        total_raw = total_raw + len(txt)
+        i = i + 1
+    }
+    // PASS 2: build dict over corpus (capped at dict_size_cap).
+    let dict_full = a19_build_dict(texts)
+    let dict_cap: i64 = if dict_size_cap > 0 && dict_size_cap < len(dict_full) { dict_size_cap } else { len(dict_full) }
+    let mut dict = []
+    let mut di: i64 = 0
+    while di < dict_cap { dict.push(dict_full[di]); di = di + 1 }
+    let dict_size = len(dict)
+    let serialized = a19_serialize_dict(dict)
+    let dict_overhead: i64 = len(serialized)
+    println("# a19_v2_live_fire dict_size=" + to_string(dict_size)
+            + " overhead_b=" + to_string(dict_overhead)
+            + " corpus_files=" + to_string(n_files)
+            + " corpus_raw_b=" + to_string(total_raw))
+    // PASS 3: per-file v2 encode, decode, byte-eq verify, accumulate.
+    let mut total_enc: i64 = 0
+    let mut byte_eq_pass: i64 = 0
+    let mut byte_eq_fail: i64 = 0
+    let mut a19_v2_fired: i64 = 0
+    let mut a19_v2_revert: i64 = 0
+    let mut j: i64 = 0
+    while j < n_files {
+        let txt = texts[j]
+        let raw_len: i64 = len(txt)
+        let enc = a19_v2_encode_with_header(txt, dict)
+        let enc_len: i64 = len(enc)
+        // Identify whether encoder fired or returned identity (raw 142 D2).
+        // Identity is detected by exact byte-eq with original input.
+        let is_identity: bool = enc == txt
+        let dec = if is_identity { enc } else { a19_v2_decode_with_header(enc, dict) }
+        let eq: bool = dec == txt
+        if eq { byte_eq_pass = byte_eq_pass + 1 } else { byte_eq_fail = byte_eq_fail + 1 }
+        if !is_identity && enc_len < raw_len { a19_v2_fired = a19_v2_fired + 1 } else { a19_v2_revert = a19_v2_revert + 1 }
+        total_enc = total_enc + enc_len
+        let saving: i64 = raw_len - enc_len
+        let pct: i64 = if raw_len > 0 { (saving * 100) / raw_len } else { 0 }
+        println("{\"file\":\"" + paths[j] + "\",\"raw_b\":" + to_string(raw_len)
+                + ",\"enc_b\":" + to_string(enc_len) + ",\"saving_b\":" + to_string(saving)
+                + ",\"saving_pct\":" + to_string(pct)
+                + ",\"byte_eq\":" + (if eq { "true" } else { "false" }) + "}")
+        j = j + 1
+    }
+    let body_saving: i64 = total_raw - total_enc
+    let body_pct: i64 = if total_raw > 0 { (body_saving * 100) / total_raw } else { 0 }
+    let amortized_saving: i64 = body_saving - dict_overhead
+    let amortized_pct: i64 = if total_raw > 0 { (amortized_saving * 100) / total_raw } else { 0 }
+    println("# a19_v2_aggregate raw_b=" + to_string(total_raw)
+            + " enc_b=" + to_string(total_enc)
+            + " body_saving_b=" + to_string(body_saving)
+            + " body_saving_pct=" + to_string(body_pct)
+            + " dict_overhead_b=" + to_string(dict_overhead)
+            + " amortized_saving_b=" + to_string(amortized_saving)
+            + " amortized_saving_pct=" + to_string(amortized_pct)
+            + " files_total=" + to_string(n_files)
+            + " a19_v2_fired=" + to_string(a19_v2_fired)
+            + " a19_v2_revert=" + to_string(a19_v2_revert)
+            + " byte_eq_pass=" + to_string(byte_eq_pass)
+            + " byte_eq_fail=" + to_string(byte_eq_fail))
+    if byte_eq_fail > 0 { return 1 }
+    return 0
+}
+
 fn main() {
     let av = argv()
     let mut has_selftest = false
     let mut has_build = false
+    let mut has_live_fire = false
     let mut k: i64 = 0
     while k < len(av) {
         if av[k] == "--selftest" { has_selftest = true }
         if av[k] == "build" { has_build = true }
+        if av[k] == "live-fire" { has_live_fire = true }
         k = k + 1
     }
     if has_selftest { exit(_selftest()) }
+    if has_live_fire {
+        // live-fire <dict_size_cap> <path1> <path2> ...
+        let mut sub_idx: i64 = 0
+        let mut q: i64 = 0
+        while q < len(av) {
+            if av[q] == "live-fire" { sub_idx = q; break }
+            q = q + 1
+        }
+        if sub_idx + 2 >= len(av) {
+            eprintln("usage: hexa hxc_a19_cross_file_dict.hexa live-fire <dict_size_cap> <path1> ...")
+            exit(3)
+        }
+        let cap: i64 = parse_int(av[sub_idx + 1])
+        let mut paths = []
+        let mut z: i64 = sub_idx + 2
+        while z < len(av) { paths.push(av[z]); z = z + 1 }
+        exit(_live_fire_corpus(paths, cap))
+    }
     if has_build {
         // First-tick build subcommand: report dict stats on a single in-memory
         // file path. Subsequent-tick will wire `find` walk over corpus root.
@@ -565,6 +948,6 @@ fn main() {
                 + " pct=" + to_string(pct) + "%")
         exit(0)
     }
-    eprintln("usage: hexa hxc_a19_cross_file_dict.hexa [--selftest | build <file>]")
+    eprintln("usage: hexa hxc_a19_cross_file_dict.hexa [--selftest | build <file> | live-fire <dict_size_cap> <path1> ...]")
     exit(3)
 }
