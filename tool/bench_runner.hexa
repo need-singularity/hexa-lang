@@ -1,0 +1,226 @@
+// tool/bench_runner.hexa — pure-hexa, ms-amortized benchmark runner (v0)
+//
+// Origin: hive/design/kick/2026-04-29_hexa-native-bench-framework_omega_cycle.json
+//         raw 100 fallback (kick file absent at task time)
+//
+// Schema (state/perf/<date>_bench.jsonl row):
+//   {ts, file, iters, warmup, total_ms, avg_ms, ops_per_sec,
+//    ok, fail, classifier_version: "bench_runner.v1"}
+//
+// Argv (user args at argv[2]+ under hexa run):
+//   --target <dir>   default "packages/"
+//   --pattern <glob> default "*.bench.hexa"
+//   --warmup <N>     default 100
+//   --iters <N>      default 1000
+//   --output <path>  default state/perf/<YYYY-MM-DD>_bench.jsonl
+//   --selftest       run pure-helper selftest, exit 0/1
+//
+// raw 91 C3 disclosures (ms-granularity hides):
+//   1. sub-ms tight-loop signals (collapsed into 1ms floor)
+//   2. process startup vs parse vs run breakdown (only union measured)
+//   3. cache-line / branch-predict variance (sub-iteration, lost)
+//   v1 (ns-precise) deferred until __builtin_time_now_ns lands.
+//
+// raw 9 hexa-only:
+//   wall clock = time_ms() in-process (hexa_time_ms in runtime.c).
+//   exec() is allowed for non-time concerns (find / date stamping /
+//   file append) but never substitutes for the timing primitive.
+//
+// raw 168 minimum-viable:
+//   180-220 LoC ceiling. Statistical-significance harness (p50/p95/
+//   stddev/CI) deferred to v1.
+
+fn parse_int_safe(s) {
+    let r = to_int(s)
+    if r < 0 { return 0 }
+    return r
+}
+
+fn jsonl_escape(s) {
+    let mut out = ""
+    let mut i = 0
+    while i < len(s) {
+        let ch = s[i]
+        if ch == "\\" { out = out + "\\\\" }
+        else if ch == "\"" { out = out + "\\\"" }
+        else if ch == "\n" { out = out + "\\n" }
+        else { out = out + ch }
+        i = i + 1
+    }
+    return out
+}
+
+fn today_utc() {
+    // exec() is allowed for *non-time* concerns (raw 9 only forbids
+    // shell-out for the wall-clock primitive, which we honor by using
+    // time_ms below).
+    let raw = exec("date -u +%Y-%m-%d 2>/dev/null").trim()
+    if len(raw) >= 10 { return raw.substring(0, 10) }
+    return "1970-01-01"
+}
+
+fn ts_iso() {
+    let raw = exec("date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null").trim()
+    if len(raw) >= 20 { return raw }
+    return "1970-01-01T00:00:00Z"
+}
+
+fn discover_bench_files(target_dir, pattern) {
+    // Recursive walk via find(1) — list of paths only, no time data.
+    let cmd = "find '" + target_dir + "' -type f -name '" + pattern + "' 2>/dev/null"
+    let raw = exec(cmd).trim()
+    if raw == "" { return [] }
+    let lines = raw.split("\n")
+    let mut out = []
+    let mut i = 0
+    while i < len(lines) {
+        let p = lines[i].trim()
+        if len(p) > 0 { out.push(p) }
+        i = i + 1
+    }
+    return out
+}
+
+fn extract_rc_marker(out) {
+    // Output from inner exec contains stderr + stdout intermixed;
+    // we appended `___RC=<n>` as the LAST line so we can grep it
+    // out reliably even if stderr noise prefixes it.
+    let lines = out.split("\n")
+    let mut k = len(lines) - 1
+    while k >= 0 {
+        let line = lines[k].trim()
+        if len(line) > 6 && line.substring(0, 6) == "___RC=" {
+            return parse_int_safe(line.substring(6, len(line)))
+        }
+        k = k - 1
+    }
+    return 127
+}
+
+fn run_bench_once(bench_path) {
+    // Spawn the bench fixture exactly once. Returns rc; hexa_interp
+    // process startup + parse + run is included in the wall-clock
+    // window measured by the *outer* time_ms() bracket — that is the
+    // honest v0 signal.
+    //
+    // Implementation note: invoke via the user-stage wrapper
+    // `~/.hx/bin/hexa` to honor the `@resolver-bypass(...)` marker
+    // in the bench fixture (raw 82 darwin landing). A direct call to
+    // `hexa.real` from a parent under hexa-lang/tool/ gets sandboxed
+    // by the watcher and fails with `syntax error: line 1` (popen
+    // sees the binary as a script). The wrapper resolves cleanly.
+    let cmd = "/Users/ghost/.hx/bin/hexa run '" + bench_path + "' 2>&1; echo \"___RC=$?\""
+    let out = exec(cmd)
+    return extract_rc_marker(out)
+}
+
+fn bench_one(bench_path, warmup, iters) {
+    println("  " + bench_path + " (warmup=" + to_string(warmup) + " iters=" + to_string(iters) + ")")
+    let mut w = 0
+    while w < warmup {
+        let _ = run_bench_once(bench_path)
+        w = w + 1
+    }
+    let t0 = time_ms()
+    let mut ok_count = 0
+    let mut fail_count = 0
+    let mut i = 0
+    while i < iters {
+        let rc = run_bench_once(bench_path)
+        if rc == 0 { ok_count = ok_count + 1 }
+        else { fail_count = fail_count + 1 }
+        i = i + 1
+    }
+    let t1 = time_ms()
+    let total_ms = t1 - t0
+    let mut avg_ms = 0
+    if iters > 0 { avg_ms = total_ms / iters }
+    let mut ops_per_sec = 0
+    if total_ms > 0 { ops_per_sec = (iters * 1000) / total_ms }
+    let row = "{\"ts\": \"" + ts_iso() +
+              "\", \"file\": \"" + jsonl_escape(bench_path) +
+              "\", \"iters\": " + to_string(iters) +
+              ", \"warmup\": " + to_string(warmup) +
+              ", \"total_ms\": " + to_string(total_ms) +
+              ", \"avg_ms\": " + to_string(avg_ms) +
+              ", \"ops_per_sec\": " + to_string(ops_per_sec) +
+              ", \"ok\": " + to_string(ok_count) +
+              ", \"fail\": " + to_string(fail_count) +
+              ", \"classifier_version\": \"bench_runner.v1\"}"
+    println("    total_ms=" + to_string(total_ms) + " avg_ms=" + to_string(avg_ms) + " ops/s=" + to_string(ops_per_sec) + " ok=" + to_string(ok_count) + " fail=" + to_string(fail_count))
+    return [row, fail_count]
+}
+
+fn append_jsonl(path, row) {
+    // We *only* shell out to append (file-IO, not time). hexa lacks
+    // a builtin fs_append at present; a future fs_append_ssot may
+    // replace this without changing the schema.
+    let cmd = "mkdir -p \"$(dirname '" + path + "')\" && printf '%s\\n' '" + row + "' >> '" + path + "'"
+    try { let _ = exec(cmd) } catch e { }
+}
+
+fn cmd_selftest() -> i64 {
+    println("[bench_runner selftest]")
+    if parse_int_safe("42") != 42 { println("FAIL parse_int_safe pos"); return 1 }
+    if parse_int_safe("0") != 0 { println("FAIL parse_int_safe zero"); return 1 }
+    if jsonl_escape("a\"b") != "a\\\"b" { println("FAIL jsonl_escape quote"); return 1 }
+    if jsonl_escape("x\\y") != "x\\\\y" { println("FAIL jsonl_escape backslash"); return 1 }
+    let dt = today_utc()
+    if len(dt) != 10 { println("FAIL today_utc len"); return 1 }
+    let ts = ts_iso()
+    if len(ts) < 20 { println("FAIL ts_iso len"); return 1 }
+    let t0 = time_ms()
+    let t1 = time_ms()
+    if t1 < t0 { println("FAIL time_ms monotonic"); return 1 }
+    println("[bench_runner selftest] OK")
+    return 0
+}
+
+fn main() {
+    let argv = args()
+    if len(argv) > 2 && (argv[2] == "--selftest" || argv[2] == "selftest") { exit(cmd_selftest()) }
+    let mut target = "packages/"
+    let mut pattern = "*.bench.hexa"
+    let mut warmup = 100
+    let mut iters = 1000
+    let mut output = ""
+    let mut i = 2
+    while i < len(argv) {
+        let a = argv[i]
+        if a == "--target" && i + 1 < len(argv) { target = argv[i + 1]; i = i + 2; continue }
+        if a == "--pattern" && i + 1 < len(argv) { pattern = argv[i + 1]; i = i + 2; continue }
+        if a == "--warmup" && i + 1 < len(argv) { warmup = parse_int_safe(argv[i + 1]); i = i + 2; continue }
+        if a == "--iters" && i + 1 < len(argv) { iters = parse_int_safe(argv[i + 1]); i = i + 2; continue }
+        if a == "--output" && i + 1 < len(argv) { output = argv[i + 1]; i = i + 2; continue }
+        i = i + 1
+    }
+    if len(output) == 0 {
+        let mut hl = env_var("HEXA_LANG")
+        if len(hl) == 0 { hl = "/Users/ghost/core/hexa-lang" }
+        output = hl + "/state/perf/" + today_utc() + "_bench.jsonl"
+    }
+    let files = discover_bench_files(target, pattern)
+    println("bench_runner.v1: target=" + target + " pattern=" + pattern + " files=" + to_string(len(files)) + " warmup=" + to_string(warmup) + " iters=" + to_string(iters))
+    println("                 output=" + output)
+    if len(files) == 0 {
+        println("bench_runner.v1: no files matched — exiting clean (nothing to do)")
+        exit(0)
+    }
+    let mut total_fail = 0
+    let mut k = 0
+    while k < len(files) {
+        let pair = bench_one(files[k], warmup, iters)
+        let row = pair[0]
+        let fcount = pair[1]
+        append_jsonl(output, row)
+        println(row)
+        if fcount > 0 { total_fail = total_fail + fcount }
+        k = k + 1
+    }
+    if total_fail > 0 {
+        println("bench_runner.v1: FAIL — " + to_string(total_fail) + " bench-fn failure(s)")
+        exit(1)
+    }
+    println("bench_runner.v1: OK — " + to_string(len(files)) + " bench file(s) passed")
+    exit(0)
+}
