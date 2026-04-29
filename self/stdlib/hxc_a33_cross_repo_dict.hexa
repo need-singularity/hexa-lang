@@ -124,31 +124,54 @@ fn _str_to_codes(s: string) -> array {
 // _codes_to_str: inverse, ASCII range only (codes must be 1..127).
 // Codes >= 128 will produce UTF-8 multibyte; first-tick selftest restricts
 // to ASCII range so this is a safe identity round-trip.
+//
+// PASS 5 RSS fix: PASS 4 used `out = out + chr(codes[i])` per byte —
+// quadratic memory allocation behavior in the hexa string-arena (each
+// concat allocates a fresh N+1 byte buffer; arena does not free until
+// fn return). On 60 KB output that's O(N^2) = 3.6 GB cumulative arena
+// pressure. Replaced with array.push(chr(c)) + join("") which uses the
+// runtime's hexa_str_join (single O(N) malloc + memcpy fill pass).
 fn _codes_to_str(codes: array) -> string {
     let n: i64 = len(codes)
-    let mut out = ""
+    let mut parts = []
     let mut i: i64 = 0
     while i < n {
-        out = out + chr(codes[i])
+        parts.push(chr(codes[i]))
         i = i + 1
     }
-    return out
+    return parts.join("")
 }
 
 // ───────────────── PASS 2 + PASS 4: ring buffer + hash-chain primitives ─────────────────
 //
-// Ring buffer state: [codes_array, write_idx_int, n_filled_int, hash_head, hash_prev]
+// Ring buffer state (PASS 5): ring = [codes_array, write_idx_int, n_filled_int]
 //   codes_array: array of byte codes (0..255). DYNAMIC GROWTH — initialized
 //     with seed contents only (length = len(seed)); appended via push until
 //     length reaches A33_RING_CAP, after which writes wrap modulo CAP.
 //   write_idx:  next position to write
 //   n_filled:   total bytes ever pushed (caps at A33_RING_CAP after wrap)
-//   hash_head:  array[A33_HASH_BUCKETS] of last absolute push position with that
-//               3-byte-prefix hash; -1 sentinel if none. ABSOLUTE position
-//               = total bytes pushed at insert time (NOT the ring index);
-//               back_distance = current_n_filled - position_at_insert.
-//   hash_prev:  map keyed by to_string(absolute_position) → previous absolute
-//               position with the same hash. -1 sentinel if first.
+//
+// HASH STATE (separate parameters, NOT inside ring tuple — PASS 5 RSS fix):
+//   hash_head:  array[A33_HASH_BUCKETS] of last absolute push position with
+//               that 3-byte-prefix hash; -1 sentinel if none.
+//   hash_prev:  array[A33_RING_CAP] indexed by (absolute_position mod
+//               A33_RING_CAP). prev[i] = previous absolute position whose
+//               3-byte key hash matched the byte that landed at ring slot i.
+//               Fixed 2 MB ceiling (262144 * 8B). Replaces PASS 4
+//               map<string,int> — zlib/DEFLATE classic pattern.
+//
+// PASS 5 RSS-FIX RATIONALE (raw 91 honest C3 disclosure):
+//   PASS 4 stored both hash arrays inside the ring tuple. _a33_ring_push
+//   returned the ring per call, and __hexa_fn_arena_return → hexa_val_heapify
+//   walks ALL items of any returned array recursively. With hash_prev as a
+//   262144-element child of the returned ring, every push triggered a 262K
+//   element walk — observed 6.4 GB peak RSS on 60 KB input despite the
+//   fixed-array allocation being only 2 MB. PASS 5 hoists hash_head/hash_prev
+//   OUT of the ring tuple and passes them as separate parameters to push
+//   and find. The push path now returns only a 3-element ring so heapify
+//   walks 3 items. Hash arrays stay alive across calls as caller-local
+//   mutable variables (in-place mutated, never returned to caller). Same
+//   pattern as A18 LZ77 hash-chain (a18_lz_match_real signature).
 //
 // PASS 4 NOTE: hash-chain replaces naive O(max_dist × max_len) match-find
 // with O(N + chain_walk_bounded). Chain bound = A33_MAX_CHAIN = 1024
@@ -174,11 +197,32 @@ fn _a33_hash_head_init() -> array {
     return h
 }
 
+// PASS 5: fixed-array prev init. Length A33_RING_CAP, all -1 sentinel.
+// Indexed by (abs_pos mod A33_RING_CAP). 2 MB fixed (262144 * 8B int).
+// Replaces PASS 4 map<string,int> per F-A33-6 jetsam mandate.
+fn _a33_hash_prev_init() -> array {
+    let mut p = []
+    let mut i: i64 = 0
+    while i < A33_RING_CAP {
+        p.push(-1)
+        i = i + 1
+    }
+    return p
+}
+
+// PASS 5: ring-index of an absolute position for prev[] lookup.
+// abs_pos mod A33_RING_CAP — non-negative because abs_pos >= 0 always.
+fn _a33_prev_idx(abs_pos: int) -> int {
+    let r: i64 = abs_pos - (abs_pos / A33_RING_CAP) * A33_RING_CAP
+    if r < 0 { return r + A33_RING_CAP }
+    return r
+}
+
+// PASS 5: init returns FLAT tuple [codes, write_idx, n_filled, hash_head,
+// hash_prev]. Caller unpacks once and keeps each component as a separate
+// local (mutated in place during the encode/decode loop). The per-push
+// hot path no longer re-bundles ring/hash arrays into a returned aggregate.
 fn _a33_ring_init_from_seed(seed_codes: array) -> array {
-    // Initialize ring with seed codes (no padding). All seed bytes also
-    // populate hash_head/hash_prev so PASS 4 match-find can reference seed
-    // content immediately. F-A33-4 amortization gate evaluates whether the
-    // seed actually provides cross-corpus lift on held-out 5MB MEASURED.
     let n: i64 = len(seed_codes)
     let cap_use: i64 = if n >= A33_RING_CAP { A33_RING_CAP } else { n }
     let mut codes = []
@@ -190,16 +234,14 @@ fn _a33_ring_init_from_seed(seed_codes: array) -> array {
     let write_idx: i64 = if cap_use >= A33_RING_CAP { 0 } else { cap_use }
     let n_filled: i64 = cap_use
     let mut hash_head = _a33_hash_head_init()
-    let hash_prev = {}
-    // Insert hashes for every 3-byte prefix in the seed. Absolute position
-    // = index within the seed (0..cap_use - A33_HASH_KEY_BYTES).
+    let mut hash_prev = _a33_hash_prev_init()
     if cap_use >= A33_HASH_KEY_BYTES {
         let last: i64 = cap_use - A33_HASH_KEY_BYTES
         let mut p: i64 = 0
         while p <= last {
             let h: i64 = _a33_hash3_codes(codes[p], codes[p + 1], codes[p + 2])
             let prev_head: i64 = hash_head[h]
-            hash_prev[to_string(p)] = prev_head
+            hash_prev[_a33_prev_idx(p)] = prev_head
             hash_head[h] = p
             p = p + 1
         }
@@ -209,7 +251,7 @@ fn _a33_ring_init_from_seed(seed_codes: array) -> array {
 
 // _a33_ring_init_empty: empty seed (selftest default).
 fn _a33_ring_init_empty() -> array {
-    return [[], 0, 0, _a33_hash_head_init(), {}]
+    return [[], 0, 0, _a33_hash_head_init(), _a33_hash_prev_init()]
 }
 
 // _a33_ring_push: push byte b; advance write_idx; bump n_filled. ALSO
@@ -217,12 +259,13 @@ fn _a33_ring_init_empty() -> array {
 // into hash_head/hash_prev once enough bytes are present. The absolute
 // insert position is (n_filled - 2): the START of the 3-byte key whose
 // last byte is the byte just pushed.
-fn _a33_ring_push(ring: array, b: int) -> array {
-    let codes: array = ring[0]
-    let write_idx: i64 = ring[1]
-    let n_filled: i64 = ring[2]
-    let hash_head: array = ring[3]
-    let hash_prev = ring[4]
+//
+// PASS 5: ALL mutable state passed as SEPARATE PARAMETERS. codes,
+// hash_head, hash_prev mutated in place. Returns [new_write_idx,
+// new_n_filled] (scalar 2-tuple) so __hexa_fn_arena_return → heapify
+// walks only 2 ints. F-A33-6 RSS fix — prevents heapify from walking
+// the codes/hash_head/hash_prev arrays per push.
+fn _a33_ring_push(codes: array, write_idx: int, n_filled: int, hash_head: array, hash_prev: array, b: int) -> array {
     let cur_len: i64 = len(codes)
     if cur_len < A33_RING_CAP {
         codes.push(b)
@@ -233,19 +276,8 @@ fn _a33_ring_push(ring: array, b: int) -> array {
     if new_idx >= A33_RING_CAP { new_idx = 0 }
     let new_filled: i64 = if n_filled < A33_RING_CAP { n_filled + 1 } else { A33_RING_CAP }
     // Hash insertion: only once we have at least 3 bytes total in the ring.
-    // Key starts at absolute position (new_filled - A33_HASH_KEY_BYTES).
-    // n_filled BEFORE push is also the absolute pos of byte b BEFORE wrap;
-    // after push, byte b lives at write_idx (relative) and abs pos n_filled.
-    // The 3-byte key ending in b spans abs positions (n_filled-2, n_filled-1, n_filled).
     if new_filled >= A33_HASH_KEY_BYTES {
         let key_start_abs: i64 = new_filled - A33_HASH_KEY_BYTES
-        // Read the 3 bytes. write_idx after push = (write_idx + 1) % CAP, so
-        // byte b is at position new_idx-1 (or CAP-1 if wrap). Compute ring
-        // indices for the 3 bytes via ring offset arithmetic.
-        // Distance back from new_idx for the 3 bytes:
-        //   byte0 (oldest) = distance 3 from new_idx
-        //   byte1          = distance 2 from new_idx
-        //   byte2 (just b) = distance 1 from new_idx
         let i0: i64 = _a33_back_idx_raw(new_idx, 3, new_filled, A33_RING_CAP)
         let i1: i64 = _a33_back_idx_raw(new_idx, 2, new_filled, A33_RING_CAP)
         let i2: i64 = _a33_back_idx_raw(new_idx, 1, new_filled, A33_RING_CAP)
@@ -254,10 +286,11 @@ fn _a33_ring_push(ring: array, b: int) -> array {
         let c2: i64 = codes[i2]
         let h: i64 = _a33_hash3_codes(c0, c1, c2)
         let prev_head: i64 = hash_head[h]
-        hash_prev[to_string(key_start_abs)] = prev_head
+        hash_prev[_a33_prev_idx(key_start_abs)] = prev_head
         hash_head[h] = key_start_abs
     }
-    return [codes, new_idx, new_filled, hash_head, hash_prev]
+    // Return scalar 2-tuple — heapify cost is constant regardless of input size.
+    return [new_idx, new_filled]
 }
 
 // _a33_back_idx_raw: helper computing ring-index for distance back from
@@ -272,10 +305,8 @@ fn _a33_back_idx_raw(write_idx: int, distance: int, n_filled: int, cap: int) -> 
 }
 
 // _a33_ring_get_back: read byte code at (write_idx - distance) with modulo wrap.
-fn _a33_ring_get_back(ring: array, distance: int) -> int {
-    let codes: array = ring[0]
-    let write_idx: i64 = ring[1]
-    let n_filled: i64 = ring[2]
+// PASS 5: codes/idx/filled passed as separate params (no ring tuple).
+fn _a33_ring_get_back(codes: array, write_idx: int, n_filled: int, distance: int) -> int {
     let p: i64 = _a33_back_idx_raw(write_idx, distance, n_filled, A33_RING_CAP)
     if p < 0 { return -1 }
     return codes[p]
@@ -284,10 +315,8 @@ fn _a33_ring_get_back(ring: array, distance: int) -> int {
 // _a33_ring_get_at_abs: read byte at ABSOLUTE position (= bytes-since-init
 // at insert time). Used by hash-chain match-find. Returns -1 if the
 // absolute position has fallen outside the ring window.
-fn _a33_ring_get_at_abs(ring: array, abs_pos: int) -> int {
-    let codes: array = ring[0]
-    let write_idx: i64 = ring[1]
-    let n_filled: i64 = ring[2]
+// PASS 5: codes/idx/filled passed as separate params.
+fn _a33_ring_get_at_abs(codes: array, write_idx: int, n_filled: int, abs_pos: int) -> int {
     let back_dist: i64 = n_filled - abs_pos
     if back_dist <= 0 { return -1 }
     if back_dist > A33_RING_CAP { return -1 }
@@ -396,8 +425,7 @@ fn _a33_varint_decode(stream: string, p: int) -> array {
 // chain walk is deterministic (FIFO insertion), match comparison is
 // byte-eq integer compare. No probabilistic mixer. No fp ops.
 
-fn _a33_find_longest_match_codes(ring: array, upcoming_codes: array, p: int, max_dist: int, max_len: int) -> array {
-    let n_filled: i64 = ring[2]
+fn _a33_find_longest_match_codes(codes: array, write_idx: int, n_filled: int, hash_head: array, hash_prev: array, upcoming_codes: array, p: int, max_dist: int, max_len: int) -> array {
     let dist_cap_pre: i64 = if max_dist < n_filled { max_dist } else { n_filled }
     let dist_cap: i64 = if dist_cap_pre > A33_RING_CAP { A33_RING_CAP } else { dist_cap_pre }
     if dist_cap <= 0 { return [0, 0] }
@@ -407,8 +435,6 @@ fn _a33_find_longest_match_codes(ring: array, upcoming_codes: array, p: int, max
     if len_cap < A33_MATCH_MIN { return [0, 0] }
     // Need at least 3 bytes of upcoming to compute hash key.
     if p + A33_HASH_KEY_BYTES > n_up { return [0, 0] }
-    let hash_head: array = ring[3]
-    let hash_prev = ring[4]
     let key_h: i64 = _a33_hash3_codes(upcoming_codes[p], upcoming_codes[p + 1], upcoming_codes[p + 2])
     let mut cand_abs: i64 = hash_head[key_h]
     let mut hops: i64 = 0
@@ -421,28 +447,22 @@ fn _a33_find_longest_match_codes(ring: array, upcoming_codes: array, p: int, max
             break
         }
         if back_dist > 0 && back_dist <= dist_cap {
-            // 3-byte prefix already matches by hash — verify with byte-eq
-            // (collisions exist; cheap reject saves the extension cost).
-            let r0: i64 = _a33_ring_get_at_abs(ring, cand_abs)
-            let r1: i64 = _a33_ring_get_at_abs(ring, cand_abs + 1)
-            let r2: i64 = _a33_ring_get_at_abs(ring, cand_abs + 2)
+            // 3-byte prefix already matches by hash — verify with byte-eq.
+            let r0: i64 = _a33_ring_get_at_abs(codes, write_idx, n_filled, cand_abs)
+            let r1: i64 = _a33_ring_get_at_abs(codes, write_idx, n_filled, cand_abs + 1)
+            let r2: i64 = _a33_ring_get_at_abs(codes, write_idx, n_filled, cand_abs + 2)
             let want0: i64 = upcoming_codes[p]
             let want1: i64 = upcoming_codes[p + 1]
             let want2: i64 = upcoming_codes[p + 2]
             if r0 == want0 && r1 == want1 && r2 == want2 {
-                // Extend the match forward, supporting RLE wrap.
                 let mut cur_len: i64 = 3
                 while cur_len < len_cap {
                     let want_k: i64 = upcoming_codes[p + cur_len]
                     let bd_k: i64 = back_dist - cur_len
                     let mut got_k: i64 = -1
                     if bd_k > 0 {
-                        got_k = _a33_ring_get_back(ring, bd_k)
+                        got_k = _a33_ring_get_back(codes, write_idx, n_filled, bd_k)
                     } else {
-                        // RLE wrap: byte at (p + cur_len - back_dist), i.e.,
-                        // pattern repeats from upcoming itself starting back_dist
-                        // before the current position. Mirrors naive formula
-                        // upcoming_codes[p + (k - d)].
                         got_k = upcoming_codes[p + cur_len - back_dist]
                     }
                     if got_k < 0 { break }
@@ -456,9 +476,7 @@ fn _a33_find_longest_match_codes(ring: array, upcoming_codes: array, p: int, max
                 }
             }
         }
-        // Walk to previous chain entry.
-        let key = to_string(cand_abs)
-        let nxt: i64 = if map_contains_key(hash_prev, key) { hash_prev[key] } else { -1 }
+        let nxt: i64 = hash_prev[_a33_prev_idx(cand_abs)]
         cand_abs = nxt
         hops = hops + 1
     }
@@ -466,17 +484,16 @@ fn _a33_find_longest_match_codes(ring: array, upcoming_codes: array, p: int, max
 }
 
 // Convenience wrapper accepting a string for upcoming.
-fn _a33_find_longest_match(ring: array, upcoming: string, p: int, max_dist: int, max_len: int) -> array {
-    let codes = _str_to_codes(upcoming)
-    return _a33_find_longest_match_codes(ring, codes, p, max_dist, max_len)
+fn _a33_find_longest_match(codes: array, write_idx: int, n_filled: int, hash_head: array, hash_prev: array, upcoming: string, p: int, max_dist: int, max_len: int) -> array {
+    let upc = _str_to_codes(upcoming)
+    return _a33_find_longest_match_codes(codes, write_idx, n_filled, hash_head, hash_prev, upc, p, max_dist, max_len)
 }
 
 // _a33_find_longest_match_codes_naive: PASS 2 baseline retained for raw 142
 // D2 revert capability and selftest cross-validation. NOT used by encode in
-// PASS 4 production path; selftest may invoke both to confirm hash-chain
-// finds at-least-equal matches on synthetic fixtures.
-fn _a33_find_longest_match_codes_naive(ring: array, upcoming_codes: array, p: int, max_dist: int, max_len: int) -> array {
-    let n_filled: i64 = ring[2]
+// PASS 4+ production path. PASS 5: signature updated to match new ring
+// representation (codes/idx/filled separate).
+fn _a33_find_longest_match_codes_naive(codes: array, write_idx: int, n_filled: int, upcoming_codes: array, p: int, max_dist: int, max_len: int) -> array {
     let dist_cap: i64 = if max_dist < n_filled { max_dist } else { n_filled }
     if dist_cap <= 0 { return [0, 0] }
     let n_up: i64 = len(upcoming_codes)
@@ -494,7 +511,7 @@ fn _a33_find_longest_match_codes_naive(ring: array, upcoming_codes: array, p: in
             let back_dist: i64 = d - k
             let mut got: i64 = -1
             if back_dist > 0 {
-                got = _a33_ring_get_back(ring, back_dist)
+                got = _a33_ring_get_back(codes, write_idx, n_filled, back_dist)
             } else {
                 got = upcoming_codes[p + (k - d)]
             }
@@ -545,10 +562,18 @@ fn _a33_emit_match(dist: int, mlen: int) -> string {
 }
 
 // _a33_encode_codes: encode array of byte codes as LZ77 over ring. Returns
-// wire body codes array (also a code array; convert at the end).
+// wire body codes array.
+// PASS 5: codes / write_idx / n_filled / hash_head / hash_prev kept as
+// separate locals; push returns (new_idx, new_filled) only — heapify cost
+// is constant per call regardless of input size. F-A33-6 RSS fix.
 fn _a33_encode_codes(text_codes: array, seed_codes: array) -> array {
     let n: i64 = len(text_codes)
-    let mut ring = _a33_ring_init_from_seed(seed_codes)
+    let init = _a33_ring_init_from_seed(seed_codes)
+    let codes: array = init[0]
+    let mut write_idx: i64 = init[1]
+    let mut n_filled: i64 = init[2]
+    let hash_head: array = init[3]
+    let hash_prev: array = init[4]
     let mut out = []     // wire codes
     let mut p: i64 = 0
     while p < n {
@@ -561,17 +586,21 @@ fn _a33_encode_codes(text_codes: array, seed_codes: array) -> array {
             out.push(A33_SIGIL_BYTE_1)
             out.push(A33_SIGIL_BYTE_2)
             out.push(A33_ESCAPE_MARKER)
-            ring = _a33_ring_push(ring, A33_SIGIL_BYTE_1)
-            ring = _a33_ring_push(ring, A33_SIGIL_BYTE_2)
+            let r1 = _a33_ring_push(codes, write_idx, n_filled, hash_head, hash_prev, A33_SIGIL_BYTE_1)
+            write_idx = r1[0]
+            n_filled = r1[1]
+            let r2 = _a33_ring_push(codes, write_idx, n_filled, hash_head, hash_prev, A33_SIGIL_BYTE_2)
+            write_idx = r2[0]
+            n_filled = r2[1]
             p = p + 2
             continue
         }
         // Try longest match at p.
-        let dist_cap_pre: i64 = ring[2]
+        let dist_cap_pre: i64 = n_filled
         let dist_cap: i64 = if dist_cap_pre < A33_RING_CAP { dist_cap_pre } else { A33_RING_CAP }
         let len_cap_pre: i64 = n - p
         let len_cap: i64 = if len_cap_pre < A33_MATCH_MAX { len_cap_pre } else { A33_MATCH_MAX }
-        let m = _a33_find_longest_match_codes(ring, text_codes, p, dist_cap, len_cap)
+        let m = _a33_find_longest_match_codes(codes, write_idx, n_filled, hash_head, hash_prev, text_codes, p, dist_cap, len_cap)
         let mdist: i64 = m[0]
         let mlen: i64 = m[1]
         if mlen >= A33_MATCH_MIN && mdist > 0 {
@@ -588,7 +617,9 @@ fn _a33_encode_codes(text_codes: array, seed_codes: array) -> array {
                 // Push the matched bytes into ring.
                 let mut k: i64 = 0
                 while k < mlen {
-                    ring = _a33_ring_push(ring, text_codes[p + k])
+                    let rk = _a33_ring_push(codes, write_idx, n_filled, hash_head, hash_prev, text_codes[p + k])
+                    write_idx = rk[0]
+                    n_filled = rk[1]
                     k = k + 1
                 }
                 p = p + mlen
@@ -597,18 +628,23 @@ fn _a33_encode_codes(text_codes: array, seed_codes: array) -> array {
         }
         // No worthwhile match → emit literal byte.
         out.push(cur)
-        ring = _a33_ring_push(ring, cur)
+        let rl = _a33_ring_push(codes, write_idx, n_filled, hash_head, hash_prev, cur)
+        write_idx = rl[0]
+        n_filled = rl[1]
         p = p + 1
     }
     return out
 }
 
-// _a33_decode_codes: inverse of _a33_encode_codes. Given wire body codes +
-// seed_codes, reconstruct original byte codes. n_expected = decoded count
-// expected.
+// _a33_decode_codes: inverse of _a33_encode_codes. PASS 5 separate-locals.
 fn _a33_decode_codes(stream_codes: array, seed_codes: array, n_expected: int) -> array {
     let n: i64 = len(stream_codes)
-    let mut ring = _a33_ring_init_from_seed(seed_codes)
+    let init = _a33_ring_init_from_seed(seed_codes)
+    let codes: array = init[0]
+    let mut write_idx: i64 = init[1]
+    let mut n_filled: i64 = init[2]
+    let hash_head: array = init[3]
+    let hash_prev: array = init[4]
     let mut out = []
     let mut p: i64 = 0
     while p < n && len(out) < n_expected {
@@ -618,17 +654,22 @@ fn _a33_decode_codes(stream_codes: array, seed_codes: array, n_expected: int) ->
             && stream_codes[p + 1] == A33_SIGIL_BYTE_2
         if !is_sigil {
             out.push(b0)
-            ring = _a33_ring_push(ring, b0)
+            let r0 = _a33_ring_push(codes, write_idx, n_filled, hash_head, hash_prev, b0)
+            write_idx = r0[0]
+            n_filled = r0[1]
             p = p + 1
             continue
         }
         let after_sigil: i64 = p + 2
         if after_sigil >= n {
-            // Truncated — emit literal sigil bytes.
             out.push(A33_SIGIL_BYTE_1)
             out.push(A33_SIGIL_BYTE_2)
-            ring = _a33_ring_push(ring, A33_SIGIL_BYTE_1)
-            ring = _a33_ring_push(ring, A33_SIGIL_BYTE_2)
+            let ra = _a33_ring_push(codes, write_idx, n_filled, hash_head, hash_prev, A33_SIGIL_BYTE_1)
+            write_idx = ra[0]
+            n_filled = ra[1]
+            let rb = _a33_ring_push(codes, write_idx, n_filled, hash_head, hash_prev, A33_SIGIL_BYTE_2)
+            write_idx = rb[0]
+            n_filled = rb[1]
             p = p + 2
             continue
         }
@@ -637,15 +678,15 @@ fn _a33_decode_codes(stream_codes: array, seed_codes: array, n_expected: int) ->
             // Literal "^h" sequence
             out.push(A33_SIGIL_BYTE_1)
             out.push(A33_SIGIL_BYTE_2)
-            ring = _a33_ring_push(ring, A33_SIGIL_BYTE_1)
-            ring = _a33_ring_push(ring, A33_SIGIL_BYTE_2)
+            let re1 = _a33_ring_push(codes, write_idx, n_filled, hash_head, hash_prev, A33_SIGIL_BYTE_1)
+            write_idx = re1[0]
+            n_filled = re1[1]
+            let re2 = _a33_ring_push(codes, write_idx, n_filled, hash_head, hash_prev, A33_SIGIL_BYTE_2)
+            write_idx = re2[0]
+            n_filled = re2[1]
             p = after_sigil + 1
             continue
         }
-        // Match reference: rebuild a string segment from stream codes for varint decode.
-        // Build a small ASCII-substring containing the varint bytes (codes 0..255).
-        // To stay in ASCII-safe range we take exactly the next 2*A33_VARINT_MAX_BYTES
-        // codes, build a string via chr(), and decode.
         let segment_len_pre: i64 = 2 * A33_VARINT_MAX_BYTES
         let segment_avail: i64 = n - after_sigil
         let segment_len: i64 = if segment_avail < segment_len_pre { segment_avail } else { segment_len_pre }
@@ -659,11 +700,14 @@ fn _a33_decode_codes(stream_codes: array, seed_codes: array, n_expected: int) ->
         let dist: i64 = dr[0]
         let q1: i64 = dr[1]
         if dist < 0 {
-            // Parse failure — emit sigil bytes literally and move on.
             out.push(A33_SIGIL_BYTE_1)
             out.push(A33_SIGIL_BYTE_2)
-            ring = _a33_ring_push(ring, A33_SIGIL_BYTE_1)
-            ring = _a33_ring_push(ring, A33_SIGIL_BYTE_2)
+            let rd1 = _a33_ring_push(codes, write_idx, n_filled, hash_head, hash_prev, A33_SIGIL_BYTE_1)
+            write_idx = rd1[0]
+            n_filled = rd1[1]
+            let rd2 = _a33_ring_push(codes, write_idx, n_filled, hash_head, hash_prev, A33_SIGIL_BYTE_2)
+            write_idx = rd2[0]
+            n_filled = rd2[1]
             p = p + 2
             continue
         }
@@ -673,18 +717,24 @@ fn _a33_decode_codes(stream_codes: array, seed_codes: array, n_expected: int) ->
         if mlen < 0 {
             out.push(A33_SIGIL_BYTE_1)
             out.push(A33_SIGIL_BYTE_2)
-            ring = _a33_ring_push(ring, A33_SIGIL_BYTE_1)
-            ring = _a33_ring_push(ring, A33_SIGIL_BYTE_2)
+            let rl1 = _a33_ring_push(codes, write_idx, n_filled, hash_head, hash_prev, A33_SIGIL_BYTE_1)
+            write_idx = rl1[0]
+            n_filled = rl1[1]
+            let rl2 = _a33_ring_push(codes, write_idx, n_filled, hash_head, hash_prev, A33_SIGIL_BYTE_2)
+            write_idx = rl2[0]
+            n_filled = rl2[1]
             p = p + 2
             continue
         }
-        // Walk back-bytes and emit forward. Each emission also pushes into ring.
+        // Walk back-bytes and emit forward.
         let mut k: i64 = 0
         while k < mlen {
-            let bb: i64 = _a33_ring_get_back(ring, dist)
+            let bb: i64 = _a33_ring_get_back(codes, write_idx, n_filled, dist)
             if bb < 0 { return out }
             out.push(bb)
-            ring = _a33_ring_push(ring, bb)
+            let rk = _a33_ring_push(codes, write_idx, n_filled, hash_head, hash_prev, bb)
+            write_idx = rk[0]
+            n_filled = rk[1]
             k = k + 1
         }
         p = after_sigil + q2
@@ -708,12 +758,9 @@ fn a33_session_encode(files_text: array, seed: string) -> array {
 // A33_MIN_SESSION_BYTES default).
 fn a33_session_encode_opts(files_text: array, seed: string, min_bytes: int) -> array {
     let n_files: i64 = len(files_text)
-    let mut concat = ""
-    let mut i: i64 = 0
-    while i < n_files {
-        concat = concat + files_text[i]
-        i = i + 1
-    }
+    // PASS 5 RSS fix: join(files) — single O(N) allocation vs N concat
+    // accumulator (which compounds with the per-byte arena pressure).
+    let concat = files_text.join("")
     let total: i64 = len(concat)
     if n_files < A33_MIN_FILE_COUNT { return [concat, total, total, "identity_single_file"] }
     if total < min_bytes { return [concat, total, total, "identity_min_bytes"] }
@@ -788,14 +835,21 @@ fn _selftest() -> int {
     //   Selftest uses 1024 pushes (subsequent-tick LIVE FIRE will verify
     //   ring-wrap at A33_RING_CAP=262144 boundary). Growth-phase semantics
     //   exercised here.
-    let mut ring2 = _a33_ring_init_empty()
+    let init2 = _a33_ring_init_empty()
+    let codes2: array = init2[0]
+    let mut write_idx2: i64 = init2[1]
+    let mut n_filled2: i64 = init2[2]
+    let hh2: array = init2[3]
+    let hp2: array = init2[4]
     let push_count: i64 = 1024
     let mut k3: i64 = 0
     while k3 < push_count {
         let raw: i64 = k3 * 17 + 3
         let rmod: i64 = raw - (raw / 127) * 127
         let bb: i64 = if rmod < 1 { rmod + 1 } else { rmod }   // keep ASCII range 1..127
-        ring2 = _a33_ring_push(ring2, bb)
+        let rp = _a33_ring_push(codes2, write_idx2, n_filled2, hh2, hp2, bb)
+        write_idx2 = rp[0]
+        n_filled2 = rp[1]
         k3 = k3 + 1
     }
     // Last-pushed byte is at distance 1.
@@ -803,11 +857,11 @@ fn _selftest() -> int {
     let last_raw: i64 = last_idx * 17 + 3
     let last_mod: i64 = last_raw - (last_raw / 127) * 127
     let last_byte: i64 = if last_mod < 1 { last_mod + 1 } else { last_mod }
-    let got_d1: i64 = _a33_ring_get_back(ring2, 1)
+    let got_d1: i64 = _a33_ring_get_back(codes2, write_idx2, n_filled2, 1)
     // Distance push_count = first-pushed byte (k3=0 → 3).
-    let got_dn: i64 = _a33_ring_get_back(ring2, push_count)
+    let got_dn: i64 = _a33_ring_get_back(codes2, write_idx2, n_filled2, push_count)
     let first_byte: i64 = 3
-    let got_dover: i64 = _a33_ring_get_back(ring2, push_count + 1)
+    let got_dover: i64 = _a33_ring_get_back(codes2, write_idx2, n_filled2, push_count + 1)
     if got_d1 == last_byte && got_dn == first_byte && got_dover == -1 {
         pass = pass + 1
         println("  PASS: F2 ring buffer 1024-push: get_back(1)=" + to_string(got_d1)
@@ -859,9 +913,14 @@ fn _selftest() -> int {
     //   = "EFGHIJ_extra_garbage" — at p=0, longest match should be "EFGHIJ"
     //   (len=6, distance=6 because 'E' is at back-distance 6).
     let seed4_codes = _str_to_codes("ABCDEFGHIJ")
-    let ring4 = _a33_ring_init_from_seed(seed4_codes)
+    let init4 = _a33_ring_init_from_seed(seed4_codes)
+    let codes4: array = init4[0]
+    let wi4: i64 = init4[1]
+    let nf4: i64 = init4[2]
+    let hh4: array = init4[3]
+    let hp4: array = init4[4]
     let upcoming4 = "EFGHIJ_extra_garbage"
-    let m4 = _a33_find_longest_match(ring4, upcoming4, 0, 10, A33_MATCH_MAX)
+    let m4 = _a33_find_longest_match(codes4, wi4, nf4, hh4, hp4, upcoming4, 0, 10, A33_MATCH_MAX)
     let m4d: i64 = m4[0]
     let m4l: i64 = m4[1]
     if m4d == 6 && m4l == 6 {
@@ -932,21 +991,33 @@ fn _read_lines_strip(path: string) -> array {
 // _ascii_filter: replace bytes outside 1..127 with byte 32 (space) to honor
 // the first-tick ASCII wire constraint. Records substitution count for
 // honest disclosure. Returns [filtered_string, substitution_count].
+//
+// PASS 5 RSS fix: PASS 4 implementation built `out` via per-byte string
+// concatenation in a tight loop, which the hexa runtime materializes as
+// O(N) per concat (each `out + ch` reallocates a fresh buffer of size N+1).
+// On 60 KB input that produces O(N^2) = 3.6 GB of cumulative buffer
+// allocation before any arena rewind. The fix accumulates the result in
+// a code array and joins via chr() once at the end (single O(N) string
+// build). Behavior identical: same byte substitution map (1..127 kept,
+// else 32), same substitution count.
 fn _ascii_filter(s: string) -> array {
     let n: i64 = len(s)
-    let mut out = ""
+    let mut codes_out = []
     let mut subs: i64 = 0
     let mut i: i64 = 0
     while i < n {
         let c: i64 = ord(s.substring(i, i + 1))
         if c >= 1 && c <= 127 {
-            out = out + s.substring(i, i + 1)
+            codes_out.push(c)
         } else {
-            out = out + " "
+            codes_out.push(32)
             subs = subs + 1
         }
         i = i + 1
     }
+    // Single-shot build: codes → string. _codes_to_str does one O(N) chr()
+    // walk; total cost is O(N) instead of O(N^2).
+    let out: string = _codes_to_str(codes_out)
     return [out, subs]
 }
 
@@ -979,10 +1050,9 @@ fn _session_roundtrip(manifest_path: string, seed_path: string) -> int {
     let mode: string = res[3]
     // Decode session (only meaningful if wire_active).
     let dec = if mode == "wire_active" { a33_session_decode(body, seed, raw_bytes) } else { body }
-    // Compare to original concatenation.
-    let mut concat = ""
-    let mut k: i64 = 0
-    while k < len(files_text) { concat = concat + files_text[k]; k = k + 1 }
+    // Compare to original concatenation. PASS 5 RSS fix: join() over the
+    // file array (single O(N) malloc) instead of accumulator concat.
+    let concat = files_text.join("")
     let byte_eq: bool = dec == concat && len(dec) == raw_bytes
     let saving_num: i64 = (raw_bytes - enc_bytes) * 10000
     let saving_pp: i64 = if raw_bytes > 0 { saving_num / raw_bytes } else { 0 }
