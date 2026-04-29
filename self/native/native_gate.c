@@ -774,6 +774,60 @@ static int refuse_raw1_mutate(const char *path) {
     return matches_raw1_path(path);
 }
 
+// ── raw#22 per-file manifest (explicit RAW22_MANIFEST_PATHS) ─────────
+//
+// Minimum-viable per-file SSOT lock: an explicit array of path SUFFIXES
+// that are write-locked unconditionally. Future cycle promotes this to
+// a sentinel-file scan (`.raw22-locked` marker in the same/parent dir);
+// the explicit array is the safe MVP — no extra syscalls per write.
+//
+// Match strategy: ends_with() against the suffix list. Use long-enough
+// suffixes that cross-repo collisions are unlikely (e.g. include a
+// distinctive parent segment). Add entries by editing this list.
+//
+// Bypass: opt_out() honored. dev-toggle HIVE_HEXA_LANG_IMPROVEMENT does
+// NOT bypass — manifest paths are SSOT-canonical and never auto-edited
+// even during hexa-lang dev sessions.
+//
+// Trade-off vs sentinel-file pattern:
+//   explicit array (this) — zero per-write syscalls, requires recompile
+//                            to add entries; safe + cheap.
+//   sentinel-file scan    — fstatat(parent, ".raw22-locked") per write;
+//                            data-driven (no recompile); ~1 syscall cost.
+// We pick explicit for MVP; sentinel can layer on later via a separate
+// refuse_raw22_sentinel() helper.
+
+static const char *RAW22_MANIFEST_PATHS[] = {
+    // SSOT manifest files locked across all repos. Suffix-match anchored
+    // by leading '/' so unrelated paths can't accidentally match.
+    "/airgenome/rules/airgenome.json",
+    "/.raw-exemptions/raw_7.list",
+    "/.raw-exemptions/raw_22.list",
+    "/self/sbpl/native.sb",
+    "/self/native/native_gate.c",
+    NULL
+};
+
+static int matches_raw22_manifest(const char *path) {
+    if (!path) return 0;
+    for (int i = 0; RAW22_MANIFEST_PATHS[i]; i++) {
+        if (ends_with(path, RAW22_MANIFEST_PATHS[i])) return 1;
+    }
+    return 0;
+}
+
+static int refuse_raw22_write(const char *path, int flags) {
+    if (opt_out()) return 0;
+    if (!path) return 0;
+    if (!(flags & (O_WRONLY | O_RDWR | O_TRUNC | O_APPEND | O_CREAT))) return 0;
+    return matches_raw22_manifest(path);
+}
+
+static int refuse_raw22_mutate(const char *path) {
+    if (opt_out()) return 0;
+    return matches_raw22_manifest(path);
+}
+
 // ─── hexa-lang self-edit allowance — raw.hexa_lang_improvement gate ──
 //
 // Background mirrors self/sbpl/native.sb#hexa-lang block. Universal
@@ -873,6 +927,9 @@ static int refuse(const char *path, int flags) {
     // so locked SSOT files in /tmp/ subdirs (or other allow-prefixes) are
     // still protected. Locked SSOT is repo-canonical, never a temp file.
     if (refuse_raw1_write(path, flags)) return 1;
+    // raw#22 — manifest paths checked BEFORE allowlist (SSOT-canonical,
+    // never legitimately under /tmp/ etc.).
+    if (refuse_raw22_write(path, flags)) return 1;
     if (on_allowlist(path)) return 0;
     // hexa-lang scope check runs BEFORE universal raw#8 so the dev
     // toggle can rescue grandfathered files that would otherwise be
@@ -906,6 +963,7 @@ static int refuse_rename(const char *newpath) {
     if (!newpath) return 0;
     // raw#1 — checked BEFORE allowlist (locked SSOT is canonical, not temp).
     if (refuse_raw1_mutate(newpath)) return 1;
+    if (refuse_raw22_mutate(newpath)) return 1;
     if (on_allowlist(newpath)) return 0;
     for (int i = 0; BANNED_SUFFIXES[i]; i++) {
         if (ends_with(newpath, BANNED_SUFFIXES[i])) return 1;
@@ -919,7 +977,9 @@ static int refuse_rename(const char *newpath) {
 static int refuse_rename_src_raw1(const char *oldpath) {
     if (opt_out()) return 0;
     if (!oldpath) return 0;
-    return refuse_raw1_mutate(oldpath);
+    if (refuse_raw1_mutate(oldpath)) return 1;
+    if (matches_raw22_manifest(oldpath)) return 1;     // raw#22 src-side
+    return 0;
 }
 
 // ── open / openat / creat ────────────────────────────────────────────
@@ -1168,29 +1228,161 @@ typedef int (*fchmodat_fn)(int, const char *, mode_t, int);
 int unlink(const char *pathname) {
     static unlink_fn real = NULL;
     if (!real) real = (unlink_fn)dlsym(RTLD_NEXT, "unlink");
-    if (!opt_out() && refuse_raw1_mutate(pathname)) { errno = EPERM; return -1; }
+    if (!opt_out() && (refuse_raw1_mutate(pathname) || refuse_raw22_mutate(pathname))) { errno = EPERM; return -1; }
     return real(pathname);
 }
 
 int unlinkat(int dirfd, const char *pathname, int flags) {
     static unlinkat_fn real = NULL;
     if (!real) real = (unlinkat_fn)dlsym(RTLD_NEXT, "unlinkat");
-    if (!opt_out() && refuse_raw1_mutate(pathname)) { errno = EPERM; return -1; }
+    if (!opt_out() && (refuse_raw1_mutate(pathname) || refuse_raw22_mutate(pathname))) { errno = EPERM; return -1; }
     return real(dirfd, pathname, flags);
 }
 
 int chmod(const char *pathname, mode_t mode) {
     static chmod_fn real = NULL;
     if (!real) real = (chmod_fn)dlsym(RTLD_NEXT, "chmod");
-    if (!opt_out() && refuse_raw1_mutate(pathname)) { errno = EPERM; return -1; }
+    if (!opt_out() && (refuse_raw1_mutate(pathname) || refuse_raw22_mutate(pathname))) { errno = EPERM; return -1; }
     return real(pathname, mode);
 }
 
 int fchmodat(int dirfd, const char *pathname, mode_t mode, int flags) {
     static fchmodat_fn real = NULL;
     if (!real) real = (fchmodat_fn)dlsym(RTLD_NEXT, "fchmodat");
-    if (!opt_out() && refuse_raw1_mutate(pathname)) { errno = EPERM; return -1; }
+    if (!opt_out() && (refuse_raw1_mutate(pathname) || refuse_raw22_mutate(pathname))) { errno = EPERM; return -1; }
     return real(dirfd, pathname, mode, flags);
+}
+
+// ── raw#6 mkdir / mkdirat (folder-naming F4 — create-time deny) ──────
+//
+// Existing refuse_raw6() catches WRITES under banned-named dirs (utils/,
+// helpers/, common/, lib/, misc/, stuff/, base/) but only fires when a
+// file inside the dir is opened. This hook closes the gap at create-time
+// so `mkdir ~/core/hive/utils` itself fails before any file is written.
+//
+// Scope: hive-only (matches refuse_raw6 is_under_hive_repo gate). Other
+// repos pending raw_6.list cross-port follow-up cycle.
+//
+// Allowlist mirrors refuse_raw6: node_modules/, packages/, infrastructure/,
+// libs/, archive/. Path-substring match is sufficient — hive layout never
+// has a legit `/utils/` segment outside those prefixes.
+//
+// We refuse if the LAST path component (basename) matches a banned name.
+// This avoids false-positive on parent path segments that happen to contain
+// a banned token (the existing substring ban in refuse_raw6 already handles
+// path-segment writes; mkdir gate fires on the component being created).
+
+typedef int (*mkdir_fn)(const char *, mode_t);
+typedef int (*mkdirat_fn)(int, const char *, mode_t);
+
+static const char *RAW6_BANNED_BASENAMES[] = {
+    "utils", "helpers", "common", "lib",
+    "misc", "stuff", "base",
+    NULL
+};
+
+// Strip trailing '/' (treat "foo/" same as "foo") then return last component.
+static const char *raw6_basename(const char *path) {
+    if (!path || !*path) return NULL;
+    size_t n = strlen(path);
+    while (n > 0 && path[n-1] == '/') n--;
+    if (n == 0) return NULL;
+    const char *end = path + n;
+    const char *p = end - 1;
+    while (p > path && *p != '/') p--;
+    return (*p == '/') ? p + 1 : p;
+}
+
+static int raw6_basename_eq(const char *path, const char *name) {
+    const char *b = raw6_basename(path);
+    if (!b) return 0;
+    size_t bl = strlen(path);
+    while (bl > 0 && path[bl-1] == '/') bl--;
+    size_t off = (size_t)(b - path);
+    size_t blen = bl - off;
+    size_t nl = strlen(name);
+    return blen == nl && strncmp(b, name, nl) == 0;
+}
+
+static int refuse_raw6_mkdir(const char *path) {
+    if (opt_out()) return 0;
+    if (!path) return 0;
+    if (!is_under_hive_repo(path)) return 0;
+    for (int i = 0; RAW6_ALLOW[i]; i++) {
+        if (strstr(path, RAW6_ALLOW[i])) return 0;
+    }
+    for (int i = 0; RAW6_BANNED_BASENAMES[i]; i++) {
+        if (raw6_basename_eq(path, RAW6_BANNED_BASENAMES[i])) return 1;
+    }
+    return 0;
+}
+
+int mkdir(const char *pathname, mode_t mode) {
+    static mkdir_fn real = NULL;
+    if (!real) real = (mkdir_fn)dlsym(RTLD_NEXT, "mkdir");
+    if (refuse_raw6_mkdir(pathname)) { errno = EPERM; return -1; }
+    return real(pathname, mode);
+}
+
+int mkdirat(int dirfd, const char *pathname, mode_t mode) {
+    static mkdirat_fn real = NULL;
+    if (!real) real = (mkdirat_fn)dlsym(RTLD_NEXT, "mkdirat");
+    if (refuse_raw6_mkdir(pathname)) { errno = EPERM; return -1; }
+    return real(dirfd, pathname, mode);
+}
+
+// ── raw#144 execve / execvp — argv length guard ──────────────────────
+//
+// Linux kernel ARG_MAX = 2,097,152 bytes total for argv+envp+pointers.
+// Massive argv (e.g. accidental `python -c "$X"*1000000`) wastes kernel
+// memory + can cause E2BIG late in execve. We pre-validate argv summed
+// length against a conservative threshold; over → EPERM (errno=E2BIG)
+// before the kernel touches it.
+//
+// Conservative budget: ARG_MAX - 64KB envp_overhead - 4KB pointer table.
+// This is intentionally pessimistic so envp drift (CI/CD env explosions)
+// doesn't push us over kernel limit at exec time. Tools needing larger
+// argv (rare; usually a misuse) bypass via CLAUDX_NO_SANDBOX=1.
+//
+// Short-cmd bypass: if argv total < SHORT_CMD_BYPASS (32KB) we return
+// allow immediately — the vast majority of execs never approach the
+// limit and we don't want extra walking cost.
+//
+// Linux-only. macOS execve goes through SBPL (sandbox-exec) when present
+// and ARG_MAX is enforced by darwin kernel; we don't shim there.
+
+typedef int (*execve_fn)(const char *, char *const[], char *const[]);
+typedef int (*execvp_fn)(const char *, char *const[]);
+
+#define RAW144_ARG_MAX           2097152L   // Linux kernel default
+#define RAW144_ENVP_OVERHEAD       65536L   // 64KB reserved for envp+pointers
+#define RAW144_BUDGET           (RAW144_ARG_MAX - RAW144_ENVP_OVERHEAD)
+#define RAW144_SHORT_BYPASS        32768L   // <32KB → fast-path allow
+
+static int refuse_raw144(char *const argv[]) {
+    if (opt_out()) return 0;
+    if (!argv) return 0;
+    long total = 0;
+    for (int i = 0; argv[i]; i++) {
+        total += (long)strlen(argv[i]) + 1;     // +1 for NUL terminator
+        if (total < RAW144_SHORT_BYPASS && argv[i+1] == NULL) return 0;
+        if (total > RAW144_BUDGET) return 1;
+    }
+    return 0;
+}
+
+int execve(const char *pathname, char *const argv[], char *const envp[]) {
+    static execve_fn real = NULL;
+    if (!real) real = (execve_fn)dlsym(RTLD_NEXT, "execve");
+    if (refuse_raw144(argv)) { errno = E2BIG; return -1; }
+    return real(pathname, argv, envp);
+}
+
+int execvp(const char *file, char *const argv[]) {
+    static execvp_fn real = NULL;
+    if (!real) real = (execvp_fn)dlsym(RTLD_NEXT, "execvp");
+    if (refuse_raw144(argv)) { errno = E2BIG; return -1; }
+    return real(file, argv);
 }
 
 // ── symlink / symlinkat (raw#21) ─────────────────────────────────────
