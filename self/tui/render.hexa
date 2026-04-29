@@ -34,10 +34,12 @@
 //   fn render_init() -> int                       // detect winsize, alloc buffers
 //   fn render_clear() -> int                      // back buffer ← all blank
 //   fn render_put(x, y, ch, fg, bg, attrs) -> int
+//   fn render_set_cursor(x, y) -> int             // pin cursor target for next flush (Task #22)
 //   fn render_flush() -> int                      // emit diff, swap buffers
 //   fn render_resize() -> int                     // re-detect rows/cols
 //   fn render_close() -> int                      // restore SGR + cursor
 //   fn render_dims() -> array                     // [rows, cols]
+//   fn render_cursor() -> array                   // [x, y] staged target (-1,-1 = unset)
 //
 // DEFERRED (L4+)
 //   - Truecolor (24-bit RGB) — only 256-color in L3
@@ -60,6 +62,19 @@ let mut _cols = 0
 let mut _front = []
 let mut _back = []
 let mut _initialized = 0
+
+// Cursor target staged by render_set_cursor(). -1 = no override (cursor
+// lands wherever the diff loop's last write left it). Honored by
+// render_flush() as the FINAL cursor positioning emit before ESC[?25h.
+//
+// Hive Task #22 (2026-04-29) — fix "status bar 부분에 커서 표시" bug. The
+// diff loop walks rows top→bottom, so the LAST cell written is always in
+// the bottom-most row that changed. With Task #14's footer layout (status
+// bar at rows-1), every frame leaves the cursor on the status bar. The
+// caller (cli_mvp _draw_state) now stages the input-widget cursor target
+// here so flush emits a final ESC[<row>;<col>H to override that.
+let mut _cursor_x = -1
+let mut _cursor_y = -1
 
 // Single blank cell prototype. Indexed copy via array literal — hexa
 // arrays are by-value on assignment (semantic confirmed via stdlib).
@@ -124,11 +139,36 @@ pub fn render_resize() -> int {
 // Public dims accessor.
 pub fn render_dims() -> array { return [_rows, _cols] }
 
+// Public staged-cursor accessor — returns [x, y] of the last
+// render_set_cursor() target, or [-1, -1] if unset/cleared. Lets tests
+// (and curious callers) introspect the cursor pin without scraping the
+// ANSI byte stream.
+pub fn render_cursor() -> array { return [_cursor_x, _cursor_y] }
+
 // Reset back buffer to all-blank (front buffer untouched — diff still
 // fires correctly on next flush).
 pub fn render_clear() -> int {
     if _initialized == 0 { return -1 }
     _back = _alloc_buffer(_rows, _cols)
+    return 0
+}
+
+// Stage a cursor target for the next render_flush(). Coordinates are
+// 0-indexed cell positions (x = column, y = row); flush translates to
+// 1-indexed CSI ESC [ <y+1> ; <x+1> H. Pass (-1, -1) to clear the
+// override (cursor falls back to last-cell default).
+//
+// Bounds-checked silently (oob → silent clear). Idempotent across
+// frames — caller MUST call every frame to keep the cursor pinned.
+pub fn render_set_cursor(x: int, y: int) -> int {
+    if _initialized == 0 { return -1 }
+    if x < 0 || y < 0 || x >= _cols || y >= _rows {
+        _cursor_x = -1
+        _cursor_y = -1
+        return 0
+    }
+    _cursor_x = x
+    _cursor_y = y
     return 0
 }
 
@@ -207,13 +247,33 @@ pub fn render_flush() -> int {
         y = y + 1
     }
 
-    // Reset SGR + show cursor
+    // Reset SGR + (optionally) park cursor at staged target + show cursor.
+    //
+    // Hive Task #22 (2026-04-29) — when caller has staged a cursor target
+    // via render_set_cursor(x, y), emit an explicit CSI ESC[<y+1>;<x+1>H
+    // BEFORE re-showing the cursor. Without this, the diff loop's last
+    // write position (always the bottom-most changed row) determines
+    // visual cursor location, which in cli_mvp's footer layout is the
+    // status bar — wrong UX.
     parts.push(chr(27))
     parts.push("[0m")
+    if _cursor_x >= 0 && _cursor_y >= 0 {
+        parts.push(chr(27))
+        parts.push("[")
+        parts.push(to_string(_cursor_y + 1))
+        parts.push(";")
+        parts.push(to_string(_cursor_x + 1))
+        parts.push("H")
+    }
     parts.push(chr(27))
     parts.push("[?25h")
 
-    if changed > 0 {
+    // Emit the SGR reset / cursor positioning / show-cursor tail
+    // whenever (a) cells changed (normal diff path) OR (b) caller has
+    // staged a cursor target (Task #22 cursor pinning — idle frames must
+    // also re-pin so terminal cursor doesn't drift after external writes).
+    // ~15-byte tail @ 60fps = 900 B/s — negligible vs frame budget.
+    if changed > 0 || (_cursor_x >= 0 && _cursor_y >= 0) {
         let out = parts.join("")
         let _w = term_write_str(out)
     }
