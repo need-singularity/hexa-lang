@@ -711,6 +711,69 @@ static int refuse_raw20(const char *path, int flags) {
     return 0;
 }
 
+// ─── raw#1 — file-lock SSOT path-literal deny (F2 agent top priority) ──
+//
+// raw#1 mandate: locked SSOT files (~/core/*/.raw, .own, .roadmap, .guide,
+// .ext, .workspace) are append-only-via-canonical-tools. ANY direct file
+// IO via open(O_WRONLY|O_RDWR|O_TRUNC|O_APPEND), creat(), unlink(),
+// rename() (as src or dst), chmod() targeting these path literals is
+// rejected with EPERM at the syscall boundary.
+//
+// Match strategy: ends_with() against the literal suffix list. The path
+// must end with exactly one of these segments (not contain). This keeps
+// the pattern tight — `/some/dir/.raw-exemptions/foo` does NOT match
+// because it doesn't end with `/.raw`.
+//
+// Interaction with raw#20: raw#20 was the partial precursor (only O_TRUNC
+// on /.own). raw#1 supersedes — refuse_raw1 is checked FIRST and covers
+// all write modes + the additional five SSOT files. raw#20 retained for
+// defense-in-depth (free since refuse_raw1 already returned 1 in matching
+// cases; refuse_raw20 only fires on the narrower /.own + O_TRUNC subset).
+//
+// FP risk audit (F2 agent):
+//   - Tools that legitimately mutate locked SSOT (raw_lock_release.sh,
+//     hexa raw-edit) bypass this shim because they're invoked under
+//     CLAUDX_NO_SANDBOX=1. opt_out() is checked at refuse() entry.
+//   - Hexa CLI itself is statically linked (musl) → LD_PRELOAD has no
+//     effect on hexa's own raw_loader file IO. This shim guards
+//     dynamically-linked subprocesses (sh, python, curl, etc.) only.
+//   - SSOT path candidates: /.raw /.own /.roadmap /.guide /.ext /.workspace
+//   - Free files inside the SSOT-named DIR (.raw/foo) are NOT matched
+//     because ends_with(/.raw/foo, "/.raw") = false. Intentional — only
+//     the literal lock files themselves are protected here.
+
+static const char *RAW1_PATHS[] = {
+    "/.raw",
+    "/.own",
+    "/.roadmap",
+    "/.guide",
+    "/.ext",
+    "/.workspace",
+    NULL
+};
+
+static int matches_raw1_path(const char *path) {
+    if (!path) return 0;
+    for (int i = 0; RAW1_PATHS[i]; i++) {
+        if (ends_with(path, RAW1_PATHS[i])) return 1;
+    }
+    return 0;
+}
+
+// Write-side gate: open/openat/creat/fopen — any write-implying flag
+// against a RAW1_PATHS literal = EPERM.
+static int refuse_raw1_write(const char *path, int flags) {
+    if (!path) return 0;
+    if (!(flags & (O_WRONLY | O_RDWR | O_TRUNC | O_APPEND | O_CREAT))) return 0;
+    return matches_raw1_path(path);
+}
+
+// Mutation-side gate: unlink/rename/chmod targeting the literals.
+// Caller passes EITHER src or dst (or single arg for unlink/chmod).
+static int refuse_raw1_mutate(const char *path) {
+    return matches_raw1_path(path);
+}
+
 // ─── hexa-lang self-edit allowance — raw.hexa_lang_improvement gate ──
 //
 // Background mirrors self/sbpl/native.sb#hexa-lang block. Universal
@@ -806,6 +869,10 @@ static int refuse_hexa_lang_scope(const char *path) {
 static int refuse(const char *path, int flags) {
     if (opt_out()) return 0;
     if (!path || !is_write_flag(flags)) return 0;
+    // raw#1 file-lock SSOT path-literal deny — checked BEFORE allowlist
+    // so locked SSOT files in /tmp/ subdirs (or other allow-prefixes) are
+    // still protected. Locked SSOT is repo-canonical, never a temp file.
+    if (refuse_raw1_write(path, flags)) return 1;
     if (on_allowlist(path)) return 0;
     // hexa-lang scope check runs BEFORE universal raw#8 so the dev
     // toggle can rescue grandfathered files that would otherwise be
@@ -837,11 +904,22 @@ static int refuse(const char *path, int flags) {
 static int refuse_rename(const char *newpath) {
     if (opt_out()) return 0;
     if (!newpath) return 0;
+    // raw#1 — checked BEFORE allowlist (locked SSOT is canonical, not temp).
+    if (refuse_raw1_mutate(newpath)) return 1;
     if (on_allowlist(newpath)) return 0;
     for (int i = 0; BANNED_SUFFIXES[i]; i++) {
         if (ends_with(newpath, BANNED_SUFFIXES[i])) return 1;
     }
     return 0;
+}
+
+// raw#1 oldpath-side rename guard — refuse renaming the locked SSOT itself
+// (not just refusing it as a destination). Standalone helper because
+// refuse_rename() handles dst-side; this handles src-side.
+static int refuse_rename_src_raw1(const char *oldpath) {
+    if (opt_out()) return 0;
+    if (!oldpath) return 0;
+    return refuse_raw1_mutate(oldpath);
 }
 
 // ── open / openat / creat ────────────────────────────────────────────
@@ -1042,6 +1120,7 @@ FILE *freopen64(const char *path, const char *mode, FILE *stream) {
 int rename(const char *oldpath, const char *newpath) {
     static rename_fn real = NULL;
     if (!real) real = (rename_fn)dlsym(RTLD_NEXT, "rename");
+    if (refuse_rename_src_raw1(oldpath)) { errno = EPERM; return -1; }
     if (refuse_rename(newpath)) { errno = EPERM; return -1; }
     return real(oldpath, newpath);
 }
@@ -1049,8 +1128,69 @@ int rename(const char *oldpath, const char *newpath) {
 int renameat(int olddfd, const char *oldpath, int newdfd, const char *newpath) {
     static renameat_fn real = NULL;
     if (!real) real = (renameat_fn)dlsym(RTLD_NEXT, "renameat");
+    if (refuse_rename_src_raw1(oldpath)) { errno = EPERM; return -1; }
     if (refuse_rename(newpath)) { errno = EPERM; return -1; }
     return real(olddfd, oldpath, newdfd, newpath);
+}
+
+// renameat2 — Linux 3.15+ extension. coreutils `mv` uses this by default
+// (RENAME_NOREPLACE flag) on modern glibc, completely bypassing rename()
+// and renameat(). raw#1 verification on ubu1 (kernel 6.17, glibc 2.39)
+// caught this gap. Hook signature matches glibc/Linux. Same policy as
+// renameat(): src-side raw#1 mutate deny + dst-side refuse_rename().
+typedef int (*renameat2_fn)(int, const char *, int, const char *, unsigned int);
+
+int renameat2(int olddfd, const char *oldpath, int newdfd, const char *newpath,
+              unsigned int flags) {
+    static renameat2_fn real = NULL;
+    if (!real) real = (renameat2_fn)dlsym(RTLD_NEXT, "renameat2");
+    if (refuse_rename_src_raw1(oldpath)) { errno = EPERM; return -1; }
+    if (refuse_rename(newpath)) { errno = EPERM; return -1; }
+    if (!real) { errno = ENOSYS; return -1; }
+    return real(olddfd, oldpath, newdfd, newpath, flags);
+}
+
+// ── unlink / unlinkat / chmod / fchmodat (raw#1 mutation gate) ───────
+//
+// Phase X (raw#1) — mutation surface beyond write+rename. unlink removes
+// the file outright; chmod can flip W bits to enable a subsequent write
+// that bypasses the open-time gate (e.g. chmod 0644 on a chmod-ed-down
+// .raw, then open O_WRONLY). Both must refuse on RAW1_PATHS literals.
+//
+// opt_out() honored; allowlist intentionally NOT consulted (locked SSOT
+// is repo-canonical and never legitimately under /tmp/ etc.).
+
+typedef int (*unlink_fn)(const char *);
+typedef int (*unlinkat_fn)(int, const char *, int);
+typedef int (*chmod_fn)(const char *, mode_t);
+typedef int (*fchmodat_fn)(int, const char *, mode_t, int);
+
+int unlink(const char *pathname) {
+    static unlink_fn real = NULL;
+    if (!real) real = (unlink_fn)dlsym(RTLD_NEXT, "unlink");
+    if (!opt_out() && refuse_raw1_mutate(pathname)) { errno = EPERM; return -1; }
+    return real(pathname);
+}
+
+int unlinkat(int dirfd, const char *pathname, int flags) {
+    static unlinkat_fn real = NULL;
+    if (!real) real = (unlinkat_fn)dlsym(RTLD_NEXT, "unlinkat");
+    if (!opt_out() && refuse_raw1_mutate(pathname)) { errno = EPERM; return -1; }
+    return real(dirfd, pathname, flags);
+}
+
+int chmod(const char *pathname, mode_t mode) {
+    static chmod_fn real = NULL;
+    if (!real) real = (chmod_fn)dlsym(RTLD_NEXT, "chmod");
+    if (!opt_out() && refuse_raw1_mutate(pathname)) { errno = EPERM; return -1; }
+    return real(pathname, mode);
+}
+
+int fchmodat(int dirfd, const char *pathname, mode_t mode, int flags) {
+    static fchmodat_fn real = NULL;
+    if (!real) real = (fchmodat_fn)dlsym(RTLD_NEXT, "fchmodat");
+    if (!opt_out() && refuse_raw1_mutate(pathname)) { errno = EPERM; return -1; }
+    return real(dirfd, pathname, mode, flags);
 }
 
 // ── symlink / symlinkat (raw#21) ─────────────────────────────────────
