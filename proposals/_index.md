@@ -22,25 +22,43 @@ Origin: anima-eeg hardware bring-up session (OpenBCI Cyton+Daisy 16ch + Mark IV 
 | [008](rfc_008_project_relative_helper_invocation.md) | project_python() helper invocation primitive | P1 | done | stdlib (path.hexa) | gap-7 |
 | [009](rfc_009_aot_bool_coercion.md) | AOT bool coercion — int_fn() == int_literal silent-false | P0 | proposed | AOT codegen (codegen_c2.hexa) | gap-9 |
 
+## RFC bundle 2026-04-29 — anima HXC A33 PASS 4 hash-chain RSS jetsam
+
+Source: anima HXC A33 PASS 4 (hash-chain match-find) — commit `509f3ea3d`. F-A33-6 RSS <= 50 MB mandate violated 24-65x at production scale due to `map<string,int>` per-entry overhead (~28 KB/entry derived from 1.71 GB / 60 K entries observed). Workaround (A33 PASS 5 fixed-array ring) in-flight at downstream consumer; stdlib-level fix proposed here.
+
+| RFC | Slug | Priority | Status | Subsystem | Source |
+|-----|------|----------|--------|-----------|--------|
+| [010](rfc_010_typed_i32_map.md) | typed-i32-map / sparse-int-array primitive | P0 | proposed | stdlib (interp builtin + AOT codegen) | A33 PASS 4 |
+
+## RFC bundle 2026-04-30 — hive cli_mvp exec("date") hot-path scan (downstream-adoption gap)
+
+Source: hive `packages/coding-agent/hexa/cli_mvp.hexa` 2026-04-30 hot-path scan (`_session_uuid_gen` line 2036 + auth slot expiry line 2242). Both sites still spawn `date +%s` (~5-10 ms macOS spawn cost) despite native `time_now()` primitive shipped in `hxa-20260424-008` (2026-04-24, commit `dfbd2ee1`). Scope re-baselined from "add primitive" to "document + lint + cross-repo migrate" after pre-write fact-check found primitive already extant (raw 91 in-place correction; precedent RFC-006).
+
+| RFC | Slug | Priority | Status | Subsystem | Source |
+|-----|------|----------|--------|-----------|--------|
+| [011](rfc_011_exec_date_to_native_time_migration.md) | exec("date +%s") → native time primitive migration mandate | P1 | proposed | docs + lint + migration (raw 47 cross-repo sweep) | hive cli_mvp.hexa hot-path 2026-04-30 |
+
 ## Priority distribution
 
-- **P0 × 3** — RFC-001 (popen_lines BLOCKER), RFC-005 (AOT slice-eq silent-wrong), RFC-009 (AOT bool coercion silent-wrong)
-- **P1 × 5** — RFC-002 (map methods), RFC-003 (\xHH \uHHHH escapes), RFC-004 (basic \n escapes), RFC-007 (exec()==int lint), RFC-008 (project_python)
+- **P0 × 4** — RFC-001 (popen_lines BLOCKER), RFC-005 (AOT slice-eq silent-wrong), RFC-009 (AOT bool coercion silent-wrong), RFC-010 (typed-i32-map RSS blocker)
+- **P1 × 6** — RFC-002 (map methods), RFC-003 (\xHH \uHHHH escapes), RFC-004 (basic \n escapes), RFC-007 (exec()==int lint), RFC-008 (project_python), RFC-011 (exec date migration)
 - **P2 × 1** — RFC-006 (exec() return-type docs)
 
 ## Status distribution
 
 - **done × 3** — RFC-002 (map.has), RFC-007 (exec lint), RFC-008 (project_python)
 - **partial-landed × 1** — RFC-001 (capture+split wrapper landed; streaming form deferred)
-- **proposed × 5** — RFC-003, RFC-004, RFC-005, RFC-006, RFC-009
+- **proposed × 7** — RFC-003, RFC-004, RFC-005, RFC-006, RFC-009, RFC-010, RFC-011
 
 ## Subsystem coverage
 
-- **stdlib** — RFC-001 (proc.hexa NEW), RFC-002 (map methods), RFC-008 (path.hexa project_python)
+- **stdlib** — RFC-001 (proc.hexa NEW), RFC-002 (map methods), RFC-008 (path.hexa project_python), RFC-010 (typed-i32-map / sparse-int-array primitives)
 - **lexer** — RFC-003 (hex/unicode escapes), RFC-004 (basic \n parity)
-- **AOT codegen (codegen_c2.hexa)** — RFC-005 (slice-eq), RFC-009 (Call(...) == IntLiteral) — same root-cause family; recommend bundled investigation cycle
-- **linter / parser_pass** — RFC-007 (exec()==int rule)
-- **docs** — RFC-006 (exec() decision tree cheat-sheet)
+- **AOT codegen (codegen_c2.hexa)** — RFC-005 (slice-eq), RFC-009 (Call(...) == IntLiteral) — same root-cause family; recommend bundled investigation cycle. RFC-010 also lands AOT codegen (primitive-packed container lowering) but is performance-class, not silent-wrong-class
+- **interp builtin (hexa_full.hexa)** — RFC-010 (int_map / sparse_int_array type-tag dispatch + native array backing)
+- **linter / parser_pass** — RFC-007 (exec()==int rule), RFC-011 (exec("date +%s") perf lint)
+- **docs** — RFC-006 (exec() decision tree cheat-sheet), RFC-011 (stdlib_time_quickref + native primitive visibility)
+- **cross-repo migration mandate** — RFC-011 (raw 47 sweep across hive/nexus/anima/airgenome/n6-architecture)
 
 ## Cross-cutting recommendations
 
