@@ -816,16 +816,88 @@ static int matches_raw22_manifest(const char *path) {
     return 0;
 }
 
+// Explicit-array layer (cheap, recompile-required). Renamed from earlier
+// matches_raw22_manifest() callsites — kept as a thin alias so existing
+// callsites (refuse_raw22_write / refuse_raw22_mutate / rename src) stay
+// stable. Future entries: edit RAW22_MANIFEST_PATHS[] above.
+static int refuse_raw22_explicit(const char *path) {
+    return matches_raw22_manifest(path);
+}
+
+// ── raw#22 sentinel-file pattern (data-driven layer) ─────────────────
+//
+// Promotion of the explicit-array MVP to a data-driven lock: scan the
+// path's parent directory for a sentinel file `.raw22-locked`. If
+// present, the entire directory (write/unlink/chmod targeting any file
+// directly inside it) is refused. No recompile needed — operators add
+// or remove the sentinel on disk to flip the lock.
+//
+// Layered semantics:
+//   refuse_raw22_explicit() — array-driven, zero per-write syscall, must
+//                              recompile to add entries; SSOT-canonical.
+//   refuse_raw22_sentinel() — sentinel-driven, ~1 fstatat per write of
+//                              any path; data-driven, operator-flippable.
+// Both are checked: explicit-array hits return 1 first (fast path);
+// otherwise sentinel scan runs.
+//
+// Naming convention: `.raw22-locked` (active state, directly readable)
+// rather than `.raw22-manifest` (which suggests a list of paths inside
+// the file; the sentinel is purely presence-based, contents ignored).
+//
+// Scan scope (trade-off): parent-dir only. Walking every ancestor would
+// catch repo-root sentinels but adds O(depth) syscalls per write — too
+// expensive for the per-syscall hot path. Operators wanting subtree
+// locks must place the sentinel in each leaf dir (or use the explicit
+// array for canonical SSOT files).
+//
+// Performance: one fstatat() per write/mutate. Linux fstatat on dentry
+// cache is ~100ns; sentinel absence is the common case so kernel caches
+// the negative dentry. opt_out() short-circuits before the syscall.
+// Per-process caching (e.g. cache parent-dir fd → present bit) is
+// possible but skipped in this MVP: cache invalidation under
+// concurrent rmdir/create races is more code than the syscall saves.
+#define RAW22_SENTINEL_NAME ".raw22-locked"
+
+static int refuse_raw22_sentinel(const char *path) {
+    if (!path) return 0;
+    // Split path into parent dir + basename. We need the parent so we
+    // can fstatat(AT_FDCWD, "<parent>/.raw22-locked"). If path has no
+    // slash, parent is "." (cwd). The sentinel itself must not lock
+    // its own creation, so skip when basename == RAW22_SENTINEL_NAME.
+    const char *slash = strrchr(path, '/');
+    const char *base  = slash ? slash + 1 : path;
+    if (strcmp(base, RAW22_SENTINEL_NAME) == 0) return 0;
+
+    char sentinel[4096];
+    if (slash) {
+        size_t plen = (size_t)(slash - path);
+        // "<parent>/.raw22-locked" — bound check with sentinel name + NUL.
+        if (plen + 1 + sizeof(RAW22_SENTINEL_NAME) >= sizeof(sentinel)) return 0;
+        memcpy(sentinel, path, plen);
+        sentinel[plen] = '/';
+        memcpy(sentinel + plen + 1, RAW22_SENTINEL_NAME, sizeof(RAW22_SENTINEL_NAME));
+    } else {
+        memcpy(sentinel, "./" RAW22_SENTINEL_NAME, sizeof("./" RAW22_SENTINEL_NAME));
+    }
+
+    struct stat st;
+    if (fstatat(AT_FDCWD, sentinel, &st, AT_SYMLINK_NOFOLLOW) == 0) return 1;
+    return 0;
+}
+
 static int refuse_raw22_write(const char *path, int flags) {
     if (opt_out()) return 0;
     if (!path) return 0;
     if (!(flags & (O_WRONLY | O_RDWR | O_TRUNC | O_APPEND | O_CREAT))) return 0;
-    return matches_raw22_manifest(path);
+    if (refuse_raw22_explicit(path)) return 1;
+    return refuse_raw22_sentinel(path);
 }
 
 static int refuse_raw22_mutate(const char *path) {
     if (opt_out()) return 0;
-    return matches_raw22_manifest(path);
+    if (!path) return 0;
+    if (refuse_raw22_explicit(path)) return 1;
+    return refuse_raw22_sentinel(path);
 }
 
 // ─── hexa-lang self-edit allowance — raw.hexa_lang_improvement gate ──
@@ -978,7 +1050,8 @@ static int refuse_rename_src_raw1(const char *oldpath) {
     if (opt_out()) return 0;
     if (!oldpath) return 0;
     if (refuse_raw1_mutate(oldpath)) return 1;
-    if (matches_raw22_manifest(oldpath)) return 1;     // raw#22 src-side
+    if (refuse_raw22_explicit(oldpath)) return 1;      // raw#22 src-side (array)
+    if (refuse_raw22_sentinel(oldpath)) return 1;      // raw#22 src-side (sentinel)
     return 0;
 }
 
