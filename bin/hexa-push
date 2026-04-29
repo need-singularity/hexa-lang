@@ -16,14 +16,49 @@ for arg in "$@"; do
   esac
 done
 
+# ─── protected-ref check helper (raw 176 safety gate inline, fix-B) ───
+# 외부 의존 0: pure bash + git rev-parse 만 (raw 13 git-hook ban 호환).
+# Default protected refs: main + master + hive/main. Override via HEXA_PUSH_PROTECTED_REFS env (콤마 separated).
+_is_protected_ref() {
+  local branch="$1"
+  local refs="${HEXA_PUSH_PROTECTED_REFS:-main,master,hive/main}"
+  IFS=',' read -ra arr <<< "$refs"
+  for r in "${arr[@]}"; do
+    [ "$branch" = "$r" ] && { echo "PROTECTED"; return; }
+  done
+  echo "NOT_PROTECTED"
+}
+
+# ─── non-FF stderr classifier helper (fix-C) ───
+# git push 실패 stderr 에 'non-fast-forward' 또는 'rejected' + '(fetch first)' 포함 시 non-FF.
+# 기타 실패 (auth / network) 는 다른 분류 → no rebase retry.
+_is_non_ff_failure() {
+  local stderr_out="$1"
+  if echo "$stderr_out" | grep -qE '(non-fast-forward|\(fetch first\)|tip of your current branch is behind)'; then
+    echo "NON_FF"
+  else
+    echo "OTHER"
+  fi
+}
+
 # ─── selftest mode ───
 if [ "${1:-}" = "--selftest" ]; then
   pass=0; fail=0
+  # F1-F4: argv block
   if "$0" --force 2>/dev/null; then fail=$((fail+1)); else pass=$((pass+1)); fi
   if "$0" -f 2>/dev/null; then fail=$((fail+1)); else pass=$((pass+1)); fi
   if "$0" --force-with-lease 2>/dev/null; then fail=$((fail+1)); else pass=$((pass+1)); fi
   if "$0" --mirror 2>/dev/null; then fail=$((fail+1)); else pass=$((pass+1)); fi
+  # F5: dry-run
   if "$0" --dry-run 2>&1 | grep -q "DRY-RUN"; then pass=$((pass+1)); else fail=$((fail+1)); fi
+  # F6-F8: protected-ref classification (NEW — fix-B)
+  if [ "$(_is_protected_ref 'main')" = "PROTECTED" ]; then pass=$((pass+1)); else fail=$((fail+1)); fi
+  if [ "$(_is_protected_ref 'master')" = "PROTECTED" ]; then pass=$((pass+1)); else fail=$((fail+1)); fi
+  if [ "$(_is_protected_ref 'fix/branch')" = "NOT_PROTECTED" ]; then pass=$((pass+1)); else fail=$((fail+1)); fi
+  # F9-F11: non-FF stderr classifier (NEW — fix-C)
+  if [ "$(_is_non_ff_failure 'error: failed to push some refs ... non-fast-forward')" = "NON_FF" ]; then pass=$((pass+1)); else fail=$((fail+1)); fi
+  if [ "$(_is_non_ff_failure 'updates were rejected because the tip of your current branch is behind its remote')" = "NON_FF" ]; then pass=$((pass+1)); else fail=$((fail+1)); fi
+  if [ "$(_is_non_ff_failure 'fatal: Authentication failed')" = "OTHER" ]; then pass=$((pass+1)); else fail=$((fail+1)); fi
   total=$((pass+fail))
   echo "__HEXA_PUSH_RESULT__ $([ $fail -eq 0 ] && echo PASS || echo FAIL) pass=$pass fail=$fail total=$total"
   [ $fail -eq 0 ] && exit 0 || exit 1
@@ -43,6 +78,15 @@ if [ -z "$BRANCH" ] || [ "$BRANCH" = "HEAD" ]; then
   exit 14
 fi
 
+# ─── protected-ref block (fix-B) ───
+SAFETY_ALLOW="${HEXA_SAFETY_ALLOW:-}"
+if [ "$(_is_protected_ref "$BRANCH")" = "PROTECTED" ] && [ -z "$SAFETY_ALLOW" ]; then
+  echo "hexa-push: BLOCKED — branch '$BRANCH' is in protected-refs list (raw 176 safety gate)" >&2
+  echo "reason=protected-ref-block protected=\${HEXA_PUSH_PROTECTED_REFS:-main,master,hive/main}" >&2
+  echo "fix=1) push from non-protected branch then merge via PR  2) HEXA_SAFETY_ALLOW='<reason>' hexa-push  # explicit user-only" >&2
+  exit 16
+fi
+
 # ─── idempotency: 0 ahead = no-op ───
 AHEAD="$(git rev-list --count "@{u}..HEAD" 2>/dev/null || echo '?')"
 if [ "$AHEAD" = "0" ]; then
@@ -54,19 +98,29 @@ fi
 AUDIT="${HEXA_PUSH_AUDIT:-state/hexa_commit_audit/audit.jsonl}"
 mkdir -p "$(dirname "$AUDIT")" 2>/dev/null || true
 TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-printf '%s\n' "{\"ts\":\"$TS\",\"actor\":\"hexa-push\",\"branch\":\"$BRANCH\",\"ahead\":\"$AHEAD\",\"safety_allow\":\"${HEXA_SAFETY_ALLOW:+set}\",\"classifier_version\":\"hexa_push_canonical.v1\"}" >> "$AUDIT" 2>/dev/null || true
+printf '%s\n' "{\"ts\":\"$TS\",\"actor\":\"hexa-push\",\"branch\":\"$BRANCH\",\"ahead\":\"$AHEAD\",\"protected_check\":\"pass\",\"safety_allow\":\"${SAFETY_ALLOW:+set}\",\"classifier_version\":\"hexa_push_canonical.v2\"}" >> "$AUDIT" 2>/dev/null || true
 
-# ─── push ff-only + auto pull-rebase 1x retry on non-FF ───
-if git push origin "$BRANCH" 2>&1; then
+# ─── push ff-only + classified non-FF auto-rebase 1x retry (fix-C) ───
+PUSH_OUT="$(git push origin "$BRANCH" 2>&1)"
+PUSH_RC=$?
+if [ $PUSH_RC -eq 0 ]; then
   echo "hexa-push: ok (branch=$BRANCH ahead=$AHEAD)"
   exit 0
 fi
-# non-FF retry
-echo "hexa-push: non-FF detected — auto pull --rebase 1x retry per raw 176" >&2
-if git pull --rebase origin "$BRANCH" && git push origin "$BRANCH"; then
-  echo "hexa-push: ok-after-rebase (branch=$BRANCH)"
-  exit 0
+# Classify failure type before deciding retry
+FAILURE_KIND="$(_is_non_ff_failure "$PUSH_OUT")"
+if [ "$FAILURE_KIND" = "NON_FF" ]; then
+  echo "hexa-push: non-FF detected — auto pull --rebase 1x retry per raw 176" >&2
+  if git pull --rebase origin "$BRANCH" && git push origin "$BRANCH"; then
+    echo "hexa-push: ok-after-rebase (branch=$BRANCH)"
+    exit 0
+  fi
+  echo "hexa-push: FAIL — pull --rebase produced conflict, halt for human resolution" >&2
+  echo "reason=non-ff-rebase-conflict fix=1) git status  2) resolve  3) git rebase --continue && hexa-push" >&2
+  exit 15
 fi
-echo "hexa-push: FAIL — pull --rebase produced conflict, halt for human resolution" >&2
-echo "reason=non-ff-rebase-conflict fix=1) git status # see conflict 2) resolve 3) git rebase --continue && hexa-push" >&2
-exit 15
+# Non-FF 외 실패 (auth / network / 기타) → rebase 시도 안 함, raw 66 ai-native trailer
+echo "hexa-push: FAIL — push rejected for non-rebase-able reason" >&2
+echo "$PUSH_OUT" >&2
+echo "reason=push-failed-non-ff-classifier-other fix=1) check stderr above  2) auth: gh auth status / git config  3) network: ping origin host  4) retry hexa-push manually after fix" >&2
+exit 17

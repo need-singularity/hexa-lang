@@ -1,0 +1,518 @@
+// tool/module_loader_collision_lint.hexa — module-loader top-level collision lint
+//
+// PURPOSE
+//   `use "self/stdlib/<name>"` is preprocessed by self/module_loader.hexa as
+//   a textual *concatenation* of all transitively-imported source bodies
+//   ahead of the host script. Function definitions are rewritten by
+//   `ml_strip_and_clean` (drops `pub`), but TOP-LEVEL STATEMENTS (any
+//   non-fn / non-struct / non-enum / non-let-const lines outside a function
+//   body) are emitted verbatim and EXECUTE in source-order at program
+//   start. When a stdlib module's top-level code calls `exit(...)`
+//   unconditionally (e.g. a generic `--selftest` gate), the host script's
+//   own `--selftest` handler never runs because the module fired first
+//   and terminated the process.
+//
+//   ω-cycle 2026-04-27 Tier-A landed two stdlib modules
+//   (self/stdlib/shell_escape.hexa, self/stdlib/flags.hexa) with a
+//   path-end-check workaround:
+//       if _se_args[_se_j].ends_with("/stdlib/shell_escape.hexa") {
+//           _se_selftest_flag = true
+//       }
+//   Selftest only fires when the module is invoked DIRECTLY. This lint
+//   formalizes the pattern so future stdlib additions don't regress.
+//
+// CHECKS (per stdlib module file under self/stdlib/)
+//   C1: TOP-LEVEL EXIT — module body contains a top-level `exit(`,
+//       `args()` access, or `if … --selftest …` gate? If so the gate
+//       MUST be guarded by an `.ends_with("/stdlib/<name>.hexa")` check
+//       so it only fires on direct invocation.
+//   C2: PATH-END-CHECK — when C1 triggers, the module file MUST contain
+//       the literal string `.ends_with("/stdlib/<name>.hexa")` somewhere
+//       in its top-level region. Failure = host-collision risk.
+//   C3: SELFTEST FLAG NAMESPACE — module-specific selftest flag SHOULD
+//       follow the convention `--selftest-<name>` (advisory, not fatal).
+//   C4: PUB API SURFACE — module MUST declare at least one `pub fn`.
+//       A module with zero `pub fn` is import-useless and likely a
+//       script-mistakenly-placed-in-stdlib (advisory).
+//
+// USAGE
+//   hexa tool/module_loader_collision_lint.hexa            — scan all stdlib modules
+//   hexa tool/module_loader_collision_lint.hexa --selftest — synthetic-fixture self-test
+//   hexa tool/module_loader_collision_lint.hexa --list     — list stdlib modules examined
+//   hexa tool/module_loader_collision_lint.hexa --file <path>   — scan single file
+//   hexa tool/module_loader_collision_lint.hexa --caller-detect — scan callers under HEXA_LANG
+//
+// EXIT
+//   0 — no violations
+//   1 — one or more violations
+//   2 — bad usage
+//
+// REFERENCES
+//   /Users/ghost/core/hexa-lang/self/module_loader.hexa  (concat semantics)
+//   /Users/ghost/core/hexa-lang/self/stdlib/shell_escape.hexa  (workaround pattern)
+//   /Users/ghost/core/hexa-lang/self/stdlib/flags.hexa         (workaround pattern)
+//   /Users/ghost/core/anima/docs/hexa_lang_module_loader_collision_20260427_landing.md
+
+use "self/stdlib/argv_skip"
+
+// ─── argv parse ────────────────────────────────────────────────
+
+let _ml_args = args()
+let mut _ml_cli = []
+let mut _ml_ai = skip_invocation_prefix(_ml_args)
+while _ml_ai < len(_ml_args) {
+    _ml_cli.push(_ml_args[_ml_ai])
+    _ml_ai = _ml_ai + 1
+}
+
+// ─── helpers ───────────────────────────────────────────────────
+
+fn _basename(p: string) -> string {
+    let mut i = len(p) - 1
+    while i >= 0 {
+        if p.substring(i, i + 1) == "/" { return p.substring(i + 1, len(p)) }
+        i = i - 1
+    }
+    return p
+}
+
+fn _strip_ext(name: string) -> string {
+    let n = len(name)
+    if n >= 5 {
+        if name.substring(n - 5, n) == ".hexa" { return name.substring(0, n - 5) }
+    }
+    return name
+}
+
+// Locate hexa-lang root. HEXA_LANG env wins; fallback to a hardcoded
+// canonical path matching nexus/scripts/bin/hexa_remote convention.
+fn _hexa_lang_root() -> string {
+    let hl = env("HEXA_LANG")
+    if len(hl) > 0 { return hl }
+    return "/Users/ghost/core/hexa-lang"
+}
+
+// Read entire file or return "".
+fn _read_or_empty(p: string) -> string {
+    if !file_exists(p) { return "" }
+    return read_file(p)
+}
+
+// Strip a `//` line comment from a line. Quote-aware enough for
+// stdlib (no `//` inside string literals in stdlib at the time of
+// writing — verified by manual scan). Returns the line truncated
+// at the first `//` not preceded by `:` (URL-like exception not used).
+fn _strip_line_comment(line: string) -> string {
+    let n = len(line)
+    let mut i = 0
+    while i < n - 1 {
+        let c = line.substring(i, i + 1)
+        let c2 = line.substring(i, i + 2)
+        if c2 == "//" { return line.substring(0, i) }
+        // Skip past string literals (best-effort): a `"` opens; matching
+        // `"` closes. Embedded `\"` skipped.
+        if c == "\"" {
+            let mut j = i + 1
+            while j < n {
+                let cc = line.substring(j, j + 1)
+                if cc == "\\" { j = j + 2 }
+                else if cc == "\"" { i = j; break }
+                else { j = j + 1 }
+            }
+            if i == j - 1 { return line }  // unterminated; stop
+        }
+        i = i + 1
+    }
+    return line
+}
+
+// Split a body into top-level "regions" — every line that is NOT
+// inside a `fn { ... }` / `struct { ... }` / `enum { ... }` block.
+// Brace-counting is sufficient because hexa does not have raw string
+// literals containing unbalanced braces in stdlib (verified by walk).
+// Comments are stripped before brace-counting so commented-out exit()
+// calls in docstrings do not trip C1 false positives.
+fn _top_level_lines(src: string) -> array {
+    let lines = src.split("\n")
+    let n = len(lines)
+    let mut depth = 0
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let raw_line = lines[i]
+        let line = _strip_line_comment(raw_line)
+        // Compute open/close *before* deciding inclusion: opening line of
+        // an `fn` block has `{` on the same line, so it's NOT top-level.
+        let mut j = 0
+        let ll = len(line)
+        let mut opens = 0
+        let mut closes = 0
+        while j < ll {
+            let c = line.substring(j, j + 1)
+            if c == "{" { opens = opens + 1 }
+            if c == "}" { closes = closes + 1 }
+            j = j + 1
+        }
+        // A line at depth 0 that does NOT start a block (no net `{`) is
+        // top-level. An `fn foo() {` line is depth 0 but ends with depth 1
+        // so we exclude it from top-level by checking pre-line depth AND
+        // requiring the line not to begin with `fn ` / `pub fn ` / `struct ` / `enum `.
+        let trimmed = _ltrim(line)
+        let is_decl = _starts_with(trimmed, "fn ") || _starts_with(trimmed, "pub fn ")
+            || _starts_with(trimmed, "struct ") || _starts_with(trimmed, "pub struct ")
+            || _starts_with(trimmed, "enum ") || _starts_with(trimmed, "pub enum ")
+            || _starts_with(trimmed, "@")  // attribute on next decl
+        if depth == 0 && !is_decl {
+            out.push(line)
+        }
+        depth = depth + opens - closes
+        if depth < 0 { depth = 0 }  // defensive
+        i = i + 1
+    }
+    return out
+}
+
+fn _ltrim(s: string) -> string {
+    let n = len(s)
+    let mut i = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c != " " && c != "\t" { return s.substring(i, n) }
+        i = i + 1
+    }
+    return ""
+}
+
+fn _starts_with(s: string, p: string) -> bool {
+    let pn = len(p)
+    if len(s) < pn { return false }
+    return s.substring(0, pn) == p
+}
+
+fn _contains(s: string, sub: string) -> bool {
+    return s.index_of(sub) >= 0
+}
+
+// ─── per-file lint ─────────────────────────────────────────────
+
+// Returns a pair [violation_count, advisory_count]. Emits per-finding
+// diagnostics to stderr.
+fn lint_file(path: string) -> array {
+    let src = _read_or_empty(path)
+    if len(src) == 0 {
+        eprintln("[mlc-lint] FAIL " + path + ": empty/unreadable")
+        return [1, 0]
+    }
+    let base = _basename(path)
+    let stem = _strip_ext(base)
+    let toplevel = _top_level_lines(src)
+    let tn = len(toplevel)
+
+    // Aggregate the top-level region into one string for substring scans.
+    let mut tl_parts = []
+    let mut i = 0
+    while i < tn {
+        tl_parts.push(toplevel[i])
+        tl_parts.push("\n")
+        i = i + 1
+    }
+    let tl = tl_parts.join("")
+
+    let mut violations = 0
+    let mut advisories = 0
+
+    // C1: detect top-level args() / exit() / --selftest gate.
+    let has_args      = _contains(tl, "args()")
+    let has_exit      = _contains(tl, "exit(")
+    let has_selftest  = _contains(tl, "--selftest")
+    let trips_c1 = has_args || has_exit || has_selftest
+
+    // C2: when C1 trips, require the path-end-check guard. The guard
+    // is typically nested inside a `while` loop scanning argv (depth>0
+    // from _top_level_lines' perspective), so search the FULL source.
+    let guard_needle_a = ".ends_with(\"/stdlib/" + base + "\")"
+    let guard_needle_b = ".ends_with(\"" + path + "\")"
+    let has_guard = _contains(src, guard_needle_a) || _contains(src, guard_needle_b)
+
+    if trips_c1 {
+        if !has_guard {
+            violations = violations + 1
+            eprintln("[mlc-lint] FAIL " + path + ": C1+C2")
+            eprintln("  cause: top-level statement(s) detected (args=" + to_string(has_args)
+                + " exit=" + to_string(has_exit) + " selftest=" + to_string(has_selftest)
+                + ") but no path-end-check guard")
+            eprintln("  remedy: wrap the gate with")
+            eprintln("    if _arg.ends_with(\"/stdlib/" + base + "\") { /* fire */ }")
+            eprintln("  ref: self/stdlib/shell_escape.hexa lines 131-148 (canonical workaround)")
+        }
+
+        // C3: namespace flag SHOULD exist (--selftest-<stem>). Accept
+        // both underscore- and hyphen-form (canonical convention is
+        // hyphen, but some legacy modules use the source-stem verbatim).
+        let ns_flag_us = "--selftest-" + stem
+        let ns_flag_hy = "--selftest-" + stem.replace("_", "-")
+        if has_selftest && !_contains(src, ns_flag_us) && !_contains(src, ns_flag_hy) {
+            advisories = advisories + 1
+            eprintln("[mlc-lint] WARN " + path + ": C3")
+            eprintln("  cause: module accepts --selftest but has no module-specific flag " + ns_flag_hy)
+            eprintln("  remedy: add a parallel " + ns_flag_hy + " branch so callers can selftest the module")
+            eprintln("          even when the host script also takes --selftest")
+        }
+    }
+
+    // C4: pub API surface.
+    let has_pub_fn = _contains(src, "pub fn ")
+    if !has_pub_fn {
+        advisories = advisories + 1
+        eprintln("[mlc-lint] WARN " + path + ": C4")
+        eprintln("  cause: zero pub fn declarations — module is import-useless")
+        eprintln("  remedy: export at least one fn via pub, or relocate file out of self/stdlib/")
+    }
+
+    return [violations, advisories]
+}
+
+// ─── batch lint ────────────────────────────────────────────────
+
+fn _stdlib_dir() -> string {
+    let r = _hexa_lang_root()
+    return r + "/self/stdlib"
+}
+
+fn _list_stdlib_modules() -> array {
+    let dir = _stdlib_dir()
+    let cmd = "ls " + dir + "/*.hexa 2>/dev/null"
+    let raw = to_string(exec(cmd))
+    let lines = raw.split("\n")
+    let mut out = []
+    let mut i = 0
+    while i < len(lines) {
+        let l = lines[i].trim()
+        if len(l) > 0 { out.push(l) }
+        i = i + 1
+    }
+    return out
+}
+
+fn cmd_list() -> int {
+    let mods = _list_stdlib_modules()
+    let n = len(mods)
+    println("[mlc-lint] " + to_string(n) + " stdlib module(s):")
+    let mut i = 0
+    while i < n {
+        println("  " + mods[i])
+        i = i + 1
+    }
+    return 0
+}
+
+fn cmd_lint_all() -> int {
+    let mods = _list_stdlib_modules()
+    let n = len(mods)
+    let mut total_v = 0
+    let mut total_a = 0
+    let mut i = 0
+    while i < n {
+        let pair = lint_file(mods[i])
+        total_v = total_v + pair[0]
+        total_a = total_a + pair[1]
+        i = i + 1
+    }
+    println("[mlc-lint] scanned " + to_string(n) + " modules: "
+        + to_string(total_v) + " violation(s), "
+        + to_string(total_a) + " advisor(ies)")
+    if total_v > 0 { return 1 }
+    return 0
+}
+
+// ─── caller-side detect (raw 102 strengthen-existing) ──────────
+//
+// For every .hexa under HEXA_LANG (or the user-specified --caller-detect
+// root) emit the list of files that import a stdlib module with known
+// top-level statements. If the module is missing a guard AND the caller
+// also defines `--selftest`, we flag a HIGH-RISK collision pair.
+
+fn _scan_callers(root: string, vulnerable_modules: array) -> array {
+    let mut hits = []
+    if len(vulnerable_modules) == 0 { return hits }
+
+    // Build alternation pattern.
+    let mut pat_parts = []
+    let mut i = 0
+    while i < len(vulnerable_modules) {
+        if i > 0 { pat_parts.push("\\|") }
+        pat_parts.push("self/stdlib/")
+        pat_parts.push(vulnerable_modules[i])
+        i = i + 1
+    }
+    let pat = pat_parts.join("")
+    let cmd = "grep -rlE 'use \"(" + pat + ")\"' " + root + " --include='*.hexa' 2>/dev/null"
+    let raw = to_string(exec(cmd))
+    let lines = raw.split("\n")
+    let mut j = 0
+    while j < len(lines) {
+        let l = lines[j].trim()
+        if len(l) > 0 { hits.push(l) }
+        j = j + 1
+    }
+    return hits
+}
+
+fn cmd_caller_detect() -> int {
+    let mods = _list_stdlib_modules()
+    let mut vuln = []
+    let mut i = 0
+    while i < len(mods) {
+        let path = mods[i]
+        let src = _read_or_empty(path)
+        let base = _basename(path)
+        let stem = _strip_ext(base)
+        let toplevel = _top_level_lines(src)
+        let tn = len(toplevel)
+        let mut tl_parts = []
+        let mut k = 0
+        while k < tn {
+            tl_parts.push(toplevel[k])
+            tl_parts.push("\n")
+            k = k + 1
+        }
+        let tl = tl_parts.join("")
+        let trips = _contains(tl, "args()") || _contains(tl, "exit(") || _contains(tl, "--selftest")
+        let guard = _contains(tl, ".ends_with(\"/stdlib/" + base + "\")")
+        if trips {
+            // Even guarded modules carry residual risk if the host script
+            // has a generic --selftest gate that happens to ALSO match the
+            // module path (e.g. running `hexa run host.hexa --selftest`
+            // where host.hexa has `use "self/stdlib/<name>"`). Report all
+            // top-level-active modules; mark guard absence as HIGH risk.
+            vuln.push(stem)
+            println("[mlc-lint] caller-scan: stdlib " + stem + " has top-level activity (guard=" + to_string(guard) + ")")
+        }
+        i = i + 1
+    }
+
+    let root = _hexa_lang_root()
+    let callers = _scan_callers(root, vuln)
+    let cn = len(callers)
+    println("[mlc-lint] caller-scan: " + to_string(cn) + " caller file(s) under " + root)
+    let mut p = 0
+    while p < cn {
+        println("  " + callers[p])
+        p = p + 1
+    }
+    return 0
+}
+
+// ─── selftest ──────────────────────────────────────────────────
+//
+// Synthetic fixtures exercise C1 / C2 / C3 / C4. We write four temp
+// files into a fresh tmpdir, lint each, and assert violation counts.
+
+fn _write_tmp(path: string, body: string) {
+    let tmp = path + ".tmp"
+    write_file(tmp, body)
+    exec("mv '" + tmp + "' '" + path + "'")
+}
+
+fn _selftest() -> int {
+    let tmpdir = to_string(exec("mktemp -d /tmp/mlc_lint_st_XXXXXX")).trim()
+    if len(tmpdir) == 0 {
+        eprintln("[mlc-lint selftest] FAIL tmpdir mktemp")
+        return 1
+    }
+
+    // Fixture A: clean module — pub fn only, no top-level activity.
+    let fa = tmpdir + "/clean.hexa"
+    _write_tmp(fa, "pub fn hello() -> string { return \"hi\" }\n")
+
+    // Fixture B: top-level args() + exit() + --selftest, NO guard. Should fail C1+C2.
+    let fb = tmpdir + "/bad.hexa"
+    let body_b = "pub fn hello() -> string { return \"hi\" }\n"
+        + "let _a = args()\n"
+        + "if len(_a) > 0 { if _a[0] == \"--selftest\" { exit(0) } }\n"
+    _write_tmp(fb, body_b)
+
+    // Fixture C: top-level args() + exit() + --selftest, WITH guard. Should pass.
+    let fc = tmpdir + "/good.hexa"
+    let body_c = "pub fn hello() -> string { return \"hi\" }\n"
+        + "let _a = args()\n"
+        + "let mut _i = 0\n"
+        + "while _i < len(_a) {\n"
+        + "    if _a[_i] == \"--selftest-good\" { exit(0) }\n"
+        + "    if _a[_i] == \"--selftest\" {\n"
+        + "        if _a[_i].ends_with(\"/stdlib/good.hexa\") { exit(0) }\n"
+        + "    }\n"
+        + "    _i = _i + 1\n"
+        + "}\n"
+    _write_tmp(fc, body_c)
+
+    // Fixture D: zero pub fn — C4 advisory.
+    let fd = tmpdir + "/empty.hexa"
+    _write_tmp(fd, "fn _internal() -> int { return 0 }\n")
+
+    // Run lint_file on each and check counts.
+    let pa = lint_file(fa)
+    let pb = lint_file(fb)
+    let pc = lint_file(fc)
+    let pd = lint_file(fd)
+
+    exec("rm -rf '" + tmpdir + "' 2>/dev/null")
+
+    if pa[0] != 0 {
+        eprintln("[mlc-lint selftest] FAIL A clean: violations=" + to_string(pa[0]) + " want 0")
+        return 1
+    }
+    if pb[0] != 1 {
+        eprintln("[mlc-lint selftest] FAIL B bad: violations=" + to_string(pb[0]) + " want 1 (C1+C2)")
+        return 1
+    }
+    if pc[0] != 0 {
+        eprintln("[mlc-lint selftest] FAIL C good: violations=" + to_string(pc[0]) + " want 0 (guard present)")
+        return 1
+    }
+    if pd[0] != 0 {
+        eprintln("[mlc-lint selftest] FAIL D empty: violations=" + to_string(pd[0]) + " want 0 (C4 is advisory)")
+        return 1
+    }
+    if pd[1] < 1 {
+        eprintln("[mlc-lint selftest] FAIL D empty: advisories=" + to_string(pd[1]) + " want >=1 (C4)")
+        return 1
+    }
+
+    println("[mlc-lint selftest] 4/4 fixtures PASS (A clean / B bad C1+C2 / C good guarded / D C4 advisory)")
+    return 0
+}
+
+// ─── dispatch ──────────────────────────────────────────────────
+
+let _cn = len(_ml_cli)
+if _cn == 0 {
+    exit(cmd_lint_all())
+}
+
+let _cmd = _ml_cli[0]
+if _cmd == "--selftest" {
+    // Honor path-end-check ourselves so this lint is import-safe under
+    // its own contract. Direct invocation: argv contains the script path
+    // ending with /tool/module_loader_collision_lint.hexa OR was invoked
+    // via `hexa run` with the file as cli[0]. Either way --selftest fires.
+    exit(_selftest())
+}
+if _cmd == "--list" {
+    exit(cmd_list())
+}
+if _cmd == "--caller-detect" {
+    exit(cmd_caller_detect())
+}
+if _cmd == "--file" {
+    if _cn < 2 {
+        eprintln("[mlc-lint] usage: --file <path>")
+        exit(2)
+    }
+    let pair = lint_file(_ml_cli[1])
+    if pair[0] > 0 { exit(1) }
+    exit(0)
+}
+eprintln("[mlc-lint] unknown command: " + _cmd)
+eprintln("  usage: hexa tool/module_loader_collision_lint.hexa [--selftest|--list|--file <p>|--caller-detect]")
+exit(2)

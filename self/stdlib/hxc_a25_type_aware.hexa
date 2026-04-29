@@ -354,6 +354,15 @@ fn a25_classify(buf: string) -> string {
 
 // a25_dispatch: PASS 2 — return inner algo descriptor for class.
 // Returns array [algo_name, sigil, version_tag, aot_bin_path].
+//
+// 2026-04-28 (A29 v3 promotion): for text-heavy / json-heavy / struct-audit /
+// mixed classes, the encode path now invokes BOTH a18_d631a902_aot AND
+// hxc_a29 (--v3) and picks the byte-min winner per file (min-of-N dispatch,
+// raw 137 deterministic — no neural mixer, integer comparison only). The
+// `algo` field in the A25 wire header records which inner won so the decoder
+// can route to the correct binary. a25_dispatch() returns the PRIMARY (A18)
+// for legacy callsites (selftest fixtures, CLI summary print). The full
+// candidate list lives in a25_candidates() below.
 fn a25_dispatch(class_name: string) -> array {
     if class_name == "passthrough" {
         return ["passthrough", "", "", ""]
@@ -366,13 +375,55 @@ fn a25_dispatch(class_name: string) -> array {
         return ["a24", "^X", "v=grammar-pcfg-v1",
                 "/Users/ghost/core/anima/.hxc_aot/hxc_a24"]
     }
-    // text-heavy / json-heavy / struct-audit / mixed → A18 v2.
+    // text-heavy / json-heavy / struct-audit / mixed → A18 v2 (primary).
     // 2026-04-28: wired to d631a902 v3/v3-o2/v4-w64/v6-optimal multi-encoder
     //             AOT (407296B, 22/22 selftest PASS) for min-of-7 dispatch.
     //             A18 binary path migration: anima/.hxc_aot/hxc_a18 (v2-only)
     //             → hexa-lang/build/a18_d631a902_aot (multi-encoder).
     return ["a18", "^M", "v=lz-ppm-v2",
             "/Users/ghost/core/hexa-lang/build/a18_d631a902_aot"]
+}
+
+// a25_candidates: PASS 2b — return ALL inner candidates for a class.
+// Each candidate is [algo_label, aot_bin_path, encode_args]. The encode
+// path tries each candidate, picks the byte-min winner, and records
+// `algo=<algo_label>` in the A25 wire header so decode can route. raw 137
+// deterministic — integer-byte-count comparison only, no neural mixer.
+//
+// algo_label values:
+//   "a18"     — a18_d631a902_aot default `encode` (already min-of-7 internally)
+//   "a29_v3"  — hxc_a29 `encode --v3` (RFC 1951 §3.2.5 length codes)
+//   "a23", "a24", "passthrough" — single-candidate classes (no min-of-N)
+fn a25_candidates(class_name: string) -> array {
+    if class_name == "passthrough" {
+        return [["passthrough", "", ""]]
+    }
+    if class_name == "small-file" {
+        return [["a23", "/Users/ghost/core/anima/.hxc_aot/hxc_a23", ""]]
+    }
+    if class_name == "synthetic-repetitive" {
+        return [["a24", "/Users/ghost/core/anima/.hxc_aot/hxc_a24", ""]]
+    }
+    // text-heavy / json-heavy / struct-audit / mixed → min-of-{A18, A29 v3}.
+    // A18 d631a902 default encode is already min-of-7 internally (v1/v2/v3/
+    // v3-o2/v4/v4-w64/v6-optimal); A29 v3 adds RFC 1951 §3.2.5 length-code
+    // DEFLATE which beats LZ+PPM on small text-heavy inputs (5KB README probe
+    // 32% vs 20% saving). A29 inner stream wire is `# a29:s3 v=deflate-v3`
+    // (orthogonal to A18 wire `# a18:s1`); algo field disambiguates routing.
+    return [["a18",    "/Users/ghost/core/hexa-lang/build/a18_d631a902_aot", ""],
+            ["a29_v3", "/Users/ghost/core/anima/.hxc_aot/hxc_a29",           "--v3"]]
+}
+
+// a25_aot_for_algo: PASS 2c — given algo label from wire header, return the
+// AOT binary path used for decode routing. Symmetric inverse of a25_candidates
+// (encode-side label → decode-side binary path).
+fn a25_aot_for_algo(algo_label: string) -> string {
+    if algo_label == "a23" { return "/Users/ghost/core/anima/.hxc_aot/hxc_a23" }
+    if algo_label == "a24" { return "/Users/ghost/core/anima/.hxc_aot/hxc_a24" }
+    if algo_label == "a29_v3" { return "/Users/ghost/core/anima/.hxc_aot/hxc_a29" }
+    if algo_label == "a18" { return "/Users/ghost/core/hexa-lang/build/a18_d631a902_aot" }
+    if algo_label == "passthrough" { return "" }
+    return ""
 }
 
 // ───────────────── base64url codec (parallel A18/A23/A24) ─────────────────
@@ -486,6 +537,23 @@ fn _aot_encode_via_subprocess(text: string, aot_bin: string, counter: int) -> st
     return inner
 }
 
+// _aot_encode_via_subprocess_args: variant accepting extra CLI args (e.g.
+// "--v3" for hxc_a29). raw 9 — args concatenated as a literal segment in the
+// shell command; caller MUST pass static / vetted strings only (a25_candidates
+// table is a closed set). Empty args == identical behavior to the no-args
+// version.
+fn _aot_encode_via_subprocess_args(text: string, aot_bin: string, args: string, counter: int) -> string {
+    let in_path = _tmp_path("enc_in", counter)
+    let out_path = _tmp_path("enc_out", counter)
+    let _w = write_file(in_path, text)
+    let args_seg = if len(args) > 0 { " " + args } else { "" }
+    let cmd = _shell_quote(aot_bin) + " encode" + args_seg + " " + _shell_quote(in_path)
+            + " " + _shell_quote(out_path) + " >/dev/null 2>&1"
+    let _r = exec(cmd)
+    let inner = read_file(out_path)
+    return inner
+}
+
 // _aot_decode_via_subprocess: write inner-stream to tmp, exec AOT bin `decode`, read.
 // Returns reconstructed bytes as string.
 fn _aot_decode_via_subprocess(inner: string, aot_bin: string, counter: int) -> string {
@@ -548,27 +616,47 @@ fn _a25_encode_force_v2(text: string, counter: int) -> string {
     let n: i64 = len(text)
     if n >= 7 && text.substring(0, 7) == "# a25:s" { return text }
     let class_name = a25_classify(text)
-    let dispatch = a25_dispatch(class_name)
-    let algo_name = dispatch[0]
-    let sigil = dispatch[1]
-    let aot_bin = dispatch[3]
-    let mut inner = ""
-    if algo_name == "passthrough" {
-        inner = text
-    } else {
-        inner = _aot_encode_via_subprocess(text, aot_bin, counter)
-        if len(inner) == 0 {
-            // raw 142 D2 fallback — inner failed, identity passthrough.
-            inner = text
+    let candidates = a25_candidates(class_name)
+    let mut best_inner = ""
+    let mut best_label = ""
+    let mut have_best: bool = false
+    let mut ci: i64 = 0
+    while ci < len(candidates) {
+        let cand = candidates[ci]
+        let cand_label = cand[0]
+        let cand_bin   = cand[1]
+        let cand_args  = cand[2]
+        let mut this_inner = ""
+        if cand_label == "passthrough" {
+            this_inner = text
+        } else {
+            this_inner = _aot_encode_via_subprocess_args(text, cand_bin, cand_args, counter + ci)
+            if len(this_inner) == 0 {
+                // raw 142 D2 fallback per-candidate — inner failed → skip.
+                ci = ci + 1
+                continue
+            }
         }
+        if !have_best || len(this_inner) < len(best_inner) {
+            best_inner = this_inner
+            best_label = cand_label
+            have_best = true
+        }
+        ci = ci + 1
+    }
+    if !have_best {
+        // All candidates failed (incl. passthrough impossible) — fall back to
+        // identity with a passthrough algo label so decode is a no-op.
+        best_inner = text
+        best_label = "passthrough"
     }
     let header = "# a25:s2 v=type-aware-v2 cls=" + class_name
-               + " algo=" + algo_name
+               + " algo=" + best_label
                + " n=" + to_string(n)
-               + " ib=" + to_string(len(inner))
+               + " ib=" + to_string(len(best_inner))
     // Wire v2: header line + raw inner bytes (NO base64). The first `\n` is the
     // header terminator; everything after is raw passthrough of the inner stream.
-    return header + "\n" + inner
+    return header + "\n" + best_inner
 }
 
 // a25_encode: try-and-revert raw 142 D2 — return shortest of
@@ -612,8 +700,16 @@ fn _a25_decode_v2(stream: string) -> string {
     let n_orig: i64 = parse_int(header.substring(n_pos + 3, ib_pos))
     let inner = stream.substring(nl_pos + 1, n)
     if algo_name == "passthrough" { return inner }
-    let dispatch = a25_dispatch(class_name)
-    let aot_bin = dispatch[3]
+    // 2026-04-28 (A29 v3 promotion): route by algo_name (wire-encoded label),
+    // NOT by class name. Encode-side recorded the WINNING candidate; decode
+    // must use the same binary to satisfy byte-eq round-trip. Falls back to
+    // a25_dispatch() for legacy (pre-promotion) streams whose algo field is
+    // a single class-default label.
+    let mut aot_bin = a25_aot_for_algo(algo_name)
+    if len(aot_bin) == 0 {
+        let dispatch = a25_dispatch(class_name)
+        aot_bin = dispatch[3]
+    }
     if len(aot_bin) == 0 { return inner }
     let plain = _aot_decode_via_subprocess(inner, aot_bin, 1)
     return plain
@@ -658,8 +754,13 @@ fn a25_decode(stream: string) -> string {
     let inner_bytes = _b64_dec_bytes(body_b64)
     let inner = _bytes_to_str(inner_bytes)
     if algo_name == "passthrough" { return inner }
-    let dispatch = a25_dispatch(class_name)
-    let aot_bin = dispatch[3]
+    // 2026-04-28 (A29 v3 promotion): align v1 decoder with v2 — route by
+    // algo_name first, fall back to class-default for pre-promotion streams.
+    let mut aot_bin = a25_aot_for_algo(algo_name)
+    if len(aot_bin) == 0 {
+        let dispatch = a25_dispatch(class_name)
+        aot_bin = dispatch[3]
+    }
     if len(aot_bin) == 0 { return inner }
     let plain = _aot_decode_via_subprocess(inner, aot_bin, 1)
     return plain
@@ -936,9 +1037,22 @@ fn main() {
             let _w = write_file(out_path, res)
             let saving = if len(txt) > 0 { ((len(txt) - len(res)) * 100) / len(txt) } else { 0 }
             let cls = a25_classify(txt)
-            let dispatch = a25_dispatch(cls)
+            // Read actual algo from wire header (post-min-of-N selection) — falls
+            // back to a25_dispatch() class default for legacy / passthrough output.
+            let mut algo_label = a25_dispatch(cls)[0]
+            if len(res) >= 9 && res.substring(0, 9) == "# a25:s2 " {
+                let nl_pos: i64 = res.index_of("\n")
+                if nl_pos > 0 {
+                    let header = res.substring(0, nl_pos)
+                    let algo_pos: i64 = header.index_of(" algo=")
+                    let n_pos: i64 = header.index_of(" n=")
+                    if algo_pos >= 0 && n_pos > algo_pos {
+                        algo_label = header.substring(algo_pos + 6, n_pos)
+                    }
+                }
+            }
             println("a25 encode raw=" + to_string(len(txt)) + " enc=" + to_string(len(res))
-                    + " saving=" + to_string(saving) + "% class=" + cls + " algo=" + dispatch[0])
+                    + " saving=" + to_string(saving) + "% class=" + cls + " algo=" + algo_label)
             exit(0)
         }
         let txt = read_file(in_path)

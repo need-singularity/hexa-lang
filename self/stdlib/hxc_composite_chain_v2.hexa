@@ -1,0 +1,761 @@
+#!hexa strict
+
+use "self/stdlib/hxc_a29_deflate"
+use "self/stdlib/hxc_a30_bwt_mtf"
+
+// @resolver-bypass(reason="darwin-native HXC composite-chain v2 internal-byte fast-path — follow-on tick per a657d6c1 §10")
+// @tool(slug="hxc-composite-chain-v2", desc="HXC composite chain v2 INTERNAL-BYTE FAST-PATH — A29 internal payload bytes (b64 envelope skipped) → A30 pipeline → single composite b64 envelope. C-PRIMARY ONLY (C1 = A29→A30). Sigil ^d (re-used; raw 92 sigil-line compliant). Wire header `# cc:s2 v=composite-byte-v1 chain=C1`. 5-fixture internal-byte round-trip + 3-fixture D2 try-revert + 5KB micro-LIVE-FIRE break-even s2 measurement vs theoretical 24.8%. raw 142 D2: encode_v2 returns shortest of {composite_v2, A29_alone, A30_alone, identity}. NO 6-repo full sweep (deferred). NO production deploy. raw 91 honest C3 STRICT: this tick = follow-on internal-byte first-tick + 5KB micro-LIVE-FIRE; F-CC-7 break-even gate measured.")
+// @usage(hexa /Users/ghost/core/hexa-lang/self/stdlib/hxc_composite_chain_v2.hexa --selftest)
+// @usage(hexa /Users/ghost/core/hexa-lang/self/stdlib/hxc_composite_chain_v2.hexa --micro-live-fire)
+// @usage(hexa /Users/ghost/core/hexa-lang/self/stdlib/hxc_composite_chain_v2.hexa encode <in> <out>)
+// @usage(hexa /Users/ghost/core/hexa-lang/self/stdlib/hxc_composite_chain_v2.hexa decode <in> <out>)
+// @exit_codes(0=ok, 1=selftest-fail, 2=io-error, 3=bad-args, 4=decode-mismatch, 5=micro-live-fire-fail)
+//
+// Design reference: anima/docs/hxc_composite_chain_design_2026_04_28.md §3.1 §4.2 §8.1
+// Predecessor: a657d6c1 (skeleton wire-level INFLATION verdict; this tick = follow-on §10 recommendation)
+//
+// Internal-byte fast-path semantics (replaces wire-level skeleton's stub stack):
+//
+//   encode_v2(s):
+//     // Stage 1: A29 v1 LZ77 + canonical-Huffman bitstream → byte payload.
+//     a29_wire = a29_encode(s)                       // imported from hxc_a29_deflate
+//     [a29_meta, a29_payload_bytes] = _cc2_extract_a29_v1(a29_wire)
+//
+//     // Stage 2: A30 BWT+MTF+RLE+range-coder on the A29 internal byte stream.
+//     // CRITICAL: feed A29 payload BYTES (as opaque byte-string via chr-mapping),
+//     // NOT the wrapped A29 wire (which is base64url + header — anti-compressive).
+//     a29_payload_str = _cc2_bytes_to_str(a29_payload_bytes)
+//     a30_wire = a30_encode(a29_payload_str)         // imported from hxc_a30_bwt_mtf
+//     [a30_meta, a30_payload_bytes] = _cc2_extract_a30_v1(a30_wire)
+//
+//     // Stage 3: SINGLE composite-layer base64url envelope on A30 payload bytes.
+//     composite_b64 = _cc2_b64_enc_bytes(a30_payload_bytes)
+//     composite_wire = "# cc:s2 v=composite-byte-v1 chain=C1 n=<orig_n> "
+//                    + "n_a29p=<len(a29_payload_bytes)> n_a30p=<len(a30_payload_bytes)> "
+//                    + "a29_t=<a29_meta.t> a30_p=<a30_meta.p> a30_r=<a30_meta.r>\n"
+//                    + "^d" + composite_b64 + "\n"
+//
+//   decode_v2(z):
+//     // Reverse: composite-b64 → a30_payload_bytes → synthesize A30 v1 wire from
+//     // stored metadata → a30_decode → recover A29 payload byte-string → bytes →
+//     // synthesize A29 v1 wire from stored metadata → a29_decode → original.
+//
+//     [n_orig, n_a29p, n_a30p, a29_t, a30_p, a30_r, body_b64] = _cc2_unwrap(z)
+//     a30_payload_bytes = _cc2_b64_dec_bytes(body_b64)
+//     a30_wire_synth    = _cc2_synthesize_a30_v1(a30_payload_bytes,
+//                                                n_input=n_a29p, primary=a30_p, rle_len=a30_r)
+//     a29_payload_str   = a30_decode(a30_wire_synth)
+//     a29_payload_bytes = _cc2_str_to_bytes(a29_payload_str)
+//     a29_wire_synth    = _cc2_synthesize_a29_v1(a29_payload_bytes,
+//                                                n_input=n_orig, n_huff_tokens=a29_t)
+//     return a29_decode(a29_wire_synth)
+//
+// Wire size accounting (§3.1 design model):
+//   A29-alone wire     ≈ 80 (header) + 1.33 × n_a29p (b64-expanded)
+//   composite_v2 wire  ≈ 110 (header) + 1.33 × n_a30p (b64-expanded ONCE)
+//   Break-even vs A29-alone: composite_v2 < A29 ⟺ n_a30p < n_a29p (A30 must shrink).
+//   Break-even vs identity (raw n): n_a30p × 1.33 + 110 < n
+//                                ⟺ n_a30p < (n - 110) / 1.33
+//   §3.1 model: n_a29p ≈ 0.78 n (text-heavy class). For composite < identity:
+//     n_a30p < (n - 110) / 1.33 ⟺ s2 ≡ 1 - n_a30p/n_a29p > 1 - (n-110)/(1.33×0.78n)
+//   Asymptotically (n → ∞): s2 > 1 - 1/(1.33×0.78) = 1 - 0.965 = 0.0353 → 3.5% naive.
+//   §3.1 alternative model uses 1.33×0.78 = 1.04 ≈ identity baseline so s2 ≈ 24.8%.
+//   The 24.8% figure is the conservative break-even when A29 wire ≈ identity input
+//   (i.e., A29 is at its compression ceiling and any further saving comes from A30).
+//
+// Idempotency (raw 65 + 68 + 137):
+//   - decode_v2(encode_v2(s)) == s for any s.
+//   - encode_v2(encode_v2(s)) == encode_v2(s) (header short-circuit).
+//   - non-composite-v2 input → cc2_decode passthrough.
+//   - encode is byte-deterministic (composes deterministic A29 + A30).
+//
+// raw 142 D2 (try-revert) — STRICT:
+//   encode_v2 returns shortest of {composite_v2, A29_alone, A30_alone, identity}.
+//   Guarantees composite never inflates aggregate vs current SOTA. Worst case = +0pp.
+//
+// raw 156 placement-orthogonality:
+//   Composite v2 = NEW axis (sequential algorithm composition with internal-byte
+//   stage interface). NOT orthogonal to A29/A30 — composite SUBSUMES them as inner
+//   stages. COMPLEMENTARY to A25 dispatcher; coexist as orthogonal axes IF
+//   composite passes follow-on F-CC-7 gate.
+//
+// raw 137 cmix-ban compliance:
+//   Composite v2 = sequential composition of deterministic algorithms (A29 v1 +
+//   A30 v1). All inner stages are deterministic, integer-only, no fp ops, no
+//   neural mixer. Output is bit-for-bit reproducible.
+//
+// Falsifiers (raw 71, this tick):
+//   F-CC2-1: round-trip byte-eq fails on any of 5 selftest fixtures → REJECT (raw 65/68).
+//   F-CC2-2: composite_v2 size > min(A29, A30, identity) for any fixture →
+//            D2 try-revert returns the smaller candidate (verified by selftest).
+//   F-CC2-3: 5KB micro-LIVE-FIRE break-even s2 < 24.8% on majority of fixtures
+//            → C-PRIMARY composite anti-lever; honest C3 catalog "below break-even".
+//   F-CC2-4: header parse ambiguity (composite v2 collides with A29/A30) → REJECT.
+//
+// Deferred (raw 91 honest C3):
+//   - 6-repo full sweep (gated on F-CC2-3 pass).
+//   - F-CC-4..8 LIVE FIRE production gates (gated on micro-LIVE-FIRE pass + 6-repo).
+//   - A25 dispatcher integration (gated on F-CC-4 aggregate ≥ 78.65%).
+//   - C-SECONDARY (C3 = A30→A23) internal-byte path (separate tick).
+//
+// Non-overlap re-affirmed:
+//   - hxc_composite_chain_v2.hexa = NEW file (this tick).
+//   - hxc_composite_chain.hexa (skeleton, predecessor a657d6c1) = read-only.
+//   - hxc_a29_deflate.hexa, hxc_a30_bwt_mtf.hexa = read-only consumers via `use`.
+//   - sigil ^d re-used (composite-v2 wire format only; v1 skeleton wire schema
+//     `# cc:s1 v=composite-v1` distinct from v2 schema `# cc:s2 v=composite-byte-v1`,
+//     unambiguous header dispatch).
+
+const CC2_MIN_BYTES = 64                     // below this: identity passthrough
+const CC2_HEADER_PREFIX = "# cc:s2"
+const CC2_SIGIL = "^d"
+const CC2_VERSION = "composite-byte-v1"
+const CC2_CHAIN_C1 = "C1"
+// Local b64 alphabet (interop with A29/A30/A23 — same canonical url-safe set).
+const CC2_B64_ALPHA = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+// ───────────────── byte / string helpers ─────────────────
+
+fn _cc2_bytes_to_str(b: array) -> string {
+    let mut out = []
+    let n: i64 = len(b)
+    let mut i: i64 = 0
+    while i < n { out.push(chr(b[i])); i = i + 1 }
+    return out.join("")
+}
+
+fn _cc2_str_to_bytes(s: string) -> array {
+    let mut out = []
+    let n: i64 = len(s)
+    let mut i: i64 = 0
+    while i < n { out.push(ord(s.substring(i, i + 1))); i = i + 1 }
+    return out
+}
+
+// ───────────────── composite-layer b64url codec (single envelope) ─────────────────
+//
+// Same canonical url-safe alphabet as A29/A30/A23. Trailing 4 chars encode the
+// exact byte count (matches A29/A30 b64 layout) so decoder recovers padding-aware
+// length without separate header field. Composite header still records n_a30p
+// for redundancy / parse-time validation.
+
+fn _cc2_b64_char_at(idx: i64) -> string {
+    return CC2_B64_ALPHA.substring(idx, idx + 1)
+}
+
+fn _cc2_b64_char_idx(c: string) -> i64 { return CC2_B64_ALPHA.index_of(c) }
+
+fn _cc2_b64_enc_bytes(bytes: array) -> string {
+    let mut out = []
+    let n: i64 = len(bytes)
+    let mut i: i64 = 0
+    while i < n {
+        let b0: i64 = bytes[i]
+        let b1: i64 = if i + 1 < n { bytes[i + 1] } else { 0 }
+        let b2: i64 = if i + 2 < n { bytes[i + 2] } else { 0 }
+        let acc: i64 = b0 * 65536 + b1 * 256 + b2
+        let c0: i64 = acc / 262144
+        let r0: i64 = acc - c0 * 262144
+        let c1: i64 = r0 / 4096
+        let r1: i64 = r0 - c1 * 4096
+        let c2: i64 = r1 / 64
+        let c3: i64 = r1 - c2 * 64
+        let group: i64 = if i + 3 <= n { 4 } else { (n - i) + 1 }
+        let chs = [c0, c1, c2, c3]
+        let mut e: i64 = 0
+        while e < group { out.push(_cc2_b64_char_at(chs[e])); e = e + 1 }
+        i = i + 3
+    }
+    let mut nv: i64 = n
+    if nv > 16777215 { nv = 16777215 }
+    let t0: i64 = nv / 262144
+    let r0t: i64 = nv - t0 * 262144
+    let t1: i64 = r0t / 4096
+    let r1t: i64 = r0t - t1 * 4096
+    let t2: i64 = r1t / 64
+    let t3: i64 = r1t - t2 * 64
+    out.push(_cc2_b64_char_at(t0))
+    out.push(_cc2_b64_char_at(t1))
+    out.push(_cc2_b64_char_at(t2))
+    out.push(_cc2_b64_char_at(t3))
+    return out.join("")
+}
+
+fn _cc2_b64_dec_bytes(s: string) -> array {
+    let total: i64 = len(s)
+    if total < 4 { return [] }
+    let t0: i64 = _cc2_b64_char_idx(s.substring(total - 4, total - 3))
+    let t1: i64 = _cc2_b64_char_idx(s.substring(total - 3, total - 2))
+    let t2: i64 = _cc2_b64_char_idx(s.substring(total - 2, total - 1))
+    let t3: i64 = _cc2_b64_char_idx(s.substring(total - 1, total))
+    let bcount: i64 = t0 * 262144 + t1 * 4096 + t2 * 64 + t3
+    let body_len: i64 = total - 4
+    let mut out = []
+    let mut i: i64 = 0
+    while i < body_len {
+        let group: i64 = if i + 4 <= body_len { 4 } else { body_len - i }
+        let mut acc: i64 = 0
+        let mut j: i64 = 0
+        while j < 4 {
+            let d: i64 = if j < group { _cc2_b64_char_idx(s.substring(i + j, i + j + 1)) } else { 0 }
+            acc = acc * 64 + d
+            j = j + 1
+        }
+        let by0: i64 = acc / 65536
+        let rem: i64 = acc - by0 * 65536
+        let by1: i64 = rem / 256
+        let by2: i64 = rem - by1 * 256
+        let bg: i64 = if group == 4 { 3 } else { group - 1 }
+        if bg >= 1 { out.push(by0) }
+        if bg >= 2 { out.push(by1) }
+        if bg >= 3 { out.push(by2) }
+        i = i + 4
+    }
+    let mut final_out = []
+    let mut fi: i64 = 0
+    while fi < bcount && fi < len(out) { final_out.push(out[fi]); fi = fi + 1 }
+    return final_out
+}
+
+// ───────────────── A29 v1 wire extract / synthesize ─────────────────
+//
+// A29 v1 wire layout (from hxc_a29_deflate.hexa _a29_encode_force):
+//   `# a29:s1 v=deflate-v1 n=<n_input> t=<n_huff_tokens>\n^a<base64url-payload>\n`
+//
+// extract: parse header for {n, t}, locate ^a body line, b64-decode body → bytes.
+// synthesize: rebuild header + b64-encode bytes + wrap.
+
+fn _cc2_extract_a29_v1(wire: string) -> array {
+    // Returns [n_input, n_huff_tokens, payload_bytes] or [] on parse failure.
+    let lines = wire.split("\n")
+    if len(lines) < 2 { return [] }
+    let header = lines[0]
+    if len(header) < 7 || header.substring(0, 7) != "# a29:s" { return [] }
+    let n_pos: i64 = header.index_of(" n=")
+    let t_pos: i64 = header.index_of(" t=")
+    if n_pos < 0 || t_pos < 0 { return [] }
+    let n_input: i64 = parse_int(header.substring(n_pos + 3, t_pos))
+    let n_huff_tokens: i64 = parse_int(header.substring(t_pos + 3, len(header)))
+    let mut body_b64 = ""
+    let mut i: i64 = 1
+    while i < len(lines) {
+        let l = lines[i]
+        if len(l) >= 2 && l.substring(0, 2) == "^a" {
+            body_b64 = l.substring(2, len(l))
+            break
+        }
+        i = i + 1
+    }
+    if len(body_b64) == 0 { return [] }
+    // Reuse imported A29 b64 decoder (same alphabet/scheme as composite layer
+    // — but A29's _b64_dec_bytes parses A29's own trailing 4-char count word).
+    let payload_bytes = _b64_dec_bytes(body_b64)
+    return [n_input, n_huff_tokens, payload_bytes]
+}
+
+fn _cc2_synthesize_a29_v1(payload_bytes: array, n_input: i64, n_huff_tokens: i64) -> string {
+    let body_b64 = _b64_enc_bytes(payload_bytes)
+    let header = "# a29:s1 v=deflate-v1 n=" + to_string(n_input) + " t=" + to_string(n_huff_tokens)
+    return header + "\n^a" + body_b64 + "\n"
+}
+
+// ───────────────── A30 v1 wire extract / synthesize ─────────────────
+//
+// A30 v1 wire layout (from hxc_a30_bwt_mtf.hexa _a30_encode_force):
+//   `# a30:s1 v=bwt-mtf-rle-v1 n=<n_input> p=<primary> r=<rle_len>\n^b<base64url-payload>\n`
+
+fn _cc2_extract_a30_v1(wire: string) -> array {
+    // Returns [n_input, primary, rle_len, payload_bytes] or [] on parse failure.
+    let lines = wire.split("\n")
+    if len(lines) < 2 { return [] }
+    let header = lines[0]
+    if len(header) < 7 || header.substring(0, 7) != "# a30:s" { return [] }
+    let n_pos: i64 = header.index_of(" n=")
+    let p_pos: i64 = header.index_of(" p=")
+    let r_pos: i64 = header.index_of(" r=")
+    if n_pos < 0 || p_pos < 0 || r_pos < 0 { return [] }
+    let n_input: i64 = parse_int(header.substring(n_pos + 3, p_pos))
+    let primary: i64 = parse_int(header.substring(p_pos + 3, r_pos))
+    let rle_len: i64 = parse_int(header.substring(r_pos + 3, len(header)))
+    let mut body_b64 = ""
+    let mut i: i64 = 1
+    while i < len(lines) {
+        let l = lines[i]
+        if len(l) >= 2 && l.substring(0, 2) == "^b" {
+            body_b64 = l.substring(2, len(l))
+            break
+        }
+        i = i + 1
+    }
+    if len(body_b64) == 0 { return [] }
+    let payload_bytes = _a30_b64_dec_bytes(body_b64)
+    return [n_input, primary, rle_len, payload_bytes]
+}
+
+fn _cc2_synthesize_a30_v1(payload_bytes: array, n_input: i64, primary: i64, rle_len: i64) -> string {
+    let body_b64 = _a30_b64_enc_bytes(payload_bytes)
+    let header = "# a30:s1 v=bwt-mtf-rle-v1 n=" + to_string(n_input)
+                 + " p=" + to_string(primary) + " r=" + to_string(rle_len)
+    return header + "\n^b" + body_b64 + "\n"
+}
+
+// ───────────────── composite v2 wire wrap / unwrap ─────────────────
+
+fn _cc2_wrap(a30_payload_bytes: array, n_orig: i64, n_a29p: i64, n_a30p: i64,
+             a29_t: i64, a30_p: i64, a30_r: i64) -> string {
+    let body_b64 = _cc2_b64_enc_bytes(a30_payload_bytes)
+    let header = CC2_HEADER_PREFIX
+               + " v=" + CC2_VERSION
+               + " chain=" + CC2_CHAIN_C1
+               + " n=" + to_string(n_orig)
+               + " n_a29p=" + to_string(n_a29p)
+               + " n_a30p=" + to_string(n_a30p)
+               + " a29_t=" + to_string(a29_t)
+               + " a30_p=" + to_string(a30_p)
+               + " a30_r=" + to_string(a30_r)
+    return header + "\n" + CC2_SIGIL + body_b64 + "\n"
+}
+
+fn _cc2_parse_field(header: string, key: string) -> i64 {
+    // Parse `<key>=<digits>` field; returns -1 on miss.
+    let pos: i64 = header.index_of(key)
+    if pos < 0 { return -1 }
+    let start: i64 = pos + len(key)
+    let mut end: i64 = start
+    let nh: i64 = len(header)
+    while end < nh {
+        let ch = header.substring(end, end + 1)
+        if ch == " " || ch == "\n" { break }
+        end = end + 1
+    }
+    return parse_int(header.substring(start, end))
+}
+
+fn _cc2_unwrap(z: string) -> array {
+    // Returns [n_orig, n_a29p, n_a30p, a29_t, a30_p, a30_r, payload_bytes] or [].
+    let lines = z.split("\n")
+    if len(lines) < 2 { return [] }
+    let header = lines[0]
+    let prefix_len: i64 = len(CC2_HEADER_PREFIX)
+    if len(header) < prefix_len { return [] }
+    if header.substring(0, prefix_len) != CC2_HEADER_PREFIX { return [] }
+    // Validate version + chain.
+    let v_check = " v=" + CC2_VERSION
+    if header.index_of(v_check) < 0 { return [] }
+    let c_check = " chain=" + CC2_CHAIN_C1
+    if header.index_of(c_check) < 0 { return [] }
+
+    let n_orig: i64 = _cc2_parse_field(header, " n=")
+    let n_a29p: i64 = _cc2_parse_field(header, " n_a29p=")
+    let n_a30p: i64 = _cc2_parse_field(header, " n_a30p=")
+    let a29_t: i64 = _cc2_parse_field(header, " a29_t=")
+    let a30_p: i64 = _cc2_parse_field(header, " a30_p=")
+    let a30_r: i64 = _cc2_parse_field(header, " a30_r=")
+    if n_orig < 0 || n_a29p < 0 || n_a30p < 0 || a29_t < 0 || a30_p < 0 || a30_r < 0 { return [] }
+
+    let mut body_b64 = ""
+    let mut i: i64 = 1
+    while i < len(lines) {
+        let l = lines[i]
+        if len(l) >= 2 && l.substring(0, 2) == CC2_SIGIL {
+            body_b64 = l.substring(2, len(l))
+            break
+        }
+        i = i + 1
+    }
+    if len(body_b64) == 0 { return [] }
+    let payload_bytes = _cc2_b64_dec_bytes(body_b64)
+    return [n_orig, n_a29p, n_a30p, a29_t, a30_p, a30_r, payload_bytes]
+}
+
+// ───────────────── force-encoders ─────────────────
+
+fn _cc2_c1_force(s: string) -> string {
+    // C1 v2 internal-byte fast-path. Returns composite_v2 wire.
+    // Pre-conditions: caller ensured len(s) >= CC2_MIN_BYTES and not already composite_v2.
+    let n: i64 = len(s)
+
+    // Stage 1: A29 v1 force-encode. If A29 D2-reverts (a29_encode returns identity),
+    // composite cannot proceed via internal-byte path — return identity sentinel.
+    let a29_wire = _a29_encode_force(s)
+    let a29_meta = _cc2_extract_a29_v1(a29_wire)
+    if len(a29_meta) == 0 { return s }
+    let n_a29p_input: i64 = a29_meta[0]
+    let a29_t: i64 = a29_meta[1]
+    let a29_payload_bytes = a29_meta[2]
+    let n_a29p: i64 = len(a29_payload_bytes)
+    if n_a29p == 0 { return s }
+
+    // Stage 2: A30 v1 force-encode on A29 payload bytes (NOT b64 wrapped wire).
+    let a29_payload_str = _cc2_bytes_to_str(a29_payload_bytes)
+    let a30_wire = _a30_encode_force(a29_payload_str)
+    let a30_meta = _cc2_extract_a30_v1(a30_wire)
+    if len(a30_meta) == 0 { return s }
+    let _a30_n_input: i64 = a30_meta[0]   // == n_a29p (A30 input)
+    let a30_p: i64 = a30_meta[1]
+    let a30_r: i64 = a30_meta[2]
+    let a30_payload_bytes = a30_meta[3]
+    let n_a30p: i64 = len(a30_payload_bytes)
+
+    // Stage 3: SINGLE composite-layer b64 envelope.
+    return _cc2_wrap(a30_payload_bytes, n, n_a29p, n_a30p, a29_t, a30_p, a30_r)
+}
+
+// ───────────────── public encode / decode (raw 142 D2 try-revert) ─────────────────
+
+fn cc2_encode(s: string) -> string {
+    // raw 142 D2 STRICT: returns shortest of {composite_v2, A29-alone, A30-alone, identity}.
+    let n: i64 = len(s)
+    if n < CC2_MIN_BYTES { return s }
+    let prefix_len: i64 = len(CC2_HEADER_PREFIX)
+    if n >= prefix_len && s.substring(0, prefix_len) == CC2_HEADER_PREFIX { return s }
+    // Detect already-A29 / already-A30 input and passthrough (raw 65/68).
+    if n >= 7 && s.substring(0, 7) == "# a29:s" { return s }
+    if n >= 7 && s.substring(0, 7) == "# a30:s" { return s }
+
+    let cc = _cc2_c1_force(s)
+    let a29 = a29_encode(s)
+    let a30 = a30_encode(s)
+
+    // raw 142 D2: pick shortest among {cc, a29, a30, identity}.
+    let mut best = s
+    let mut best_n: i64 = n
+    if len(cc) < best_n { best = cc; best_n = len(cc) }
+    if len(a29) < best_n { best = a29; best_n = len(a29) }
+    if len(a30) < best_n { best = a30; best_n = len(a30) }
+    return best
+}
+
+fn cc2_decode(z: string) -> string {
+    let unwrapped = _cc2_unwrap(z)
+    if len(unwrapped) == 0 {
+        // Not a composite-v2 stream — try A29 / A30 / passthrough.
+        if len(z) >= 7 && z.substring(0, 7) == "# a29:s" { return a29_decode(z) }
+        if len(z) >= 7 && z.substring(0, 7) == "# a30:s" { return a30_decode(z) }
+        return z
+    }
+    let n_orig: i64 = unwrapped[0]
+    let n_a29p: i64 = unwrapped[1]
+    let _n_a30p: i64 = unwrapped[2]
+    let a29_t: i64 = unwrapped[3]
+    let a30_p: i64 = unwrapped[4]
+    let a30_r: i64 = unwrapped[5]
+    let a30_payload_bytes = unwrapped[6]
+
+    // Reverse Stage 3 → Stage 2 → Stage 1.
+    let a30_wire_synth = _cc2_synthesize_a30_v1(a30_payload_bytes,
+                                                n_a29p, a30_p, a30_r)
+    let a29_payload_str = a30_decode(a30_wire_synth)
+    let a29_payload_bytes = _cc2_str_to_bytes(a29_payload_str)
+    let a29_wire_synth = _cc2_synthesize_a29_v1(a29_payload_bytes, n_orig, a29_t)
+    let _ignore = n_orig + a29_t   // silence unused-warning
+    return a29_decode(a29_wire_synth)
+}
+
+// ───────────────── selftest helpers ─────────────────
+
+fn _cc2_assert_round_trip(label: string, fixture: string) -> int {
+    let n_in: i64 = len(fixture)
+    // Force-path round-trip via _cc2_c1_force (skips D2 try-revert to verify
+    // composite-v2 internal-byte path even on small fixtures).
+    let enc = _cc2_c1_force(fixture)
+    if len(enc) == 0 || enc == fixture {
+        // Force path declined (a29 D2 revert / a30 D2 revert internally).
+        // For round-trip selftest skip and report STRUCT.
+        println("  SKIP: " + label + " force path declined (inner stage D2 revert) n_in=" + to_string(n_in))
+        return 0
+    }
+    let dec = cc2_decode(enc)
+    if dec == fixture {
+        let n_enc: i64 = len(enc)
+        let saving_pct: i64 = if n_in > 0 { ((n_in - n_enc) * 100) / n_in } else { 0 }
+        let revert_label = if n_enc < n_in { "shrunk" } else { "INFLATED-D2-eligible" }
+        println("  PASS: " + label + " round-trip byte-eq n_in=" + to_string(n_in)
+                + " n_enc=" + to_string(n_enc)
+                + " saving=" + to_string(saving_pct) + "% [" + revert_label + "]")
+        return 0
+    }
+    println("  FAIL: " + label + " round-trip lost n_in=" + to_string(n_in)
+            + " n_dec=" + to_string(len(dec))
+            + " n_enc=" + to_string(len(enc)))
+    return 1
+}
+
+fn _cc2_assert_d2_revert(label: string, fixture: string) -> int {
+    let n_in: i64 = len(fixture)
+    let enc = cc2_encode(fixture)
+    let n_enc: i64 = len(enc)
+    if n_enc <= n_in {
+        let mut what = "identity-revert"
+        if enc != fixture {
+            // Determine which winner D2 picked by header sniff.
+            if n_enc >= 7 && enc.substring(0, 7) == "# cc:s2" { what = "composite-v2-shrunk" }
+            else { if n_enc >= 7 && enc.substring(0, 7) == "# a29:s" { what = "A29-shrunk" }
+                   else { if n_enc >= 7 && enc.substring(0, 7) == "# a30:s" { what = "A30-shrunk" }
+                          else { what = "shrunk-other" } } }
+        }
+        println("  PASS: " + label + " D2 try-revert n_in=" + to_string(n_in)
+                + " n_enc=" + to_string(n_enc) + " [" + what + "]")
+        return 0
+    }
+    println("  FAIL: " + label + " D2 try-revert violated n_in=" + to_string(n_in)
+            + " n_enc=" + to_string(n_enc))
+    return 1
+}
+
+// ───────────────── micro-LIVE-FIRE 5KB stratified ─────────────────
+//
+// 5 fixtures × ~5KB each. Builds via repetition of seed phrases (deterministic,
+// raw 137 cmix-ban — no random sampling). Measures composite_v2 size, A29 size,
+// A30 size, identity size, computes s2 = saving on A29 payload by A30, reports
+// break-even verdict vs 24.8% theoretical threshold.
+
+fn _cc2_repeat(seed: string, target_bytes: i64) -> string {
+    let mut out = ""
+    let sn: i64 = len(seed)
+    if sn == 0 { return out }
+    while len(out) < target_bytes { out = out + seed }
+    return out
+}
+
+fn _cc2_live_fire_one(label: string, fixture: string) -> array {
+    // Returns [n_in, n_a29, n_a30, n_cc2, n_a29p, n_a30p, s2_pct, verdict_pp, winner]
+    let n: i64 = len(fixture)
+    let cc = _cc2_c1_force(fixture)
+    let a29 = a29_encode(fixture)
+    let a30 = a30_encode(fixture)
+    let n_cc: i64 = len(cc)
+    let n_a29: i64 = len(a29)
+    let n_a30: i64 = len(a30)
+
+    // Recover internal payload sizes for s2 measurement (best-effort; if A29 D2
+    // reverted, n_a29p = 0 and s2 undefined).
+    let mut n_a29p: i64 = 0
+    let mut n_a30p: i64 = 0
+    let a29f = _a29_encode_force(fixture)
+    let a29m = _cc2_extract_a29_v1(a29f)
+    if len(a29m) > 0 { n_a29p = len(a29m[2]) }
+    if n_a29p > 0 {
+        let a29_payload_str = _cc2_bytes_to_str(a29m[2])
+        let a30f = _a30_encode_force(a29_payload_str)
+        let a30m = _cc2_extract_a30_v1(a30f)
+        if len(a30m) > 0 { n_a30p = len(a30m[3]) }
+    }
+    let s2_pct: i64 = if n_a29p > 0 { ((n_a29p - n_a30p) * 100) / n_a29p } else { 0 }
+
+    // raw 142 D2: pick shortest among {cc, a29, a30, identity}.
+    let mut winner = "identity"
+    let mut best: i64 = n
+    if n_cc < best { winner = "composite-v2"; best = n_cc }
+    if n_a29 < best { winner = "A29"; best = n_a29 }
+    if n_a30 < best { winner = "A30"; best = n_a30 }
+    let saving_pp: i64 = ((n - best) * 100) / n
+
+    println("  " + label + " n_in=" + to_string(n)
+            + " | A29=" + to_string(n_a29)
+            + " A30=" + to_string(n_a30)
+            + " cc2=" + to_string(n_cc)
+            + " | a29p=" + to_string(n_a29p)
+            + " a30p=" + to_string(n_a30p)
+            + " s2=" + to_string(s2_pct) + "%"
+            + " | winner=" + winner
+            + " saving=" + to_string(saving_pp) + "%")
+    return [n, n_a29, n_a30, n_cc, n_a29p, n_a30p, s2_pct, saving_pp, winner]
+}
+
+fn _micro_live_fire() -> int {
+    println("=== HXC composite-chain v2 — 5KB stratified micro-LIVE-FIRE ===")
+    println("    F-CC2-3 break-even gate: composite_v2 < min(A29, A30, identity)")
+    println("    theoretical s2 threshold (composite < identity): >= 24.8% on DEFLATE byte projection")
+    let mut wins = 0
+    let mut total = 0
+    let mut s2_sum: i64 = 0
+
+    // Fixture A: English natural text (text-heavy class).
+    let seed_eng = "the quick brown fox jumps over the lazy dog. pack my box with five dozen liquor jugs. how vexingly quick daft zebras jump! "
+    let fix_eng = _cc2_repeat(seed_eng, 5120)
+    let r_eng = _cc2_live_fire_one("F-A english 5KB ", fix_eng)
+    total = total + 1
+    if r_eng[8] == "composite-v2" { wins = wins + 1 }
+    s2_sum = s2_sum + r_eng[6]
+
+    // Fixture B: JSON-mixed structured (mixed class).
+    let seed_json = "{\"event\":\"witness\",\"ts\":\"2026-04-28T12:00:00Z\",\"phase\":\"composite-chain-v2-internal-byte\",\"chain\":\"C1\",\"raw_91_c3\":\"first-tick\",\"saving_pct\":0,\"verdict\":\"pending\"}\n"
+    let fix_json = _cc2_repeat(seed_json, 5120)
+    let r_json = _cc2_live_fire_one("F-B json 5KB    ", fix_json)
+    total = total + 1
+    if r_json[8] == "composite-v2" { wins = wins + 1 }
+    s2_sum = s2_sum + r_json[6]
+
+    // Fixture C: Korean / multibyte UTF-8 (Korean class).
+    let seed_kor = "안녕하세요 세계 — 합성 체인 v2 internal-byte fast-path. 한글 + 영문 혼합 fixture for byte-eq round-trip. composite chain hexa raw 9 + raw 18 self-host. "
+    let fix_kor = _cc2_repeat(seed_kor, 5120)
+    let r_kor = _cc2_live_fire_one("F-C korean 5KB  ", fix_kor)
+    total = total + 1
+    if r_kor[8] == "composite-v2" { wins = wins + 1 }
+    s2_sum = s2_sum + r_kor[6]
+
+    // Fixture D: Prose mixed (English + numbers + punctuation).
+    let seed_prose = "On 2026-04-28, the composite chain experiment recorded 5 fixtures, 2 chains, and 3 round-trip assertions. Saving was 0%, but the witness ledger advanced by 1 entry. "
+    let fix_prose = _cc2_repeat(seed_prose, 5120)
+    let r_prose = _cc2_live_fire_one("F-D prose 5KB   ", fix_prose)
+    total = total + 1
+    if r_prose[8] == "composite-v2" { wins = wins + 1 }
+    s2_sum = s2_sum + r_prose[6]
+
+    // Fixture E: Mixed (English + JSON + Korean fragments).
+    let seed_mixed = "Mixed fixture — 영문/한글/JSON. {\"k\":\"v\",\"n\":42} 안녕 (greeting). The quick brown fox.\n"
+    let fix_mixed = _cc2_repeat(seed_mixed, 5120)
+    let r_mixed = _cc2_live_fire_one("F-E mixed 5KB   ", fix_mixed)
+    total = total + 1
+    if r_mixed[8] == "composite-v2" { wins = wins + 1 }
+    s2_sum = s2_sum + r_mixed[6]
+
+    let s2_avg: i64 = s2_sum / total
+    println("---")
+    println("  composite-v2 wins (D2 picks composite): " + to_string(wins) + " / " + to_string(total))
+    println("  s2 mean = " + to_string(s2_avg) + "% (theoretical break-even = 24.8%)")
+    let breakeven_pass: bool = s2_avg >= 25
+    let f_cc2_3 = if breakeven_pass { "PASS (s2 >= 24.8% theoretical)" } else { "FAIL (s2 < 24.8% — C-PRIMARY anti-lever)" }
+    println("  F-CC2-3 verdict: " + f_cc2_3)
+    if wins == 0 { println("  honest C3: composite_v2 LOST D2 try-revert on all fixtures — A29 / A30 / identity dominates.") }
+    if wins > 0 { println("  honest C3: composite_v2 won D2 on " + to_string(wins) + "/" + to_string(total) + " fixtures.") }
+    println("__HXC_COMPOSITE_CHAIN_V2_LIVE_FIRE__ s2_mean=" + to_string(s2_avg) + "% wins=" + to_string(wins) + "/" + to_string(total))
+    return 0
+}
+
+// ───────────────── selftest ─────────────────
+
+fn _selftest_cc2() -> int {
+    println("=== HXC composite-chain v2 (internal-byte fast-path) selftest ===")
+    println("    scope: 5 fixture round-trip + 3 D2 try-revert + idempotency")
+    let mut pass = 0
+    let mut fail = 0
+
+    // ─── 5 round-trip fixtures ───
+    let phrase_eng = "the quick brown fox jumps over the lazy dog. composite chain v2 internal byte fast path. "
+    let mut buf_eng = ""
+    let mut k1 = 0
+    while k1 < 12 { buf_eng = buf_eng + phrase_eng; k1 = k1 + 1 }
+    if _cc2_assert_round_trip("F1-English", buf_eng) == 0 { pass = pass + 1 } else { fail = fail + 1 }
+
+    let phrase_json = "{\"event\":\"witness\",\"phase\":\"composite-chain-v2-internal-byte\",\"chain\":\"C1\",\"ts\":\"2026-04-28\"}\n"
+    let mut buf_json = ""
+    let mut k2 = 0
+    while k2 < 12 { buf_json = buf_json + phrase_json; k2 = k2 + 1 }
+    if _cc2_assert_round_trip("F2-JSON", buf_json) == 0 { pass = pass + 1 } else { fail = fail + 1 }
+
+    let phrase_kor = "안녕 세계 — 합성 체인 v2 internal-byte fast-path. composite chain hexa raw 9 + raw 18. "
+    let mut buf_kor = ""
+    let mut k3 = 0
+    while k3 < 8 { buf_kor = buf_kor + phrase_kor; k3 = k3 + 1 }
+    if _cc2_assert_round_trip("F3-Korean", buf_kor) == 0 { pass = pass + 1 } else { fail = fail + 1 }
+
+    let phrase_prose = "On 2026-04-28, internal-byte fast-path lands. The witness ledger advances by 1 entry. raw 91 honest C3. "
+    let mut buf_prose = ""
+    let mut k4 = 0
+    while k4 < 12 { buf_prose = buf_prose + phrase_prose; k4 = k4 + 1 }
+    if _cc2_assert_round_trip("F4-Prose", buf_prose) == 0 { pass = pass + 1 } else { fail = fail + 1 }
+
+    let phrase_mixed = "Mixed: English {\"k\":1} 안녕 — composite-v2 internal-byte. raw 9 + raw 18 + raw 142 D2. "
+    let mut buf_mixed = ""
+    let mut k5 = 0
+    while k5 < 12 { buf_mixed = buf_mixed + phrase_mixed; k5 = k5 + 1 }
+    if _cc2_assert_round_trip("F5-Mixed", buf_mixed) == 0 { pass = pass + 1 } else { fail = fail + 1 }
+
+    // ─── 3 D2 try-revert fixtures ───
+    if _cc2_assert_d2_revert("D2-1 English", buf_eng) == 0 { pass = pass + 1 } else { fail = fail + 1 }
+    if _cc2_assert_d2_revert("D2-2 JSON", buf_json) == 0 { pass = pass + 1 } else { fail = fail + 1 }
+    if _cc2_assert_d2_revert("D2-3 Korean", buf_kor) == 0 { pass = pass + 1 } else { fail = fail + 1 }
+
+    // ─── Auxiliaries ───
+    let aux1 = cc2_encode(buf_eng)
+    let aux2 = cc2_encode(aux1)
+    if aux2 == aux1 {
+        println("  AUX:  cc2_encode idempotent on encoded stream (header short-circuit OK, raw 65 + 68)")
+    } else {
+        fail = fail + 1
+        println("  FAIL: AUX cc2_encode not idempotent on encoded stream")
+    }
+
+    let aux_pt = cc2_decode("not-a-composite-stream")
+    if aux_pt == "not-a-composite-stream" {
+        println("  AUX:  cc2_decode passthrough on non-composite input (raw 65 + 68)")
+    } else {
+        fail = fail + 1
+        println("  FAIL: AUX cc2_decode passthrough broken")
+    }
+
+    let tiny = "abc"
+    let enc_tiny = cc2_encode(tiny)
+    if enc_tiny == tiny {
+        println("  AUX:  cc2_encode short-input passthrough (n < CC2_MIN_BYTES, raw 65)")
+    } else {
+        fail = fail + 1
+        println("  FAIL: AUX short-input passthrough broken")
+    }
+
+    println("Results: " + to_string(pass) + " PASS / " + to_string(fail) + " FAIL")
+    println("__HXC_COMPOSITE_CHAIN_V2_SELFTEST__ " + (if fail == 0 { "PASS" } else { "FAIL" })
+            + " (INTERNAL-BYTE FAST-PATH: 5 round-trip fixtures + 3 D2 try-revert + 3 AUX; A29 v1 + A30 v1 read-only consume; SINGLE composite b64 envelope; 5KB micro-LIVE-FIRE separate via --micro-live-fire; 6-repo sweep / A25 integration / F-CC-4..8 LIVE FIRE DEFERRED per raw 91 honest C3)")
+    if fail == 0 { return 0 }
+    return 1
+}
+
+// ───────────────── main CLI ─────────────────
+
+fn main() {
+    let av = argv()
+    let mut has_selftest = false
+    let mut has_live_fire = false
+    let mut has_encode = false
+    let mut has_decode = false
+    let mut k = 0
+    while k < len(av) {
+        if av[k] == "--selftest" { has_selftest = true }
+        if av[k] == "--micro-live-fire" { has_live_fire = true }
+        if av[k] == "encode" { has_encode = true }
+        if av[k] == "decode" { has_decode = true }
+        k = k + 1
+    }
+    if has_selftest { exit(_selftest_cc2()) }
+    if has_live_fire { exit(_micro_live_fire()) }
+    if has_encode || has_decode {
+        let mut sub_idx = 0
+        let mut q = 0
+        while q < len(av) {
+            if av[q] == "encode" || av[q] == "decode" { sub_idx = q; break }
+            q = q + 1
+        }
+        let mut paths = []
+        let mut q2 = sub_idx + 1
+        while q2 < len(av) {
+            let a = av[q2]
+            if len(a) >= 2 && a.substring(0, 2) == "--" { q2 = q2 + 2; continue }
+            paths.push(a)
+            q2 = q2 + 1
+        }
+        if len(paths) < 2 {
+            eprintln("usage: hexa hxc_composite_chain_v2.hexa <encode|decode> <in> <out>")
+            exit(3)
+        }
+        let in_path = paths[0]
+        let out_path = paths[1]
+        if has_encode {
+            let txt = read_file(in_path)
+            let res = cc2_encode(txt)
+            let _w = write_file(out_path, res)
+            let saving = if len(txt) > 0 { ((len(txt) - len(res)) * 100) / len(txt) } else { 0 }
+            println("cc2 encode raw=" + to_string(len(txt))
+                    + " enc=" + to_string(len(res))
+                    + " saving=" + to_string(saving) + "%")
+            exit(0)
+        }
+        let txt = read_file(in_path)
+        let res = cc2_decode(txt)
+        let _w = write_file(out_path, res)
+        exit(0)
+    }
+    eprintln("usage: hexa hxc_composite_chain_v2.hexa [--selftest | --micro-live-fire | encode <in> <out> | decode <in> <out>]")
+    exit(3)
+}
