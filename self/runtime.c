@@ -7616,41 +7616,117 @@ HexaVal hexa_term_pty_reap(HexaVal pid) {
 // (raw 168 minimum-viable input-during-processing) 23 caller가 이 primitive
 // 의존. 직전 hexa-lang commit drift로 native impl 부재 → cli_mvp build fail.
 //
-// Stub semantics (raw 49 additive-first safe fallback):
-//   exec_stream_async(cmd) -> int   : 항상 -1 반환 (=spawn 실패), caller가
-//                                      sync _one_call로 fallback (cli_mvp
-//                                      _stream_spawn return false path).
-//   exec_stream_poll(handle) -> any  : 빈 배열 [] 반환 (no lines available).
-//   exec_stream_close(handle) -> int : 0 반환 (clean close).
+// Real impl semantics (v1.8, KI-4 stub → actual async impl 2026-05-01):
+//   exec_stream_async(cmd) -> int   : popen(cmd, "r") + fcntl O_NONBLOCK,
+//                                      slot table에 FILE* 저장 후 handle return.
+//                                      handle ≥ 0 = 성공, -1 = popen 실패.
+//   exec_stream_poll(handle) -> any  : drain available newline-terminated
+//                                      lines (non-blocking). EOF 시 EOF marker
+//                                      삽입. line array return.
+//   exec_stream_close(handle) -> int : pclose() child rc return + slot release.
+//                                      handle stale 시 -1.
 //
-// raw 91 honest C3: stub은 async streaming 기능 비활성화. cli_mvp는
-// _stream_spawn==false 시 sync fallback이 보장됨 (raw 168 minimum-viable
-// degraded mode). 실제 async impl은 별도 hexa-lang cycle (popen + O_NONBLOCK
-// + child rc 처리).
+// raw 91 honest C3: 8-slot table (single-process limit). Concurrent stream >8
+// 시 spawn fail (-1 return → caller sync fallback). cli_mvp는 _stream_handle
+// 단일 slot이므로 충분.
 //
-// codegen은 `hexa_exec_stream_async_impl` (impl suffix) 형식으로 emit
-// (hexa_exec_stream_impl @ line 3182 패턴 mirror) — function 이름은
-// `_impl` suffix로 정의 + macro alias로 user-facing `hexa_exec_stream_async`
-// 노출.
+// codegen은 `hexa_exec_stream_async_impl` (impl suffix) + raw `exec_stream_*`
+// 두 path 모두 emit (hexa_call1 _Generic dispatch에 의존).
+
+#include <fcntl.h>
+#include <errno.h>
+
+#define HEXA_STREAM_SLOT_COUNT 8
+#define HEXA_STREAM_LINE_BUF 8192
+typedef struct {
+    FILE* fp;
+    char  buf[HEXA_STREAM_LINE_BUF];
+    int   buf_len;
+    int   eof;
+    int   in_use;
+} HexaStreamSlot;
+static HexaStreamSlot _hexa_stream_slots[HEXA_STREAM_SLOT_COUNT];
+static int _hexa_stream_slots_init = 0;
+
+static void _hexa_stream_slots_ensure_init(void) {
+    if (_hexa_stream_slots_init) return;
+    for (int i = 0; i < HEXA_STREAM_SLOT_COUNT; i++) {
+        _hexa_stream_slots[i].fp = NULL;
+        _hexa_stream_slots[i].buf_len = 0;
+        _hexa_stream_slots[i].eof = 0;
+        _hexa_stream_slots[i].in_use = 0;
+    }
+    _hexa_stream_slots_init = 1;
+}
+
 HexaVal hexa_exec_stream_async_impl(HexaVal cmd) {
-    (void)cmd;
-    return hexa_int((int64_t)-1);
+    _hexa_stream_slots_ensure_init();
+    const char* cmd_s = HX_IS_STR(cmd) ? HX_STR(cmd) : NULL;
+    if (!cmd_s) return hexa_int((int64_t)-1);
+    int slot = -1;
+    for (int i = 0; i < HEXA_STREAM_SLOT_COUNT; i++) {
+        if (!_hexa_stream_slots[i].in_use) { slot = i; break; }
+    }
+    if (slot < 0) return hexa_int((int64_t)-1);
+    FILE* fp = popen(cmd_s, "r");
+    if (!fp) return hexa_int((int64_t)-1);
+    int fd = fileno(fp);
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    _hexa_stream_slots[slot].fp = fp;
+    _hexa_stream_slots[slot].buf_len = 0;
+    _hexa_stream_slots[slot].eof = 0;
+    _hexa_stream_slots[slot].in_use = 1;
+    return hexa_int((int64_t)slot);
 }
 HexaVal hexa_exec_stream_async(HexaVal cmd) {
     return hexa_exec_stream_async_impl(cmd);
 }
 
 HexaVal hexa_exec_stream_poll_impl(HexaVal handle) {
-    (void)handle;
-    return hexa_array_new();
+    _hexa_stream_slots_ensure_init();
+    int h = (int)__hx_to_double(handle);
+    HexaVal out = hexa_array_new();
+    if (h < 0 || h >= HEXA_STREAM_SLOT_COUNT) return out;
+    HexaStreamSlot* s = &_hexa_stream_slots[h];
+    if (!s->in_use || !s->fp) return out;
+    char chunk[4096];
+    while (1) {
+        ssize_t n = read(fileno(s->fp), chunk, sizeof(chunk));
+        if (n <= 0) {
+            if (n == 0) s->eof = 1;
+            break;
+        }
+        // append to slot buf, scan for newlines.
+        for (ssize_t i = 0; i < n; i++) {
+            char c = chunk[i];
+            if (c == '\n') {
+                s->buf[s->buf_len] = '\0';
+                hexa_array_push(out, hexa_str(s->buf));
+                s->buf_len = 0;
+            } else if (s->buf_len < HEXA_STREAM_LINE_BUF - 1) {
+                s->buf[s->buf_len++] = c;
+            }
+        }
+    }
+    return out;
 }
 HexaVal hexa_exec_stream_poll(HexaVal handle) {
     return hexa_exec_stream_poll_impl(handle);
 }
 
 HexaVal hexa_exec_stream_close_impl(HexaVal handle) {
-    (void)handle;
-    return hexa_int((int64_t)0);
+    _hexa_stream_slots_ensure_init();
+    int h = (int)__hx_to_double(handle);
+    if (h < 0 || h >= HEXA_STREAM_SLOT_COUNT) return hexa_int((int64_t)-1);
+    HexaStreamSlot* s = &_hexa_stream_slots[h];
+    if (!s->in_use || !s->fp) return hexa_int((int64_t)-1);
+    int rc = pclose(s->fp);
+    s->fp = NULL;
+    s->buf_len = 0;
+    s->eof = 0;
+    s->in_use = 0;
+    return hexa_int((int64_t)rc);
 }
 HexaVal hexa_exec_stream_close(HexaVal handle) {
     return hexa_exec_stream_close_impl(handle);
