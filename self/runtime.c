@@ -579,7 +579,7 @@ static inline HexaVal hexa_call0(HexaVal f) {
     }
     return hexa_void();
 }
-static inline HexaVal hexa_call1(HexaVal f, HexaVal a1) {
+static inline HexaVal hexa_call1_hv(HexaVal f, HexaVal a1) {
     if (HX_IS_CLOSURE(f)) {
         HexaVal (*fp)(HexaVal, HexaVal) = (HexaVal(*)(HexaVal, HexaVal))HX_CLO_PTR(f);
         return fp(hexa_closure_env(f), a1);
@@ -590,6 +590,16 @@ static inline HexaVal hexa_call1(HexaVal f, HexaVal a1) {
     }
     return hexa_void();
 }
+// Raw C function-pointer overload (KI-4 fix 2026-05-01): codegen emits
+// `hexa_call1(exec_stream_async, cmd)` with raw symbol. _Generic dispatches
+// to the function-pointer path; HexaVal path keeps original lowering.
+static inline HexaVal __hexa_call1_fp1(HexaVal (*fp)(HexaVal), HexaVal a1) {
+    return fp(a1);
+}
+#define hexa_call1(f, a1) _Generic((f), \
+    HexaVal: hexa_call1_hv, \
+    HexaVal (*)(HexaVal): __hexa_call1_fp1, \
+    default: hexa_call1_hv)((f), (a1))
 static inline HexaVal hexa_call2(HexaVal f, HexaVal a1, HexaVal a2) {
     if (HX_IS_CLOSURE(f)) {
         HexaVal (*fp)(HexaVal, HexaVal, HexaVal) = (HexaVal(*)(HexaVal, HexaVal, HexaVal))HX_CLO_PTR(f);
@@ -7599,5 +7609,62 @@ HexaVal hexa_term_pty_reap(HexaVal pid) {
     hexa_array_push(arr, hexa_int((int64_t)r));
     hexa_array_push(arr, hexa_int((int64_t)st));
     return arr;
+}
+
+// ── exec_stream_async / poll / close stub primitives (KI-4 fix, 2026-05-01) ──
+// Origin: hive 7-bucket closure cycle KI-4 fix. cli_mvp.hexa async streaming
+// (raw 168 minimum-viable input-during-processing) 23 caller가 이 primitive
+// 의존. 직전 hexa-lang commit drift로 native impl 부재 → cli_mvp build fail.
+//
+// Stub semantics (raw 49 additive-first safe fallback):
+//   exec_stream_async(cmd) -> int   : 항상 -1 반환 (=spawn 실패), caller가
+//                                      sync _one_call로 fallback (cli_mvp
+//                                      _stream_spawn return false path).
+//   exec_stream_poll(handle) -> any  : 빈 배열 [] 반환 (no lines available).
+//   exec_stream_close(handle) -> int : 0 반환 (clean close).
+//
+// raw 91 honest C3: stub은 async streaming 기능 비활성화. cli_mvp는
+// _stream_spawn==false 시 sync fallback이 보장됨 (raw 168 minimum-viable
+// degraded mode). 실제 async impl은 별도 hexa-lang cycle (popen + O_NONBLOCK
+// + child rc 처리).
+//
+// codegen은 `hexa_exec_stream_async_impl` (impl suffix) 형식으로 emit
+// (hexa_exec_stream_impl @ line 3182 패턴 mirror) — function 이름은
+// `_impl` suffix로 정의 + macro alias로 user-facing `hexa_exec_stream_async`
+// 노출.
+HexaVal hexa_exec_stream_async_impl(HexaVal cmd) {
+    (void)cmd;
+    return hexa_int((int64_t)-1);
+}
+HexaVal hexa_exec_stream_async(HexaVal cmd) {
+    return hexa_exec_stream_async_impl(cmd);
+}
+
+HexaVal hexa_exec_stream_poll_impl(HexaVal handle) {
+    (void)handle;
+    return hexa_array_new();
+}
+HexaVal hexa_exec_stream_poll(HexaVal handle) {
+    return hexa_exec_stream_poll_impl(handle);
+}
+
+HexaVal hexa_exec_stream_close_impl(HexaVal handle) {
+    (void)handle;
+    return hexa_int((int64_t)0);
+}
+HexaVal hexa_exec_stream_close(HexaVal handle) {
+    return hexa_exec_stream_close_impl(handle);
+}
+
+// codegen이 raw symbol `exec_stream_*` 도 emit (hexa_call1 indirect 패턴) —
+// non-prefixed alias 함수도 추가 (hexa_ prefix 미사용 form).
+HexaVal exec_stream_async(HexaVal cmd) {
+    return hexa_exec_stream_async_impl(cmd);
+}
+HexaVal exec_stream_poll(HexaVal handle) {
+    return hexa_exec_stream_poll_impl(handle);
+}
+HexaVal exec_stream_close(HexaVal handle) {
+    return hexa_exec_stream_close_impl(handle);
 }
 
