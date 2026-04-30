@@ -7623,12 +7623,21 @@ HexaVal hexa_term_pty_reap(HexaVal pid) {
 //   exec_stream_poll(handle) -> any  : drain available newline-terminated
 //                                      lines (non-blocking). EOF 시 EOF marker
 //                                      삽입. line array return.
-//   exec_stream_close(handle) -> int : pclose() child rc return + slot release.
-//                                      handle stale 시 -1.
+//   exec_stream_close(handle) -> int : pclose() rc → WIFEXITED + WEXITSTATUS
+//                                      decode (signal exit 시 -signal). slot
+//                                      release. handle stale 시 -1.
+//
+// v1.1 enhancements (2026-05-01):
+//   - Dynamic line buffer: 8KB initial → realloc doubling up to 1MB cap (raw
+//     49 additive-first growth). raw 12 silent-error-ban 정합 (long line
+//     truncate 회피; 단 1MB cap 도달 시 silent drop 잔존 — raw 91 honest C3).
+//   - pclose rc proper decode: WIFEXITED → WEXITSTATUS, WIFSIGNALED →
+//     -WTERMSIG. Caller가 표준 exit code 패턴 (`if rc == 0`) 사용 가능.
 //
 // raw 91 honest C3: 8-slot table (single-process limit). Concurrent stream >8
 // 시 spawn fail (-1 return → caller sync fallback). cli_mvp는 _stream_handle
-// 단일 slot이므로 충분.
+// 단일 slot이므로 충분. realloc fail / 1MB cap hit 시 silent drop — v1.2에서
+// stderr advisory 추가 예정.
 //
 // codegen은 `hexa_exec_stream_async_impl` (impl suffix) + raw `exec_stream_*`
 // 두 path 모두 emit (hexa_call1 _Generic dispatch에 의존).
@@ -7637,11 +7646,13 @@ HexaVal hexa_term_pty_reap(HexaVal pid) {
 #include <errno.h>
 
 #define HEXA_STREAM_SLOT_COUNT 8
-#define HEXA_STREAM_LINE_BUF 8192
+#define HEXA_STREAM_LINE_BUF_INITIAL 8192
+#define HEXA_STREAM_LINE_BUF_MAX 1048576  /* 1MB cap (raw 49 additive-first growth) */
 typedef struct {
     FILE* fp;
-    char  buf[HEXA_STREAM_LINE_BUF];
-    int   buf_len;
+    char* buf;          /* dynamic alloc (v1.1 raw 12 long-line truncate 회피) */
+    int   buf_cap;      /* current capacity */
+    int   buf_len;      /* current length */
     int   eof;
     int   in_use;
 } HexaStreamSlot;
@@ -7652,6 +7663,9 @@ static void _hexa_stream_slots_ensure_init(void) {
     if (_hexa_stream_slots_init) return;
     for (int i = 0; i < HEXA_STREAM_SLOT_COUNT; i++) {
         _hexa_stream_slots[i].fp = NULL;
+        _hexa_stream_slots[i].buf = (char*)malloc(HEXA_STREAM_LINE_BUF_INITIAL);
+        _hexa_stream_slots[i].buf_cap = _hexa_stream_slots[i].buf
+                                          ? HEXA_STREAM_LINE_BUF_INITIAL : 0;
         _hexa_stream_slots[i].buf_len = 0;
         _hexa_stream_slots[i].eof = 0;
         _hexa_stream_slots[i].in_use = 0;
@@ -7668,6 +7682,12 @@ HexaVal hexa_exec_stream_async_impl(HexaVal cmd) {
         if (!_hexa_stream_slots[i].in_use) { slot = i; break; }
     }
     if (slot < 0) return hexa_int((int64_t)-1);
+    /* v1.1 defensive: ensure_init malloc failure 시 lazy retry */
+    if (!_hexa_stream_slots[slot].buf) {
+        _hexa_stream_slots[slot].buf = (char*)malloc(HEXA_STREAM_LINE_BUF_INITIAL);
+        if (!_hexa_stream_slots[slot].buf) return hexa_int((int64_t)-1);
+        _hexa_stream_slots[slot].buf_cap = HEXA_STREAM_LINE_BUF_INITIAL;
+    }
     FILE* fp = popen(cmd_s, "r");
     if (!fp) return hexa_int((int64_t)-1);
     int fd = fileno(fp);
@@ -7683,32 +7703,114 @@ HexaVal hexa_exec_stream_async(HexaVal cmd) {
     return hexa_exec_stream_async_impl(cmd);
 }
 
+/* v1.2 (KI-5 RESOLVED, 2026-05-01) — per-call [done_int, line_str] protocol.
+ *
+ * Prior contract (v1.0/1.1): array-of-lines [line1, line2, ...] drained
+ *   in one call. cli_mvp _stream_drain expected per-call [done, line]
+ *   tuple → semantic mismatch → TUI 첫 chat 입력 시 crash (KI-5).
+ *
+ * New contract: each call extracts AT MOST one complete line.
+ *   Returns: [done_int, line_str]
+ *     done_int == 1 → stream EOF + buf drained (caller should close).
+ *     done_int == 0 + line_str non-empty → one line ready, more may follow.
+ *     done_int == 0 + line_str empty → EAGAIN (no data yet, not EOF).
+ *   EOF with trailing partial buf (no final \n): emit buf as final line
+ *   on this call (done_int=0), then [1, ""] on next call.
+ *
+ * cli_mvp expectation (cli_mvp.hexa _stream_drain line 4703-4732):
+ *   let r = exec_stream_poll(_stream_handle)
+ *   let done = r[0]                 // bool/int 1=stream-finished
+ *   let line = to_string(r[1])      // single complete line OR ""
+ *   if len(line) > 0 { dispatch_line(line); ... }
+ *   if done { return 1 }            // _stream_finish triggers
+ *   if len(line) == 0 { return 0 }  // EAGAIN — wait next tick
+ *
+ * raw 91 honest C3: per-call drain ≤1 line. cli_mvp loops up to 64 times
+ * per tick → 64 lines/tick max throughput. SSE typical throughput well
+ * within bounds. raw 168 minimum-viable.
+ */
 HexaVal hexa_exec_stream_poll_impl(HexaVal handle) {
     _hexa_stream_slots_ensure_init();
     int h = (int)__hx_to_double(handle);
     HexaVal out = hexa_array_new();
-    if (h < 0 || h >= HEXA_STREAM_SLOT_COUNT) return out;
+    if (h < 0 || h >= HEXA_STREAM_SLOT_COUNT) {
+        hexa_array_push(out, hexa_int((int64_t)1));
+        hexa_array_push(out, hexa_str(""));
+        return out;
+    }
     HexaStreamSlot* s = &_hexa_stream_slots[h];
-    if (!s->in_use || !s->fp) return out;
-    char chunk[4096];
-    while (1) {
+    if (!s->in_use || !s->fp) {
+        hexa_array_push(out, hexa_int((int64_t)1));
+        hexa_array_push(out, hexa_str(""));
+        return out;
+    }
+    /* Step 1: scan current buf for first newline. */
+    int nl_pos = -1;
+    for (int i = 0; i < s->buf_len; i++) {
+        if (s->buf[i] == '\n') { nl_pos = i; break; }
+    }
+    /* Step 2: if no newline yet AND not EOF, try one non-blocking read.
+       Append bytes; rescan only newly-appended region for first newline. */
+    if (nl_pos < 0 && !s->eof) {
+        char chunk[4096];
         ssize_t n = read(fileno(s->fp), chunk, sizeof(chunk));
-        if (n <= 0) {
-            if (n == 0) s->eof = 1;
-            break;
-        }
-        // append to slot buf, scan for newlines.
-        for (ssize_t i = 0; i < n; i++) {
-            char c = chunk[i];
-            if (c == '\n') {
-                s->buf[s->buf_len] = '\0';
-                hexa_array_push(out, hexa_str(s->buf));
-                s->buf_len = 0;
-            } else if (s->buf_len < HEXA_STREAM_LINE_BUF - 1) {
-                s->buf[s->buf_len++] = c;
+        if (n == 0) {
+            s->eof = 1;
+        } else if (n > 0) {
+            int start = s->buf_len;
+            for (ssize_t i = 0; i < n; i++) {
+                char c = chunk[i];
+                if (s->buf_len < s->buf_cap - 1) {
+                    s->buf[s->buf_len++] = c;
+                } else if (s->buf_cap < HEXA_STREAM_LINE_BUF_MAX) {
+                    int new_cap = s->buf_cap * 2;
+                    if (new_cap > HEXA_STREAM_LINE_BUF_MAX) new_cap = HEXA_STREAM_LINE_BUF_MAX;
+                    char* new_buf = (char*)realloc(s->buf, new_cap);
+                    if (new_buf) {
+                        s->buf = new_buf;
+                        s->buf_cap = new_cap;
+                        s->buf[s->buf_len++] = c;
+                    }
+                    /* realloc fail / 1MB cap hit 시 silent drop. raw 91 honest C3. */
+                }
+            }
+            /* Rescan from `start` (newly-appended region) for first newline. */
+            for (int i = start; i < s->buf_len; i++) {
+                if (s->buf[i] == '\n') { nl_pos = i; break; }
             }
         }
+        /* n < 0 (EAGAIN) → fall through with nl_pos == -1, eof unchanged. */
     }
+    /* Step 3: newline found → extract first line, shift buf. */
+    if (nl_pos >= 0) {
+        s->buf[nl_pos] = '\0';
+        HexaVal line_v = hexa_str(s->buf);
+        int rem = s->buf_len - nl_pos - 1;
+        if (rem > 0) memmove(s->buf, s->buf + nl_pos + 1, rem);
+        s->buf_len = rem;
+        hexa_array_push(out, hexa_int((int64_t)0));
+        hexa_array_push(out, line_v);
+        return out;
+    }
+    /* Step 4: no newline. Handle EOF. */
+    if (s->eof) {
+        if (s->buf_len > 0) {
+            /* EOF + trailing partial buf (no final \n) — emit as final line. */
+            s->buf[s->buf_len] = '\0';
+            HexaVal line_v = hexa_str(s->buf);
+            s->buf_len = 0;
+            hexa_array_push(out, hexa_int((int64_t)0));
+            hexa_array_push(out, line_v);
+            return out;
+        }
+        /* Truly done. */
+        hexa_array_push(out, hexa_int((int64_t)1));
+        hexa_array_push(out, hexa_str(""));
+        return out;
+    }
+    /* Step 5: EAGAIN. */
+    hexa_array_push(out, hexa_int((int64_t)0));
+    hexa_array_push(out, hexa_str(""));
     return out;
 }
 HexaVal hexa_exec_stream_poll(HexaVal handle) {
@@ -7721,12 +7823,25 @@ HexaVal hexa_exec_stream_close_impl(HexaVal handle) {
     if (h < 0 || h >= HEXA_STREAM_SLOT_COUNT) return hexa_int((int64_t)-1);
     HexaStreamSlot* s = &_hexa_stream_slots[h];
     if (!s->in_use || !s->fp) return hexa_int((int64_t)-1);
-    int rc = pclose(s->fp);
+    int raw_rc = pclose(s->fp);
+    /* v1.1 WIFEXITED + WEXITSTATUS proper rc decode (raw 91 honest C3 — caller가
+       표준 exit code 패턴 사용 가능). Signal exit 시 negative signal 반환. */
+    int proper_rc;
+    if (raw_rc == -1) {
+        proper_rc = -1;  /* pclose itself failed */
+    } else if (WIFEXITED(raw_rc)) {
+        proper_rc = WEXITSTATUS(raw_rc);
+    } else if (WIFSIGNALED(raw_rc)) {
+        proper_rc = -WTERMSIG(raw_rc);
+    } else {
+        proper_rc = -1;
+    }
     s->fp = NULL;
     s->buf_len = 0;
     s->eof = 0;
     s->in_use = 0;
-    return hexa_int((int64_t)rc);
+    /* Note: s->buf 보존 (재사용 위해 free 안 함; 다음 spawn 시 재초기화). */
+    return hexa_int((int64_t)proper_rc);
 }
 HexaVal hexa_exec_stream_close(HexaVal handle) {
     return hexa_exec_stream_close_impl(handle);
