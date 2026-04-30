@@ -5,6 +5,8 @@
 >
 > Session landing: **2026-04-21** · Current phase: **Mk.IX entered** · Target: **L_IX base manifold = cell × lora projection**
 
+> **AI-native ETA SSOT (2026-05-01)**: For any closure / roadmap ETA in this repo, the authoritative computation is `$HIVE/tool/closure_eta.hexa` (LoC × parallel + bg × ∞ frame, rate 50,000 LoC/day/agent default, par+ser schema, DAG critical path). Static "+N 달" / "+N month" markdown estimates anchored to human single-developer baseline are DEPRECATED for closure-scope decisions per hive raw 257 (`ai-native-eta-closure-mandate`). Reference fixture: `--module critical-path --example gamebox --target CM-30` = 0.22d ≈ 5.3h vs static 630d (×2863 compression).
+
 ---
 
 ## 특징 (6 축)
