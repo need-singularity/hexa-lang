@@ -182,7 +182,7 @@ exec-rule: "SUB progress 는 MAIN phase 로만 흡수, 단독 commit 금지"
 - **pending**: Mk.VIII L_edu fixpoint · Mk.X atoms ossified (novelty yield ≥3/10) · C5 N=10 recursion · meta-lens M fire (Pearson≥0.6) · Mk.XI twin-engine nexus↔anima · 7대난제 framework (raw#24 + own 4) · self-host P7-7/8/9 (roadmap 12/13/14)
 
 ### Self-host (runtime.c + Rust driver 탈피) — 신규 (anima hxa-20260423-003, 2026-04-23)
-Parent roadmap **64** → 5 children **65–69**. 상세 정의 `.roadmap` 64–69, 원문 `/Users/ghost/core/anima/docs/upstream_notes/hexa_lang_full_selfhost_prompt_20260423.md`.
+Parent roadmap **64** → 5 children **65–69**. 상세 정의 `.roadmap` 64–69, 원문 `$ANIMA/docs/upstream_notes/hexa_lang_full_selfhost_prompt_20260423.md`.
 - **65 (M3, P1/Q2)** — argv[0] 중복 삽입 정책 고정 (anima 최우선). `hexa_set_args` duplicate 제거 + `args()` / `script_path()` 계약 분리.
 - **66 (M4, P1/Q2)** — string method codegen 완성 + **binary rebuild 파이프라인 Phase C.2 symbol namespacing** (현재 블로커: `hexa cc --regen` merge 시 `__hexa_strlit_init` per-module 충돌로 Mac `hexa_v2` 재빌드 불가 → 소스는 고쳤는데 바이너리 미반영).
 - **67 (M5, P1/Q3)** — self-hosted `hexa_driver.hexa` (Rust 삭제, Linux/Mac/arm64 동일 CLI, `hexa run` 공식 서브커맨드).
