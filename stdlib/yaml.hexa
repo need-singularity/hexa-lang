@@ -1,0 +1,221 @@
+// HEXA Standard Library — yaml
+//
+// Phase α (Friction 0) — AI-native module landed 2026-05-02.
+//
+// Purpose: parse YAML frontmatter blocks at the head of `.ai.md` documents
+// (raw 271 README.ai.md convention) and any flat YAML key:value text. This
+// is *not* a full YAML implementation — see Caveats. It is the minimum
+// surface needed to:
+//   (a) extract a `--- ... ---` frontmatter block from a document body,
+//   (b) parse it into a flat `key -> str` map,
+//   (c) validate the presence of a required-key set,
+//   (d) read individual values with default fallback.
+//
+// Sister-repo unblock: anima/anima-eeg/airgenome/etc. each ship multiple
+// `.ai.md` docs with frontmatter; today every consumer either ignores it
+// or hand-rolls a regex/line-scan helper. This stdlib centralizes the
+// parser so AI agents (and lint tools) can rely on identical semantics.
+//
+// raw 9 hexa-only — no python/awk delegation. Pure stdlib.
+//
+// API:
+//   yaml_frontmatter_extract(text)       -> str   // body between --- markers, "" if absent
+//   yaml_parse_flat(text)                -> map   // key -> str (numeric/bool stay as strings)
+//   yaml_get(m, key, default_)           -> str   // safe lookup with default
+//   yaml_validate_keys(m, required)      -> [str] // missing keys ([] = OK)
+//   yaml_strip_frontmatter(text)         -> str   // body with frontmatter removed (post-parse use)
+//
+// Limits (raw#10):
+//   1. Nested YAML rejected. Lines indented past `key:` collapse to the
+//      raw remainder string of the parent key — value is `""` for nested
+//      maps. Caller must treat such keys as opaque blobs.
+//   2. Quoted strings: leading+trailing `"` and `'` stripped if balanced;
+//      no escape handling (\n, \t literal kept).
+//   3. Comments: line starting with `#` ignored. Inline ` # comment` NOT
+//      stripped (would break URLs containing `#`).
+//   4. Multi-document YAML (`---` between docs) NOT supported — first
+//      `---...---` block treated as frontmatter, remainder as body.
+//   5. Anchors / aliases / tags (`&a`, `*a`, `!type`) ignored verbatim.
+//   6. Empty key (line is `: value`) silently dropped.
+
+// ── frontmatter extract ─────────────────────────────────────────────────────
+
+// Extract the YAML frontmatter block from text. Returns the content between
+// the leading `---` and the matching closing `---` (exclusive of markers).
+// Returns "" if no frontmatter exists. Frontmatter must start at offset 0
+// (modulo BOM / leading blank lines), per raw 271 convention.
+pub fn yaml_frontmatter_extract(text: string) -> string {
+    if len(text) == 0 { return "" }
+    let lines = text.split("\n")
+    let n = len(lines)
+    if n < 2 { return "" }
+
+    // First non-blank line must be exactly `---`.
+    let mut i = 0
+    while i < n && lines[i].trim() == "" {
+        i = i + 1
+    }
+    if i >= n { return "" }
+    if lines[i].trim() != "---" { return "" }
+
+    // Walk forward to closing `---`.
+    let start = i + 1
+    let mut j = start
+    while j < n {
+        if lines[j].trim() == "---" {
+            // join lines[start..j] with newline
+            let mut out = ""
+            let mut k = start
+            while k < j {
+                if k > start { out = out + "\n" }
+                out = out + lines[k]
+                k = k + 1
+            }
+            return out
+        }
+        j = j + 1
+    }
+    // No closing marker — treat as no frontmatter (defensive).
+    return ""
+}
+
+// Strip the frontmatter block from text, returning the body. If no
+// frontmatter is present, returns text unchanged.
+pub fn yaml_strip_frontmatter(text: string) -> string {
+    if len(text) == 0 { return "" }
+    let lines = text.split("\n")
+    let n = len(lines)
+    if n < 2 { return text }
+
+    let mut i = 0
+    while i < n && lines[i].trim() == "" {
+        i = i + 1
+    }
+    if i >= n { return text }
+    if lines[i].trim() != "---" { return text }
+
+    let mut j = i + 1
+    while j < n {
+        if lines[j].trim() == "---" {
+            // body = lines[j+1..n]
+            let mut out = ""
+            let mut k = j + 1
+            while k < n {
+                if k > j + 1 { out = out + "\n" }
+                out = out + lines[k]
+                k = k + 1
+            }
+            return out
+        }
+        j = j + 1
+    }
+    return text
+}
+
+// ── flat parser ─────────────────────────────────────────────────────────────
+
+// Internal: strip balanced wrapping quotes from a value string.
+// "abc" → abc;  'abc' → abc;  abc → abc;  "ab → "ab (unbalanced kept).
+fn _yaml_unquote(v: string) -> string {
+    let s = v.trim()
+    let n = len(s)
+    if n < 2 { return s }
+    let head = s.substring(0, 1)
+    let tail = s.substring(n - 1, n)
+    if head == "\"" && tail == "\"" {
+        return s.substring(1, n - 1)
+    }
+    if head == "'" && tail == "'" {
+        return s.substring(1, n - 1)
+    }
+    return s
+}
+
+// Parse a flat YAML text (no nesting) into a `key -> string` map.
+// Lines that begin with whitespace + `-` (list items) are dropped; nested
+// children of a parent key are dropped (parent value becomes "" by the
+// time we reach the next top-level key). See raw#10 limit (1).
+pub fn yaml_parse_flat(text: string) -> map {
+    let result = #{}
+    if len(text) == 0 { return result }
+    let lines = text.split("\n")
+    let n = len(lines)
+    let mut i = 0
+    while i < n {
+        let raw_line = lines[i]
+        let line = raw_line.trim()
+        i = i + 1
+        if len(line) == 0 { continue }
+        // Comment line.
+        if line.substring(0, 1) == "#" { continue }
+        // Document marker.
+        if line == "---" || line == "..." { continue }
+        // List item — dropped (flat parser).
+        if line.substring(0, 1) == "-" { continue }
+
+        // Indented child line — only top-level keys are flat-parsed.
+        // raw_line begins with whitespace? skip (treat as nested under
+        // most-recent top-level key, which we drop per raw#10 limit 1).
+        let first_char = raw_line.substring(0, 1)
+        if first_char == " " || first_char == "\t" {
+            continue
+        }
+
+        // Parse `key: value` (first colon splits).
+        let mut colon_at = -1
+        let mut p = 0
+        while p < len(line) {
+            if line.substring(p, p + 1) == ":" {
+                colon_at = p
+                break
+            }
+            p = p + 1
+        }
+        if colon_at < 0 { continue }
+        let key = line.substring(0, colon_at).trim()
+        if len(key) == 0 { continue }
+        let val_part = if colon_at + 1 < len(line) {
+            line.substring(colon_at + 1, len(line)).trim()
+        } else {
+            ""
+        }
+        let value = _yaml_unquote(val_part)
+        result[key] = value
+    }
+    return result
+}
+
+// ── lookup helpers ──────────────────────────────────────────────────────────
+
+// Safe key lookup. If missing or non-string, returns default_.
+pub fn yaml_get(m: map, key: string, default_: string) -> string {
+    if type_of(m) != "map" { return default_ }
+    if !has_key(m, key) { return default_ }
+    let v = m[key]
+    if type_of(v) == "void" { return default_ }
+    return to_string(v)
+}
+
+// Validate a list of required keys against a parsed map.
+// Returns the list of *missing* keys — empty array means all present.
+pub fn yaml_validate_keys(m: map, required: [string]) -> [string] {
+    let mut missing = []
+    if type_of(m) != "map" {
+        // Everything missing.
+        let mut i = 0
+        while i < len(required) {
+            missing.push(required[i])
+            i = i + 1
+        }
+        return missing
+    }
+    let mut i = 0
+    while i < len(required) {
+        let k = required[i]
+        if !has_key(m, k) {
+            missing.push(k)
+        }
+        i = i + 1
+    }
+    return missing
+}
