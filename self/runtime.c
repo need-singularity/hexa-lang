@@ -17,6 +17,9 @@
 #include <sys/wait.h>
 #if defined(__APPLE__)
 #include <execinfo.h>
+#include <mach/mach.h>
+#include <mach/task.h>
+#include <mach/task_info.h>
 #endif
 
 // Force line-buffered stdout when redirected to file/pipe.
@@ -24,6 +27,89 @@ __attribute__((constructor))
 static void _hexa_init_stdio(void) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     setvbuf(stderr, NULL, _IOLBF, 0);
+}
+
+// ═══════════════════════════════════════════════════════════
+//  RSS soft cap — runtime guard against runaway memory
+// ═══════════════════════════════════════════════════════════
+//
+// Background: macOS rejects setrlimit(RLIMIT_AS|DATA|RSS,...) with EINVAL,
+// so the only effective in-process cap is polling self-RSS via task_info()
+// (Darwin) or /proc/self/statm (Linux). When exceeded, we exit(77) with a
+// clear stderr trailer instead of letting the process grow until jetsam
+// SIGKILL or system swap pressure.
+//
+// Tick model: hot paths (hexa_arena_alloc / hexa_array_push / hexa_strbuf_alloc)
+// call _hx_mem_tick(). Internally a counter modulo (every 2^16 calls) decides
+// whether to actually syscall. Per-call overhead ≈ 1 increment + 1 mask + 1
+// branch; the syscall is amortized to ~once per tens of MB of allocation.
+//
+// Defaults & overrides:
+//   HEXA_MEM_UNLIMITED=1           → cap disabled
+//   HEXA_MEM_CAP_MB=<N>            → cap to N MB (must be >0)
+//   default                        → 2048 MB
+//
+// CLI flags (parsed by the hexa wrapper script, exported as env above):
+//   --mem-unlimited                → HEXA_MEM_UNLIMITED=1
+//   --mem-cap=<N>                  → HEXA_MEM_CAP_MB=<N>
+
+static size_t _hx_mem_cap_bytes = 2048ull * 1024ull * 1024ull;  // 2 GB default
+static int    _hx_mem_cap_disabled = 0;
+static volatile uint64_t _hx_mem_tick_ctr = 0;
+
+__attribute__((constructor))
+static void _hexa_init_mem_cap(void) {
+    const char* unl = getenv("HEXA_MEM_UNLIMITED");
+    if (unl && unl[0] == '1' && unl[1] == '\0') {
+        _hx_mem_cap_disabled = 1;
+        return;
+    }
+    const char* cap = getenv("HEXA_MEM_CAP_MB");
+    if (cap && cap[0] != '\0') {
+        long long mb = atoll(cap);
+        if (mb > 0) _hx_mem_cap_bytes = (size_t)mb * 1024ull * 1024ull;
+    }
+}
+
+static size_t _hx_self_rss_bytes(void) {
+#if defined(__APPLE__)
+    mach_task_basic_info_data_t info;
+    mach_msg_type_number_t cnt = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+                  (task_info_t)&info, &cnt) != KERN_SUCCESS) return 0;
+    return (size_t)info.resident_size;
+#elif defined(__linux__)
+    FILE* f = fopen("/proc/self/statm", "r");
+    if (!f) return 0;
+    long pages_total = 0, pages_rss = 0;
+    if (fscanf(f, "%ld %ld", &pages_total, &pages_rss) != 2) {
+        fclose(f); return 0;
+    }
+    fclose(f);
+    long ps = sysconf(_SC_PAGESIZE);
+    if (ps <= 0) ps = 4096;
+    return (size_t)pages_rss * (size_t)ps;
+#else
+    return 0;
+#endif
+}
+
+__attribute__((noinline))
+static void _hx_mem_cap_fire(size_t rss) {
+    fprintf(stderr,
+        "[hexa-runtime] memory cap exceeded: rss=%zuMB > cap=%zuMB\n"
+        "[hexa-runtime] hint: re-run with --mem-unlimited "
+        "(or HEXA_MEM_UNLIMITED=1) to disable, or --mem-cap=<MB> to raise.\n",
+        (size_t)(rss / (1024ull*1024ull)),
+        (size_t)(_hx_mem_cap_bytes / (1024ull*1024ull)));
+    exit(77);
+}
+
+static inline void _hx_mem_tick(void) {
+    if (_hx_mem_cap_disabled) return;
+    if ((++_hx_mem_tick_ctr & 0xFFFFu) != 0) return;
+    size_t rss = _hx_self_rss_bytes();
+    if (rss > _hx_mem_cap_bytes) _hx_mem_cap_fire(rss);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -124,6 +210,7 @@ typedef struct {
 // (data - sizeof(HexaStrHdr)). data[len] is pre-NUL-terminated so
 // callers can fill bytes 0..len-1 and immediately treat as C string.
 static inline char* hexa_strbuf_alloc(size_t len) {
+    _hx_mem_tick();
     HexaStrHdr* hdr = (HexaStrHdr*)malloc(sizeof(HexaStrHdr) + len + 1);
     if (!hdr) return NULL;
     hdr->magic = HEXA_STR_MAGIC;
@@ -1098,6 +1185,7 @@ HexaVal hexa_array_reserve(HexaVal arr, int n) {
 // to heap with malloc+memcpy — the arena region cannot be realloc'd. Negative
 // `cap` encodes from_arena; abs(cap) is the real capacity.
 HexaVal hexa_array_push(HexaVal arr, HexaVal item) {
+    _hx_mem_tick();
     if (_hx_stats_on()) _hx_stats_array_push++;
     int real_cap = HX_ARR_CAP(arr) < 0 ? -HX_ARR_CAP(arr) : HX_ARR_CAP(arr);
     if (HX_ARR_LEN(arr) >= real_cap) {
@@ -2235,6 +2323,7 @@ static HexaArenaBlock* hexa_arena_new_block(size_t min_cap) {
 // Public so future FFI consumers (env_push/pop_scope, parser temporaries)
 // can opt in. Thread-safety: single-threaded runtime; no locks needed.
 void* hexa_arena_alloc(size_t n) {
+    _hx_mem_tick();
     // Round up to 8-byte alignment so we can safely return the pointer to
     // any caller that may store it where alignment matters.
     n = (n + 7u) & ~(size_t)7u;
