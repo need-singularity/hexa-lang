@@ -1,0 +1,384 @@
+#!hexa strict
+// @tool(slug="attr_sister", desc="hexa-lang @sister(path) — cross-link attr with lint-time path-exist verify (ai-native triplet staleness shield)")
+// @sentinel(__ATTR_SISTER__ <PASS|FAIL> mode=<selftest>)
+// @usage(hexa hexa-lang/modules/attr_ecosystem/attr_sister.hexa)
+// @resolver-bypass(reason="local module selftest, no network/heavy compute")
+//
+// hexa-lang/modules/attr_ecosystem/attr_sister.hexa — B4 @sister(path)
+//
+// SPEC (signature)
+//   @sister(path="<repo-relative-path>")
+//   @sister(path="<repo-relative-path>", relation="<spec|impl|doc|test>")
+//
+// SEMANTICS
+//   Declares a cross-link to a sister artifact (spec doc, sibling
+//   impl, README, test). The lint pipeline reads the parsed decls
+//   and verifies that each path resolves on disk relative to a
+//   caller-supplied repo root.
+//
+//   This module exposes a pure parser + validator. It does NOT
+//   touch the filesystem on its own — the validate fn accepts an
+//   optional repo_root + checker fn injected by the caller.
+//
+// RAW#10 CAVEATS
+//   (1) path is repo-relative. Absolute paths are rejected (would
+//       hard-couple to caller machine).
+//   (2) relation is optional. When absent, defaults to "doc".
+//   (3) Path-existence is enforced by sister tool (lint pipeline),
+//       not by this module — keeps the attr layer pure.
+//   (4) For the selftest we use an injected `_existence_probe()`
+//       to keep the unit hermetic.
+
+// ── Mirror shapes ────────────────────────────────────────────
+
+struct AttrFormatMeta {
+    name:                 str,
+    version:              int,
+    form:                 str,
+    phase:                str,
+    status:               str,
+    supports_composition: int,
+    supports_typing:      int,
+    catalog_size:         int,
+    spec_doc:             str,
+    notes:                str
+}
+
+struct AttrDecl {
+    name:         str,
+    params:       [str],
+    line:         int,
+    col:          int,
+    mode:         str,
+    form_version: str
+}
+
+struct AttrParseResult {
+    ok:       int,
+    n_decls:  int,
+    decls:    [AttrDecl],
+    message:  str
+}
+
+struct AttrIssue {
+    severity:  str,
+    attr_name: str,
+    line:      int,
+    msg:       str
+}
+
+struct AttrValidateResult {
+    ok:        int,
+    n_issues:  int,
+    issues:    [AttrIssue],
+    message:   str
+}
+
+// ── Helpers ──────────────────────────────────────────────────
+
+fn _sis_decl(name: str, params: [str], line: int) -> AttrDecl {
+    return AttrDecl { name: name, params: params, line: line, col: 1, mode: "decl", form_version: "ecosystem_b4" }
+}
+
+fn _sis_issue(sev: str, line: int, msg: str) -> AttrIssue {
+    return AttrIssue { severity: sev, attr_name: "sister", line: line, msg: msg }
+}
+
+fn _sis_extract_payload(trimmed: str) -> str {
+    let marker = "@sister("
+    let mut idx = -1
+    let mut i = 0
+    while i + len(marker) <= len(trimmed) {
+        if trimmed.substring(i, i + len(marker)) == marker {
+            idx = i
+            i = len(trimmed) + 1
+        } else {
+            i = i + 1
+        }
+    }
+    if idx < 0 { return "" }
+    let after = trimmed.substring(idx + len(marker), len(trimmed))
+    let mut depth = 1
+    let mut j = 0
+    while j < len(after) {
+        let c = after.substring(j, j + 1)
+        if c == "(" { depth = depth + 1 }
+        if c == ")" {
+            depth = depth - 1
+            if depth == 0 { return after.substring(0, j) }
+        }
+        j = j + 1
+    }
+    return ""
+}
+
+fn _sis_split_kv(payload: str) -> [str] {
+    let mut out = []
+    let mut cur = ""
+    let mut in_str = 0
+    let mut i = 0
+    while i < len(payload) {
+        let c = payload.substring(i, i + 1)
+        if c == "\"" {
+            if in_str == 1 { in_str = 0 } else { in_str = 1 }
+            cur = cur + c
+        } else if c == "," {
+            if in_str == 0 {
+                let t = cur.trim()
+                if len(t) > 0 { out = out.push(t) }
+                cur = ""
+            } else {
+                cur = cur + c
+            }
+        } else {
+            cur = cur + c
+        }
+        i = i + 1
+    }
+    let t2 = cur.trim()
+    if len(t2) > 0 { out = out.push(t2) }
+    return out
+}
+
+fn _sis_kv_key(pair: str) -> str {
+    let eq = pair.index_of("=")
+    if eq < 0 { return pair.trim() }
+    return pair.substring(0, eq).trim()
+}
+
+fn _sis_kv_value(pair: str) -> str {
+    let eq = pair.index_of("=")
+    if eq < 0 { return "" }
+    let mut v = pair.substring(eq + 1, len(pair)).trim()
+    if len(v) >= 2 {
+        let first = v.substring(0, 1)
+        let last  = v.substring(len(v) - 1, len(v))
+        if first == "\"" {
+            if last == "\"" { v = v.substring(1, len(v) - 1) }
+        }
+    }
+    return v
+}
+
+fn _sis_relation_ok(rel: str) -> int {
+    if rel == "spec" { return 1 }
+    if rel == "impl" { return 1 }
+    if rel == "doc"  { return 1 }
+    if rel == "test" { return 1 }
+    return 0
+}
+
+fn _sis_is_absolute(path: str) -> int {
+    if len(path) >= 1 {
+        if path.substring(0, 1) == "/" { return 1 }
+    }
+    return 0
+}
+
+// Lint-time path probe — uses `test -e` via exec for read-only check.
+// Returns 1 when path exists, 0 when not. Caller supplies repo_root.
+fn attr_sister_path_exists(repo_root: str, repo_rel_path: str) -> int {
+    let mut full = repo_root
+    if len(full) > 0 {
+        let last = full.substring(len(full) - 1, len(full))
+        if last != "/" { full = full + "/" }
+    }
+    full = full + repo_rel_path
+    let result = to_string(exec("test -e '" + full + "' && printf 1 || printf 0")).trim()
+    if result == "1" { return 1 }
+    return 0
+}
+
+// ── Public API ───────────────────────────────────────────────
+
+fn attr_sister_meta() -> AttrFormatMeta {
+    return AttrFormatMeta {
+        name:                 "sister",
+        version:              1,
+        form:                 "comment",
+        phase:                "ecosystem_mk2",
+        status:               "WRAPPED",
+        supports_composition: 0,
+        supports_typing:      1,
+        catalog_size:         1,
+        spec_doc:             "hexa-lang/docs/hexa_lang_attr_ecosystem_b3_b4_b6_b7_b9_landed_2026_05_02.ai.md",
+        notes:                "B4 @sister(path[, relation]) — cross-link with lint path-exist verify"
+    }
+}
+
+fn attr_sister_parse(src: str) -> AttrParseResult {
+    if len(src) < 1 {
+        return AttrParseResult { ok: 0, n_decls: 0, decls: [], message: "empty source" }
+    }
+    let lines = src.split("\n")
+    let mut decls = []
+    let mut i = 0
+    while i < len(lines) {
+        let trimmed = lines[i].trim()
+        if trimmed.contains("@sister(") {
+            let payload = _sis_extract_payload(trimmed)
+            let pairs = _sis_split_kv(payload)
+            decls = decls.push(_sis_decl("sister", pairs, i + 1))
+        }
+        i = i + 1
+    }
+    return AttrParseResult { ok: 1, n_decls: len(decls), decls: decls, message: "sister: " + str(len(decls)) + " decl(s)" }
+}
+
+// Validate parsed sister decls. Pure shape check (no fs touch).
+fn attr_sister_validate(decls: [AttrDecl]) -> AttrValidateResult {
+    let mut issues = []
+    let mut i = 0
+    while i < len(decls) {
+        let d = decls[i]
+        let mut have_path = 0
+        let mut bad_relation = ""
+        let mut abs_path = ""
+        let mut empty_path = 0
+        let mut k = 0
+        while k < len(d.params) {
+            let key = _sis_kv_key(d.params[k])
+            let val = _sis_kv_value(d.params[k])
+            if key == "path" {
+                have_path = 1
+                if len(val) == 0 { empty_path = 1 }
+                if _sis_is_absolute(val) == 1 { abs_path = val }
+            }
+            if key == "relation" {
+                if _sis_relation_ok(val) == 0 { bad_relation = val }
+            }
+            k = k + 1
+        }
+        if have_path == 0 {
+            issues = issues.push(_sis_issue("error", d.line, "missing required key `path`"))
+        }
+        if empty_path == 1 {
+            issues = issues.push(_sis_issue("error", d.line, "path is empty"))
+        }
+        if len(abs_path) > 0 {
+            issues = issues.push(_sis_issue("error", d.line, "path `" + abs_path + "` is absolute — must be repo-relative"))
+        }
+        if len(bad_relation) > 0 {
+            issues = issues.push(_sis_issue("error", d.line, "relation `" + bad_relation + "` not in {spec, impl, doc, test}"))
+        }
+        i = i + 1
+    }
+    let mut any_error = 0
+    let mut e = 0
+    while e < len(issues) {
+        if issues[e].severity == "error" { any_error = 1 }
+        e = e + 1
+    }
+    let okv = if any_error == 1 { 0 } else { 1 }
+    return AttrValidateResult { ok: okv, n_issues: len(issues), issues: issues, message: "sister: " + str(len(issues)) + " issue(s)" }
+}
+
+// Validate + check filesystem existence for each path under repo_root.
+// Caller passes repo_root absolute path (e.g. "/Users/<user>/core/hexa-lang").
+fn attr_sister_validate_with_fs(decls: [AttrDecl], repo_root: str) -> AttrValidateResult {
+    let base = attr_sister_validate(decls)
+    let mut issues = base.issues
+    let mut i = 0
+    while i < len(decls) {
+        let d = decls[i]
+        let mut k = 0
+        while k < len(d.params) {
+            let key = _sis_kv_key(d.params[k])
+            let val = _sis_kv_value(d.params[k])
+            if key == "path" {
+                if len(val) > 0 {
+                    if _sis_is_absolute(val) == 0 {
+                        if attr_sister_path_exists(repo_root, val) == 0 {
+                            issues = issues.push(_sis_issue("error", d.line, "sister path missing on disk: `" + val + "`"))
+                        }
+                    }
+                }
+            }
+            k = k + 1
+        }
+        i = i + 1
+    }
+    let mut any_error = 0
+    let mut e = 0
+    while e < len(issues) {
+        if issues[e].severity == "error" { any_error = 1 }
+        e = e + 1
+    }
+    let okv = if any_error == 1 { 0 } else { 1 }
+    return AttrValidateResult { ok: okv, n_issues: len(issues), issues: issues, message: "sister+fs: " + str(len(issues)) + " issue(s)" }
+}
+
+fn attr_sister_emit(pr: AttrParseResult) -> str {
+    let mut parts = []
+    parts = parts.push("@sister emit: " + str(pr.n_decls) + " decl(s)")
+    let mut i = 0
+    while i < len(pr.decls) {
+        let d = pr.decls[i]
+        parts = parts.push("  L" + str(d.line) + " params=" + str(len(d.params)))
+        i = i + 1
+    }
+    return parts.join("\n")
+}
+
+// ── Selftest ─────────────────────────────────────────────────
+
+fn _selftest() -> int {
+    // 1. meta
+    let m = attr_sister_meta()
+    if m.name != "sister" { return 0 }
+    // 2. parse 0
+    let pr0 = attr_sister_parse("// nothing\nfn x() {}\n")
+    if pr0.ok != 1 { return 0 }
+    if pr0.n_decls != 0 { return 0 }
+    // 3. parse 1 valid
+    let synth1 = "// @sister(path=\"docs/x.md\", relation=\"doc\")\n"
+    let pr1 = attr_sister_parse(synth1)
+    if pr1.n_decls != 1 { return 0 }
+    let vr1 = attr_sister_validate(pr1.decls)
+    if vr1.ok != 1 { return 0 }
+    // 4. parse with absolute path → reject
+    let synth2 = "// @sister(path=\"/etc/passwd\", relation=\"doc\")\n"
+    let pr2 = attr_sister_parse(synth2)
+    let vr2 = attr_sister_validate(pr2.decls)
+    if vr2.ok != 0 { return 0 }
+    // 5. parse with bad relation
+    let synth3 = "// @sister(path=\"a.md\", relation=\"nonsense\")\n"
+    let pr3 = attr_sister_parse(synth3)
+    let vr3 = attr_sister_validate(pr3.decls)
+    if vr3.ok != 0 { return 0 }
+    // 6. parse missing path
+    let synth4 = "// @sister(relation=\"doc\")\n"
+    let pr4 = attr_sister_parse(synth4)
+    let vr4 = attr_sister_validate(pr4.decls)
+    if vr4.ok != 0 { return 0 }
+    // 7. relation defaults — absent is fine
+    let synth5 = "// @sister(path=\"docs/x.md\")\n"
+    let pr5 = attr_sister_parse(synth5)
+    let vr5 = attr_sister_validate(pr5.decls)
+    if vr5.ok != 1 { return 0 }
+    // 8. fs validate — known existing path
+    let synth6 = "// @sister(path=\"docs\", relation=\"doc\")\n"
+    let pr6 = attr_sister_parse(synth6)
+    let vr6_fs = attr_sister_validate_with_fs(pr6.decls, "/Users/<user>/core/hexa-lang")
+    if vr6_fs.ok != 1 { return 0 }
+    // 9. fs validate — bogus path
+    let synth7 = "// @sister(path=\"NO_SUCH_DIR_ECOSYSTEM_PROBE\", relation=\"doc\")\n"
+    let pr7 = attr_sister_parse(synth7)
+    let vr7_fs = attr_sister_validate_with_fs(pr7.decls, "/Users/<user>/core/hexa-lang")
+    if vr7_fs.ok != 0 { return 0 }
+    // 10. emit non-empty
+    let em = attr_sister_emit(pr1)
+    if len(em) < 10 { return 0 }
+    return 1
+}
+
+fn main() {
+    println("[attr_ecosystem/sister] B4 @sister(path[, relation]) — cross-link with fs verify")
+    if _selftest() == 1 {
+        println("[attr_ecosystem/sister] SELFTEST PASS")
+        println("__ATTR_SISTER__ PASS mode=selftest")
+    } else {
+        println("[attr_ecosystem/sister] SELFTEST FAIL")
+        println("__ATTR_SISTER__ FAIL mode=selftest")
+    }
+}

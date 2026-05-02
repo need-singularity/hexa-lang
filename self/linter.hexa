@@ -357,6 +357,190 @@ fn check_mixed_arrays(lines) {
     return results
 }
 
+// ── A4: array param mutation visibility ─────────────────
+// HX-safety A4 (BG-HX1, 2026-05-02): hexa array values are passed by
+// reference (shared), so a function that mutates a parameter array
+// (`xs.push(...)`, `xs[i] = ...`, `xs = xs + ...`) silently propagates
+// the mutation back to the caller. This causes "mutation leak between
+// sub-tests" in selftest harnesses (the canonical case is hxc_v3
+// selftest where a fixture array carries state across test cases).
+//
+// This lint flags the static signature `fn name(...arr_param...)` followed
+// by mutation of that param, recommending one of:
+//   (a) accept and return a new array (functional style)
+//   (b) document the in-place mutation contract via `// @mut <param>`
+//   (c) clone at top-of-fn (e.g. `let mut local = arr_param + []`)
+//
+// False-negative tolerated: param-name shadowing inside nested fns is not
+// tracked. False-positive minimized: the rule fires only when the param
+// name is referenced LHS of `=`, `[i] =`, or `.push(` / `.pop(` / `.insert(`.
+fn check_array_param_mutation(lines) {
+    let mut results = []
+    let mut i = 0
+    let mut in_fn = false
+    let mut fn_brace_depth = 0
+    let mut params = []
+
+    for line in lines {
+        i = i + 1
+        let t = trim(line)
+        if starts_with(t, "//") {
+            continue
+        }
+
+        // Detect fn signature start
+        if !in_fn && (starts_with(t, "fn ") || starts_with(t, "pub fn ") || starts_with(t, "async fn ") || starts_with(t, "pure fn ")) {
+            let lp = t.index_of("(")
+            let rp = t.index_of(")")
+            if lp >= 0 && rp > lp {
+                let plist = t.substring(lp + 1, rp)
+                let pparts = split(plist, ",")
+                params = []
+                for pp in pparts {
+                    let pname = trim(pp)
+                    let cidx = pname.index_of(":")
+                    if cidx > 0 { pname = trim(pname.substring(0, cidx)) }
+                    if starts_with(pname, "mut ") { pname = trim(pname.substring(4, len(pname))) }
+                    if len(pname) > 0 && pname != "self" {
+                        params.push(pname)
+                    }
+                }
+                if contains(t, "{") {
+                    in_fn = true
+                    fn_brace_depth = 1
+                }
+            }
+            continue
+        }
+
+        if !in_fn { continue }
+
+        // Track brace depth within fn body
+        let chars = t.chars()
+        for ch in chars {
+            if ch == '{' { fn_brace_depth = fn_brace_depth + 1 }
+            if ch == '}' { fn_brace_depth = fn_brace_depth - 1 }
+        }
+        if fn_brace_depth <= 0 {
+            in_fn = false
+            params = []
+            continue
+        }
+
+        // Check each param for mutation patterns
+        for p in params {
+            // pattern a: p.push( / .pop( / .insert( / .remove( / .clear(
+            let mut hit = false
+            let mut_methods = [".push(", ".pop(", ".insert(", ".remove(", ".clear(", ".append(", ".extend("]
+            for mm in mut_methods {
+                if contains(t, p + mm) { hit = true }
+            }
+            // pattern b: p[i] = ... or p[...] = ...
+            if !hit && contains(t, p + "[") {
+                let bidx = t.index_of(p + "[")
+                if bidx >= 0 {
+                    let rest = t.substring(bidx, len(t))
+                    let rb = rest.index_of("]")
+                    if rb > 0 {
+                        let after_b = rest.substring(rb + 1, len(rest))
+                        if starts_with(trim(after_b), "=") && !starts_with(trim(after_b), "==") {
+                            hit = true
+                        }
+                    }
+                }
+            }
+            // pattern c: p = p + ... (rebinding param)
+            if !hit && starts_with(t, p + " = ") {
+                hit = true
+            }
+            if hit {
+                results.push(LintMsg {
+                    level: "warn",
+                    line: i,
+                    rule: "A4",
+                    msg: "param '" + p + "' mutated in fn body — array params are by-reference; mutation leaks to caller. Clone (`let mut local = " + p + " + []`) or document via `// @mut " + p + "`"
+                })
+            }
+        }
+    }
+    return results
+}
+
+// ── A8: env() personal-path-leak (raw 15) ───────────────
+// HX-safety A8 (BG-HX1, 2026-05-02): top-of-file `env(KEY)` followed by
+// concatenation that bakes a personal absolute path (e.g.
+// `env("HOME") + "/Dev/hexa-lang/..."` or `env_or("X", "/Users/<user>/...")`),
+// or 2-arg `env("KEY", "/Users/...")` form, leaks per-developer locations
+// into committed source. Lint rule A8 flags:
+//
+//   1. `env(...)` default 2nd arg starting with `/Users/`, `/home/`, `/root/`
+//   2. `env_or(KEY, "/<absolute personal path>")` (common helper alias)
+//   3. top-of-file (line ≤ 50) string concat of `env(` result with
+//      a path containing `/Dev/`, `/core/`, `/Users/`, `/home/` literal.
+//
+// Recommendation: load defaults from a config file under repo root
+// (e.g. `config/dev_paths.json`) or require the env var unconditionally
+// with a clear error.
+fn check_env_personal_path_default(lines) {
+    let mut results = []
+    let mut i = 0
+    let personal_prefixes = ["\"/Users/", "\"/home/", "\"/root/", "\"/srv/"]
+    let personal_substrings = ["/Dev/", "/core/", "/workspace/", "/Users/", "/home/"]
+    for line in lines {
+        i = i + 1
+        let t = trim(line)
+        if starts_with(t, "//") { continue }
+        if contains(t, "// a8_lint: allow") { continue }
+
+        // Pattern 1+2: env(KEY, "/abs/personal/...") or env_or(KEY, "/abs/...")
+        let mut hit_default = false
+        let mut prefix_hit = ""
+        let calls = ["env_or(", "env("]
+        for call in calls {
+            if !contains(t, call) { continue }
+            let cidx = t.index_of(call)
+            if cidx < 0 { continue }
+            let after = t.substring(cidx + len(call), len(t))
+            // find first `,` inside the call (rough — single-arg env() will not have one)
+            let comma_idx = after.index_of(",")
+            if comma_idx < 0 { continue }
+            let arg2 = trim(after.substring(comma_idx + 1, len(after)))
+            for pp in personal_prefixes {
+                if starts_with(arg2, pp) {
+                    hit_default = true
+                    prefix_hit = pp
+                }
+            }
+        }
+        if hit_default {
+            results.push(LintMsg {
+                level: "warn",
+                line: i,
+                rule: "A8",
+                msg: "env() lazy default with personal absolute path (" + prefix_hit + "...) — extract to config/dev_paths.json or require env var explicitly"
+            })
+            continue
+        }
+
+        // Pattern 3: top-of-file (≤ line 50) `env(` concat with personal substring
+        if i > 50 { continue }
+        if !contains(t, "env(") { continue }
+        if !contains(t, "+") { continue }
+        for ss in personal_substrings {
+            if contains(t, ss) {
+                results.push(LintMsg {
+                    level: "warn",
+                    line: i,
+                    rule: "A8",
+                    msg: "top-of-file env() concat with personal path fragment '" + ss + "' — leaks per-developer location into committed source (raw 15)"
+                })
+                break
+            }
+        }
+    }
+    return results
+}
+
 // ── 미사용 import 감지 ──────────────────────────────────
 fn check_unused_imports(lines, source) {
     let mut results = []
@@ -429,6 +613,12 @@ fn lint_file(path) {
     for m in r6 { all.push(m) }
     let r7 = check_unused_imports(lines, source)
     for m in r7 { all.push(m) }
+    // A4: array param mutation visibility (BG-HX1)
+    let r_a4 = check_array_param_mutation(lines)
+    for m in r_a4 { all.push(m) }
+    // A8: env() personal-path-leak (BG-HX1, raw 15)
+    let r8 = check_env_personal_path_default(lines)
+    for m in r8 { all.push(m) }
 
     return all
 }

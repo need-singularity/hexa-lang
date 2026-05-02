@@ -1,0 +1,425 @@
+#!hexa strict
+// @tool(slug="attr_env_required", desc="hexa-lang @env_required(name, fallback) — startup-time env-var presence check (env() lazy hardening)")
+// @sentinel(__ATTR_ENV_REQUIRED__ <PASS|FAIL> mode=<selftest>)
+// @usage(hexa hexa-lang/modules/attr_ecosystem/attr_env_required.hexa)
+// @resolver-bypass(reason="local module selftest, no network/heavy compute")
+//
+// hexa-lang/modules/attr_ecosystem/attr_env_required.hexa
+//   B9 @env_required(name, fallback)
+//
+// SPEC (signature)
+//   @env_required(name="<ENV_VAR_NAME>", fallback="<default-value>")
+//   @env_required(name="<ENV_VAR_NAME>")               // no fallback → hard required
+//
+// SEMANTICS
+//   Hardens lazy env() reads. Declares an env var as a startup-time
+//   contract. The hexa runtime (or any caller of resolve_*) reads
+//   parsed env_required decls and:
+//     * If env[name] is set → use it.
+//     * If env[name] is unset + fallback is provided → use fallback,
+//       emit advisory.
+//     * If env[name] is unset + no fallback → emit a hard error.
+//
+//   This module is the attr enforcer (parse + validate + emit). It
+//   exposes a `resolve` helper that lint pipelines / runtime entry
+//   points can call to apply the contract.
+//
+// REQUIREMENTS
+//   * name: [A-Z][A-Z0-9_]{1,63} (POSIX env var convention).
+//   * fallback: optional, str. When absent, name is HARD REQUIRED.
+//
+// RAW#10 CAVEATS
+//   (1) The runtime check uses `exec("printenv NAME")` for portability
+//       (env_var() is not always available in stage0 builds). Same
+//       quirk as `anima/core/rng/router.hexa` (raw#10 §7).
+//   (2) fallback is treated as a string; numeric env vars get string
+//       treatment (caller parses).
+//   (3) The attr does NOT mutate process env — it only checks +
+//       returns the resolved value to the caller.
+
+// ── Mirror shapes ────────────────────────────────────────────
+
+struct AttrFormatMeta {
+    name:                 str,
+    version:              int,
+    form:                 str,
+    phase:                str,
+    status:               str,
+    supports_composition: int,
+    supports_typing:      int,
+    catalog_size:         int,
+    spec_doc:             str,
+    notes:                str
+}
+
+struct AttrDecl {
+    name:         str,
+    params:       [str],
+    line:         int,
+    col:          int,
+    mode:         str,
+    form_version: str
+}
+
+struct AttrParseResult {
+    ok:       int,
+    n_decls:  int,
+    decls:    [AttrDecl],
+    message:  str
+}
+
+struct AttrIssue {
+    severity:  str,
+    attr_name: str,
+    line:      int,
+    msg:       str
+}
+
+struct AttrValidateResult {
+    ok:        int,
+    n_issues:  int,
+    issues:    [AttrIssue],
+    message:   str
+}
+
+// Resolve outcome
+struct EnvResolveResult {
+    ok:           int,
+    name:         str,
+    value:        str,
+    used_fallback: int,
+    message:      str
+}
+
+// ── Helpers ──────────────────────────────────────────────────
+
+fn _er_decl(params: [str], line: int) -> AttrDecl {
+    return AttrDecl {
+        name: "env_required",
+        params: params,
+        line: line,
+        col: 1,
+        mode: "decl",
+        form_version: "ecosystem_b9"
+    }
+}
+
+fn _er_issue(sev: str, line: int, msg: str) -> AttrIssue {
+    return AttrIssue { severity: sev, attr_name: "env_required", line: line, msg: msg }
+}
+
+fn _er_index(haystack: str, needle: str) -> int {
+    let mut i = 0
+    while i + len(needle) <= len(haystack) {
+        if haystack.substring(i, i + len(needle)) == needle { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn _er_extract_payload_for(trimmed: str, marker: str) -> str {
+    let idx = _er_index(trimmed, marker)
+    if idx < 0 { return "" }
+    let after = trimmed.substring(idx + len(marker), len(trimmed))
+    let mut depth = 1
+    let mut j = 0
+    while j < len(after) {
+        let c = after.substring(j, j + 1)
+        if c == "(" { depth = depth + 1 }
+        if c == ")" {
+            depth = depth - 1
+            if depth == 0 { return after.substring(0, j) }
+        }
+        j = j + 1
+    }
+    return ""
+}
+
+fn _er_split_kv(payload: str) -> [str] {
+    let mut out = []
+    let mut cur = ""
+    let mut in_str = 0
+    let mut i = 0
+    while i < len(payload) {
+        let c = payload.substring(i, i + 1)
+        if c == "\"" {
+            if in_str == 1 { in_str = 0 } else { in_str = 1 }
+            cur = cur + c
+        } else if c == "," {
+            if in_str == 0 {
+                let t = cur.trim()
+                if len(t) > 0 { out = out.push(t) }
+                cur = ""
+            } else {
+                cur = cur + c
+            }
+        } else {
+            cur = cur + c
+        }
+        i = i + 1
+    }
+    let t2 = cur.trim()
+    if len(t2) > 0 { out = out.push(t2) }
+    return out
+}
+
+fn _er_kv_key(pair: str) -> str {
+    let eq = pair.index_of("=")
+    if eq < 0 { return pair.trim() }
+    return pair.substring(0, eq).trim()
+}
+
+fn _er_kv_value(pair: str) -> str {
+    let eq = pair.index_of("=")
+    if eq < 0 { return "" }
+    let mut v = pair.substring(eq + 1, len(pair)).trim()
+    if len(v) >= 2 {
+        let first = v.substring(0, 1)
+        let last  = v.substring(len(v) - 1, len(v))
+        if first == "\"" {
+            if last == "\"" { v = v.substring(1, len(v) - 1) }
+        }
+    }
+    return v
+}
+
+// Validate POSIX env var name [A-Z][A-Z0-9_]{1,63}
+fn _er_name_ok(s: str) -> int {
+    if len(s) < 2 { return 0 }
+    if len(s) > 64 { return 0 }
+    let first = s.substring(0, 1)
+    let upper_first = (first == "A") || (first == "B") || (first == "C") || (first == "D") || (first == "E") || (first == "F") || (first == "G") || (first == "H") || (first == "I") || (first == "J") || (first == "K") || (first == "L") || (first == "M") || (first == "N") || (first == "O") || (first == "P") || (first == "Q") || (first == "R") || (first == "S") || (first == "T") || (first == "U") || (first == "V") || (first == "W") || (first == "X") || (first == "Y") || (first == "Z")
+    if upper_first == false { return 0 }
+    let mut i = 1
+    while i < len(s) {
+        let c = s.substring(i, i + 1)
+        let upper = (c == "A") || (c == "B") || (c == "C") || (c == "D") || (c == "E") || (c == "F") || (c == "G") || (c == "H") || (c == "I") || (c == "J") || (c == "K") || (c == "L") || (c == "M") || (c == "N") || (c == "O") || (c == "P") || (c == "Q") || (c == "R") || (c == "S") || (c == "T") || (c == "U") || (c == "V") || (c == "W") || (c == "X") || (c == "Y") || (c == "Z")
+        let digit = (c == "0") || (c == "1") || (c == "2") || (c == "3") || (c == "4") || (c == "5") || (c == "6") || (c == "7") || (c == "8") || (c == "9")
+        let under = c == "_"
+        if upper == false {
+            if digit == false {
+                if under == false { return 0 }
+            }
+        }
+        i = i + 1
+    }
+    return 1
+}
+
+// ── Public API ───────────────────────────────────────────────
+
+fn attr_env_required_meta() -> AttrFormatMeta {
+    return AttrFormatMeta {
+        name:                 "env_required",
+        version:              1,
+        form:                 "comment",
+        phase:                "ecosystem_mk2",
+        status:               "WRAPPED",
+        supports_composition: 0,
+        supports_typing:      1,
+        catalog_size:         1,
+        spec_doc:             "hexa-lang/docs/hexa_lang_attr_ecosystem_b3_b4_b6_b7_b9_landed_2026_05_02.ai.md",
+        notes:                "B9 @env_required(name[, fallback]) — startup-time env-var contract"
+    }
+}
+
+fn attr_env_required_parse(src: str) -> AttrParseResult {
+    if len(src) < 1 {
+        return AttrParseResult { ok: 0, n_decls: 0, decls: [], message: "empty source" }
+    }
+    let lines = src.split("\n")
+    let mut decls = []
+    let m1 = "@env_required("
+    let m2 = "@env-required("
+    let mut i = 0
+    while i < len(lines) {
+        let trimmed = lines[i].trim()
+        let mut payload = ""
+        let mut hit = 0
+        if trimmed.contains(m1) {
+            payload = _er_extract_payload_for(trimmed, m1)
+            hit = 1
+        }
+        if hit == 0 {
+            if trimmed.contains(m2) {
+                payload = _er_extract_payload_for(trimmed, m2)
+                hit = 1
+            }
+        }
+        if hit == 1 {
+            let pairs = _er_split_kv(payload)
+            decls = decls.push(_er_decl(pairs, i + 1))
+        }
+        i = i + 1
+    }
+    return AttrParseResult { ok: 1, n_decls: len(decls), decls: decls, message: "env_required: " + str(len(decls)) + " decl(s)" }
+}
+
+fn attr_env_required_validate(decls: [AttrDecl]) -> AttrValidateResult {
+    let mut issues = []
+    let mut i = 0
+    while i < len(decls) {
+        let d = decls[i]
+        let mut have_name = 0
+        let mut name_val = ""
+        let mut bad_name = ""
+        let mut k = 0
+        while k < len(d.params) {
+            let key = _er_kv_key(d.params[k])
+            let val = _er_kv_value(d.params[k])
+            if key == "name" {
+                have_name = 1
+                name_val = val
+                if _er_name_ok(val) == 0 { bad_name = val }
+            }
+            // fallback is optional, no validation needed
+            k = k + 1
+        }
+        if have_name == 0 {
+            issues = issues.push(_er_issue("error", d.line, "missing required key `name`"))
+        }
+        if len(bad_name) > 0 {
+            issues = issues.push(_er_issue("error", d.line, "name `" + bad_name + "` invalid — require [A-Z][A-Z0-9_]{1,63}"))
+        }
+        i = i + 1
+    }
+    let mut any_error = 0
+    let mut e = 0
+    while e < len(issues) {
+        if issues[e].severity == "error" { any_error = 1 }
+        e = e + 1
+    }
+    let okv = if any_error == 1 { 0 } else { 1 }
+    return AttrValidateResult { ok: okv, n_issues: len(issues), issues: issues, message: "env_required: " + str(len(issues)) + " issue(s)" }
+}
+
+// Lookup an env var via printenv (portable).
+fn _er_lookup_env(name: str) -> str {
+    let result = to_string(exec("printenv " + name + " 2>/dev/null")).trim()
+    return result
+}
+
+// Resolve a single env_required decl. Returns EnvResolveResult.
+// This is what runtime entry points call at startup time.
+fn attr_env_required_resolve(d: AttrDecl) -> EnvResolveResult {
+    let mut name_val = ""
+    let mut have_fallback = 0
+    let mut fallback_val = ""
+    let mut k = 0
+    while k < len(d.params) {
+        let key = _er_kv_key(d.params[k])
+        let val = _er_kv_value(d.params[k])
+        if key == "name"     { name_val = val }
+        if key == "fallback" { have_fallback = 1; fallback_val = val }
+        k = k + 1
+    }
+    if len(name_val) == 0 {
+        return EnvResolveResult { ok: 0, name: "", value: "", used_fallback: 0, message: "env_required: name missing" }
+    }
+    let env_val = _er_lookup_env(name_val)
+    if len(env_val) > 0 {
+        return EnvResolveResult { ok: 1, name: name_val, value: env_val, used_fallback: 0, message: "env[" + name_val + "] resolved from process env" }
+    }
+    if have_fallback == 1 {
+        return EnvResolveResult { ok: 1, name: name_val, value: fallback_val, used_fallback: 1, message: "env[" + name_val + "] unset — using fallback" }
+    }
+    return EnvResolveResult { ok: 0, name: name_val, value: "", used_fallback: 0, message: "env[" + name_val + "] HARD-REQUIRED but unset and no fallback" }
+}
+
+// Resolve all decls in a parse result. Returns list of EnvResolveResult.
+fn attr_env_required_resolve_all(decls: [AttrDecl]) -> [EnvResolveResult] {
+    let mut out = []
+    let mut i = 0
+    while i < len(decls) {
+        out = out.push(attr_env_required_resolve(decls[i]))
+        i = i + 1
+    }
+    return out
+}
+
+fn attr_env_required_emit(pr: AttrParseResult) -> str {
+    let mut parts = []
+    parts = parts.push("@env_required emit: " + str(pr.n_decls) + " decl(s)")
+    let mut i = 0
+    while i < len(pr.decls) {
+        let d = pr.decls[i]
+        parts = parts.push("  L" + str(d.line) + " params=" + str(len(d.params)))
+        i = i + 1
+    }
+    return parts.join("\n")
+}
+
+// ── Selftest ─────────────────────────────────────────────────
+
+fn _selftest() -> int {
+    // 1. meta
+    let m = attr_env_required_meta()
+    if m.name != "env_required" { return 0 }
+    // 2. parse 0
+    let pr0 = attr_env_required_parse("// nothing\n")
+    if pr0.n_decls != 0 { return 0 }
+    // 3. parse underscore valid
+    let s1 = "// @env_required(name=\"PATH\")\n"
+    let pr1 = attr_env_required_parse(s1)
+    if pr1.n_decls != 1 { return 0 }
+    let vr1 = attr_env_required_validate(pr1.decls)
+    if vr1.ok != 1 { return 0 }
+    // 4. parse dashed variant
+    let s2 = "// @env-required(name=\"HOME\", fallback=\"/tmp\")\n"
+    let pr2 = attr_env_required_parse(s2)
+    if pr2.n_decls != 1 { return 0 }
+    let vr2 = attr_env_required_validate(pr2.decls)
+    if vr2.ok != 1 { return 0 }
+    // 5. parse missing name
+    let s3 = "// @env_required(fallback=\"x\")\n"
+    let pr3 = attr_env_required_parse(s3)
+    let vr3 = attr_env_required_validate(pr3.decls)
+    if vr3.ok != 0 { return 0 }
+    // 6. parse bad name (lowercase)
+    let s4 = "// @env_required(name=\"home\")\n"
+    let pr4 = attr_env_required_parse(s4)
+    let vr4 = attr_env_required_validate(pr4.decls)
+    if vr4.ok != 0 { return 0 }
+    // 7. parse bad name (with hyphen)
+    let s5 = "// @env_required(name=\"BAD-NAME\")\n"
+    let pr5 = attr_env_required_parse(s5)
+    let vr5 = attr_env_required_validate(pr5.decls)
+    if vr5.ok != 0 { return 0 }
+    // 8. resolve PATH (always set on darwin)
+    let res1 = attr_env_required_resolve(pr1.decls[0])
+    if res1.ok != 1 { return 0 }
+    if len(res1.value) == 0 { return 0 }
+    if res1.used_fallback != 0 { return 0 }
+    // 9. resolve missing var → fallback used
+    let s6 = "// @env_required(name=\"DEFINITELY_NOT_SET_ATTR_PROBE_VAR\", fallback=\"FB-VALUE\")\n"
+    let pr6 = attr_env_required_parse(s6)
+    let res2 = attr_env_required_resolve(pr6.decls[0])
+    if res2.ok != 1 { return 0 }
+    if res2.value != "FB-VALUE" { return 0 }
+    if res2.used_fallback != 1 { return 0 }
+    // 10. resolve missing var with no fallback → hard error
+    let s7 = "// @env_required(name=\"DEFINITELY_NOT_SET_ATTR_PROBE_HARD\")\n"
+    let pr7 = attr_env_required_parse(s7)
+    let res3 = attr_env_required_resolve(pr7.decls[0])
+    if res3.ok != 0 { return 0 }
+    // 11. resolve_all
+    let s_multi = "// @env_required(name=\"PATH\")\n// @env_required(name=\"HOME\")\n"
+    let pr_multi = attr_env_required_parse(s_multi)
+    let res_all = attr_env_required_resolve_all(pr_multi.decls)
+    if len(res_all) != 2 { return 0 }
+    // 12. emit non-empty
+    let em = attr_env_required_emit(pr_multi)
+    if len(em) < 10 { return 0 }
+    return 1
+}
+
+fn main() {
+    println("[attr_ecosystem/env_required] B9 startup env-var contract")
+    if _selftest() == 1 {
+        println("[attr_ecosystem/env_required] SELFTEST PASS")
+        println("__ATTR_ENV_REQUIRED__ PASS mode=selftest")
+    } else {
+        println("[attr_ecosystem/env_required] SELFTEST FAIL")
+        println("__ATTR_ENV_REQUIRED__ FAIL mode=selftest")
+    }
+}
