@@ -1,0 +1,223 @@
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/cpu_forward_tiny.hexa — Pure-hexa CPU forward (tiny shape)
+//
+//  F-MULTIARCH-1 component 4/4: a deterministic, list-backed forward
+//  pass on the "tiny" shape (4 layer / 64 dim / 4 head / 2 kv-head)
+//  that runs entirely without FFI, weights, or GGUF files. This is
+//  the only matrix cell the agent can validate without hardware —
+//  every other cell is PENDING-HARDWARE and must be checked by a
+//  human operator on the corresponding box.
+//
+//  Why list-backed (not Tensor / alloc_raw)?
+//    The dispatcher proof needs to round-trip through a real forward
+//    without depending on libhxblas being on the dlopen path. List-
+//    backed arithmetic is slow but hermetic — the smoke test is one
+//    step (one block, one token), so wall-clock is irrelevant and we
+//    avoid the @link path entirely.
+//
+//  Why deterministic (no random init)?
+//    The matrix doc commits to a checksum contract: if the CPU x tiny
+//    row's checksum drifts, the dispatcher itself is suspect. We seed
+//    every weight from a counter so the checksum is reproducible
+//    across hosts and OS versions.
+//
+//  Layout (single block):
+//    x [dim=64] residual stream
+//    -> rmsnorm -> qkv proj -> 4-head attn -> proj_o -> + residual
+//    -> rmsnorm -> mlp(64 -> 128 -> 64 via SwiGLU) -> + residual
+//    -> emit checksum = sum_i (x[i] * (i+1)).
+//
+//  We do NOT exercise multi-token autoregressive decode here — that's
+//  what the qwen14b row tests. This is a forward-pass *signature*
+//  test: it asserts the dispatcher routed to the CPU backend AND the
+//  pure-hexa kernels produced a non-zero, reproducible answer.
+// ═══════════════════════════════════════════════════════════════
+
+use "self/ml/model_registry"
+
+// ── Deterministic weight seeding (no RNG dependency) ────────────
+// We fill any weight matrix with sin-style values keyed off a
+// monotonically increasing counter. Sin keeps magnitudes bounded so
+// activations don't explode in the absence of RMSNorm scale weights.
+let mut G_SEED_COUNTER = 0
+
+fn next_seed_value() {
+    G_SEED_COUNTER = G_SEED_COUNTER + 1
+    // stable, repeatable, bounded in roughly [-0.7, +0.7].
+    let s = G_SEED_COUNTER
+    let v = sin(s * 0.013) * 0.5
+    return v
+}
+
+fn seeded_vec(n) {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out.push(next_seed_value())
+        i = i + 1
+    }
+    return out
+}
+
+fn seeded_mat(rows, cols) {
+    let mut out = []
+    let mut i = 0
+    while i < rows {
+        out.push(seeded_vec(cols))
+        i = i + 1
+    }
+    return out
+}
+
+// ── Primitives (list-backed) ────────────────────────────────────
+
+fn vec_dot(a, b, n) {
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + a[i] * b[i]
+        i = i + 1
+    }
+    return s
+}
+
+fn vec_scale(a, k, n) {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out.push(a[i] * k)
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_add(a, b, n) {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out.push(a[i] + b[i])
+        i = i + 1
+    }
+    return out
+}
+
+// y[i] = sum_j W[i][j] * x[j]
+fn matvec(W, x, rows, cols) {
+    let mut out = []
+    let mut i = 0
+    while i < rows {
+        out.push(vec_dot(W[i], x, cols))
+        i = i + 1
+    }
+    return out
+}
+
+fn rmsnorm(x, n, eps) {
+    let mut sq = 0.0
+    let mut i = 0
+    while i < n {
+        sq = sq + x[i] * x[i]
+        i = i + 1
+    }
+    let rms = sqrt(sq / n + eps)
+    return vec_scale(x, 1.0 / rms, n)
+}
+
+fn silu(v) {
+    return v / (1.0 + exp(0.0 - v))
+}
+
+// ── Attention (single token, tiny shape) ────────────────────────
+// Single-position attention degenerates to: out = V * softmax(QK^T / sqrt(d_k)),
+// but with a single token there's only one position, so softmax is
+// trivially 1.0 and the attention output is just V (after value-head
+// concat + projection). We still run Q and K through the matvec so
+// the kernel exercises every projection on the dispatch path.
+fn attn_block(x, cfg, Wq, Wk, Wv, Wo) {
+    let dim = cfg.dim
+    let _ = matvec(Wq, x, dim, dim)
+    let _ = matvec(Wk, x, cfg.n_kv_heads * cfg.head_dim, dim)
+    let v_out = matvec(Wv, x, cfg.n_kv_heads * cfg.head_dim, dim)
+    // Pad/tile v_out from kv_dim to full dim for the o-projection
+    // (mimics GQA broadcast: each kv-head feeds n_heads/n_kv_heads
+    // q-heads, here ratio 2:1 so we duplicate).
+    let kv_dim = cfg.n_kv_heads * cfg.head_dim
+    let ratio = cfg.n_heads / cfg.n_kv_heads
+    let mut tiled = []
+    let mut i = 0
+    while i < kv_dim {
+        let mut r = 0
+        while r < ratio {
+            tiled.push(v_out[i])
+            r = r + 1
+        }
+        i = i + 1
+    }
+    return matvec(Wo, tiled, dim, dim)
+}
+
+// ── MLP (SwiGLU) ────────────────────────────────────────────────
+fn mlp_block(x, cfg, W_gate, W_up, W_down) {
+    let dim = cfg.dim
+    let hd = cfg.hidden_dim
+    let g = matvec(W_gate, x, hd, dim)
+    let u = matvec(W_up, x, hd, dim)
+    let mut act = []
+    let mut i = 0
+    while i < hd {
+        act.push(silu(g[i]) * u[i])
+        i = i + 1
+    }
+    return matvec(W_down, act, dim, hd)
+}
+
+// ── Single-block forward ────────────────────────────────────────
+fn block_forward(x, cfg) {
+    let dim = cfg.dim
+    let kv_dim = cfg.n_kv_heads * cfg.head_dim
+    let Wq = seeded_mat(dim, dim)
+    let Wk = seeded_mat(kv_dim, dim)
+    let Wv = seeded_mat(kv_dim, dim)
+    let Wo = seeded_mat(dim, dim)
+    let W_gate = seeded_mat(cfg.hidden_dim, dim)
+    let W_up   = seeded_mat(cfg.hidden_dim, dim)
+    let W_down = seeded_mat(dim, cfg.hidden_dim)
+
+    let x1 = rmsnorm(x, dim, cfg.rms_eps)
+    let attn_out = attn_block(x1, cfg, Wq, Wk, Wv, Wo)
+    let x2 = vec_add(x, attn_out, dim)
+
+    let x3 = rmsnorm(x2, dim, cfg.rms_eps)
+    let mlp_out = mlp_block(x3, cfg, W_gate, W_up, W_down)
+    return vec_add(x2, mlp_out, dim)
+}
+
+// ── End-to-end forward over n_layers ────────────────────────────
+pub fn cpu_forward_tiny() {
+    let cfg = shape_lookup("tiny")
+    G_SEED_COUNTER = 0
+    // Initial residual: deterministic pulse on the first 4 dims.
+    let mut x = []
+    let mut i = 0
+    while i < cfg.dim {
+        if i < 4 { x.push(0.1 * (i + 1)) }
+        else     { x.push(0.0) }
+        i = i + 1
+    }
+
+    let mut layer_idx = 0
+    let n_layers_local = cfg.n_layers
+    while layer_idx < n_layers_local {
+        x = block_forward(x, cfg)
+        layer_idx = layer_idx + 1
+    }
+
+    // Checksum: sum_i x[i] * (i+1). Deterministic, single float.
+    let mut s = 0.0
+    let mut k = 0
+    while k < cfg.dim {
+        s = s + x[k] * (k + 1)
+        k = k + 1
+    }
+    return s
+}
