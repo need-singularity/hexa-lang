@@ -1,0 +1,656 @@
+// tool/jit/jit_compile.hexa — F-JIT pipeline (hexa @jit fn → IR → C → .dylib)
+//
+// @resolver-bypass(reason="JIT pipeline is mac-local: cc -O2 -dynamiclib produces a Mach-O .dylib that won't load inside the Linux hexa-exec container. Docker landing must be skipped.")
+//
+// Usage:
+//   hexa tool/jit/jit_compile.hexa <input.hexa> [-o <runner.hexa>]
+//
+// Discovers `@jit` annotated functions in <input.hexa>, lowers each one to
+// the tiny IR documented in tool/jit/jit_ir.md, emits C, compiles to
+// build/libjit_<basename>.dylib, and writes a runner .hexa that uses
+// `@link("jit_<basename>")` extern fn declarations in place of the original
+// hexa function bodies. The runner is an interpreter-driven program that
+// makes its hot calls land in compiled native code.
+//
+// Bail-outs (interpreter fallback, original source kept):
+//   - non-Int param/return type
+//   - body uses for/match/closures/strings/lists/method calls/extern
+//   - calls a fn not also @jit-tagged in the same file
+//
+// The "IR" in this revision is a typed instruction list (CONST_I, MOV, BIN,
+// NEG, BR, BRC, LABEL, CALL, RET) — see jit_ir.md. We track it with maps so
+// downstream passes (constant folding, peephole) have a clean target;
+// emit_c() walks a structured statement list (built alongside the IR) so the
+// C compiler does the real SSA / register-alloc work at -O2.
+
+fn map_has_key(m, k) {
+    let ks = m.keys()
+    let mut i = 0
+    while i < len(ks) { if ks[i] == k { return true }; i = i + 1 }
+    return false
+}
+
+// Locate project root: walk up from CWD looking for hexa.toml.
+fn locate_project_root() {
+    let mut cur = exec("pwd").trim()
+    let mut steps = 0
+    while steps < 30 {
+        if file_exists(cur + "/hexa.toml") { return cur }
+        if cur == "/" || cur == "" { return "" }
+        cur = exec("dirname '" + cur + "'").trim()
+        steps = steps + 1
+    }
+    return ""
+}
+let mut project_dir = locate_project_root()
+if project_dir == "" {
+    // fallback: assume CWD
+    project_dir = exec("pwd").trim()
+}
+let build_dir = project_dir + "/build"
+
+// ---------- argv ----------
+// args() returns [exe, exe, user_args...]; user args start at index 2.
+let _argv = args()
+let argc = len(_argv)
+if argc < 3 {
+    println("usage: hexa tool/jit/jit_compile.hexa <input.hexa> [-o <runner.hexa>]")
+    exit(2)
+}
+let input = _argv[2]
+let mut out_runner = ""
+let mut k = 3
+while k < argc {
+    if _argv[k] == "-o" && k + 1 < argc {
+        out_runner = _argv[k + 1]
+        k = k + 2
+    } else {
+        k = k + 1
+    }
+}
+if out_runner == "" {
+    // default: build/<basename>.jit.hexa
+    let base = exec("basename '" + input + "' .hexa").trim()
+    out_runner = build_dir + "/" + base + ".jit.hexa"
+}
+exec("mkdir -p " + build_dir)
+
+let src = read_file(input)
+let n = len(src)
+
+// ---------- Step 1: scan for @jit fn declarations ----------
+// Conservative textual finder: line "@jit" immediately followed (next non-blank
+// line) by "fn NAME(...) -> TYPE { ... }". We match the closing brace by depth.
+
+fn find_line_start(src, pos) {
+    let mut p = pos
+    while p > 0 && src[p - 1] != "\n" { p = p - 1 }
+    return p
+}
+
+fn skip_ws(src, i) {
+    let n = len(src)
+    let mut p = i
+    while p < n {
+        let c = src[p]
+        if c == " " || c == "\t" || c == "\r" || c == "\n" { p = p + 1 }
+        else { return p }
+    }
+    return p
+}
+
+fn match_at(src, i, needle) {
+    let nn = len(needle)
+    if i + nn > len(src) { return false }
+    if src.substring(i, i + nn) != needle { return false }
+    return true
+}
+
+fn is_id_char(c) {
+    let k = char_code(c, 0)
+    return (k >= 48 && k <= 57) || (k >= 97 && k <= 122) || (k >= 65 && k <= 90) || k == 95
+}
+
+// scan from pos forward, return position immediately after matching '}'
+// for an open-brace at brace_open_pos (src[brace_open_pos] == "{")
+fn match_brace(src, brace_open_pos) {
+    let n = len(src)
+    let mut p = brace_open_pos + 1
+    let mut depth = 1
+    while p < n && depth > 0 {
+        let c = src[p]
+        if c == "\"" {
+            p = p + 1
+            while p < n && src[p] != "\"" {
+                if src[p] == "\\" && p + 1 < n { p = p + 2 } else { p = p + 1 }
+            }
+            if p < n { p = p + 1 }
+            continue
+        }
+        if c == "/" && p + 1 < n && src[p + 1] == "/" {
+            while p < n && src[p] != "\n" { p = p + 1 }
+            continue
+        }
+        if c == "{" { depth = depth + 1; p = p + 1; continue }
+        if c == "}" { depth = depth - 1; p = p + 1; continue }
+        p = p + 1
+    }
+    return p
+}
+
+// extract identifier starting at i
+fn read_ident(src, i) {
+    let n = len(src)
+    let mut p = i
+    while p < n && is_id_char(src[p]) { p = p + 1 }
+    return [src.substring(i, p), p]
+}
+
+// Find all @jit functions. Each entry:
+//   { "name": ..., "params": [[name, type], ...], "ret": ..., "body": "...",
+//     "decl_start": int, "decl_end": int }
+let mut fns = []
+let mut bail_reasons = []
+let mut p = 0
+while p < n {
+    let ihit = src.index_of("@jit", p)
+    if ihit < 0 { break }
+    // must be at line start (preceding char \n or start)
+    let ls = find_line_start(src, ihit)
+    let prefix = src.substring(ls, ihit).trim()
+    if prefix != "" { p = ihit + 4; continue }
+    // skip past attribute (allow optional `(...)` form) and find next "fn"
+    let mut q = ihit + 4
+    if q < n && src[q] == "(" {
+        let mut d = 1
+        q = q + 1
+        while q < n && d > 0 {
+            if src[q] == "(" { d = d + 1 }
+            else if src[q] == ")" { d = d - 1 }
+            q = q + 1
+        }
+    }
+    q = skip_ws(src, q)
+    if !match_at(src, q, "fn") { p = ihit + 4; continue }
+    q = q + 2
+    q = skip_ws(src, q)
+    let name_pair = read_ident(src, q)
+    let fname = name_pair[0]
+    q = name_pair[1]
+    q = skip_ws(src, q)
+    if q >= n || src[q] != "(" { p = ihit + 4; continue }
+    let paren_start = q
+    // match parens
+    let mut d = 1
+    q = q + 1
+    while q < n && d > 0 {
+        if src[q] == "(" { d = d + 1 }
+        else if src[q] == ")" { d = d - 1 }
+        if d > 0 { q = q + 1 }
+    }
+    let params_str = src.substring(paren_start + 1, q)
+    q = q + 1
+    q = skip_ws(src, q)
+    // optional `-> Type`
+    let mut ret_type = "Int"
+    if match_at(src, q, "->") {
+        q = q + 2
+        q = skip_ws(src, q)
+        let rt = read_ident(src, q)
+        ret_type = rt[0]
+        q = rt[1]
+        q = skip_ws(src, q)
+    }
+    if q >= n || src[q] != "{" { p = ihit + 4; continue }
+    let body_open = q
+    let body_close = match_brace(src, body_open)
+    let body = src.substring(body_open + 1, body_close - 1)
+
+    // parse params
+    let mut params = []
+    let raw_params = params_str.split(",")
+    let mut bp = 0
+    let mut bail_param = ""
+    while bp < len(raw_params) {
+        let rp = raw_params[bp].trim()
+        if rp == "" { bp = bp + 1; continue }
+        let parts = rp.split(":")
+        if len(parts) != 2 {
+            bail_param = "param-no-type:" + rp
+            bp = bp + 1
+            continue
+        }
+        let pname = parts[0].trim()
+        let ptype = parts[1].trim()
+        params.push([pname, ptype])
+        bp = bp + 1
+    }
+
+    if bail_param != "" {
+        bail_reasons.push("[jit] bail: " + fname + " " + bail_param)
+        p = body_close
+        continue
+    }
+    if ret_type != "Int" {
+        bail_reasons.push("[jit] bail: " + fname + " return-type=" + ret_type)
+        p = body_close
+        continue
+    }
+    let mut bad_param = ""
+    let mut bp2 = 0
+    while bp2 < len(params) {
+        if params[bp2][1] != "Int" { bad_param = params[bp2][1] }
+        bp2 = bp2 + 1
+    }
+    if bad_param != "" {
+        bail_reasons.push("[jit] bail: " + fname + " param-type=" + bad_param)
+        p = body_close
+        continue
+    }
+
+    let mut entry = {}
+    entry["name"] = fname
+    entry["params"] = params
+    entry["ret"] = ret_type
+    entry["body"] = body
+    entry["decl_start"] = ls
+    entry["decl_end"] = body_close
+    fns.push(entry)
+    p = body_close
+}
+
+if len(fns) == 0 {
+    println("[jit] no @jit functions in " + input)
+    let mut br = 0
+    while br < len(bail_reasons) { println(bail_reasons[br]); br = br + 1 }
+    exit(0)
+}
+
+// ---------- Step 2: lower each fn body to IR / C ----------
+// Lowering is line-by-line, with an explicit IR record kept alongside the
+// emitted C (see jit_ir.md for op set).  The C output is what the dylib
+// actually executes; the IR list is held in `ir_log` and printed in
+// verbose mode for debugging future passes.
+
+let mut ir_log = []
+
+// Tokenizer-light: trim a single line, strip trailing comment.
+fn strip_comment(line) {
+    let i = line.index_of("//")
+    if i < 0 { return line }
+    return line.substring(0, i)
+}
+
+fn is_stmt_terminator(c) {
+    return c == "{" || c == "}"
+}
+
+// Translate a hexa expression to a C expression. Supported:
+//   Int literal, identifier, ( expr ), unary -, binary + - * / % & | ^,
+//   == != < <= > >=, && ||, function calls fn(arg, arg, ...)
+//   boolean keywords true/false
+// Anything else returns "" → bail.
+fn xlat_expr(e, jit_names) {
+    let s = e.trim()
+    if s == "" { return "" }
+    // String literal in expr → bail (we only support Int)
+    if s.contains("\"") { return "" }
+    // Reject obvious non-numeric tokens: lists `[`, maps `{`, method `.`, range `..`
+    if s.contains("[") || s.contains("{") || s.contains("..") { return "" }
+    if s.contains(".") {
+        // a single "." typically denotes method call; reject (1.0 floats also rejected)
+        return ""
+    }
+    // Scan for identifier(... patterns; ensure each callee is in jit_names
+    // (we can call our own peer @jit functions). Math-builtins like abs/min
+    // are not handled in this revision.
+    let n = len(s)
+    let mut i = 0
+    while i < n {
+        let c = s[i]
+        let kc = char_code(c, 0)
+        let is_alpha = (kc >= 97 && kc <= 122) || (kc >= 65 && kc <= 90) || kc == 95
+        if is_alpha {
+            let start = i
+            while i < n {
+                let c2 = s[i]
+                let kc2 = char_code(c2, 0)
+                let alnum = (kc2 >= 48 && kc2 <= 57) || (kc2 >= 97 && kc2 <= 122) || (kc2 >= 65 && kc2 <= 90) || kc2 == 95
+                if !alnum { i = i; break }
+                i = i + 1
+            }
+            let ident = s.substring(start, i)
+            // Skip whitespace
+            while i < n && (s[i] == " " || s[i] == "\t") { i = i + 1 }
+            if i < n && s[i] == "(" {
+                // function call. Allowed only if it's a peer @jit fn.
+                if !map_has_key(jit_names, ident) {
+                    // emit as jit_<ident> only if peer, otherwise bail
+                    return ""
+                }
+                // rewrite call: ident( -> jit_ident(
+                // We need to substitute. To avoid double-substituting, only
+                // do it when ident isn't already prefixed.
+            }
+            continue
+        }
+        i = i + 1
+    }
+    // Now do peer-call rewriting: replace `IDENT(` with `jit_IDENT(` for
+    // each name in jit_names. Walk again.
+    let names = jit_names.keys()
+    let mut out = s
+    let mut ni = 0
+    while ni < len(names) {
+        let nm = names[ni]
+        // simple word-boundary replace (substring + fwd)
+        let mut buf = ""
+        let mut p2 = 0
+        while p2 < len(out) {
+            let idx = out.index_of(nm + "(", p2)
+            if idx < 0 { buf = buf + out.substring(p2, len(out)); break }
+            // verify left boundary
+            let mut ok = true
+            if idx > 0 {
+                let lc = out[idx - 1]
+                let lk = char_code(lc, 0)
+                if (lk >= 48 && lk <= 57) || (lk >= 97 && lk <= 122) || (lk >= 65 && lk <= 90) || lk == 95 {
+                    ok = false
+                }
+            }
+            buf = buf + out.substring(p2, idx)
+            if ok {
+                buf = buf + "jit_" + nm + "("
+            } else {
+                buf = buf + nm + "("
+            }
+            p2 = idx + len(nm) + 1
+        }
+        out = buf
+        ni = ni + 1
+    }
+    return out
+}
+
+// A single fn lowering. Returns C source for the function definition.
+fn lower_fn(fn_rec, all_jit_names) {
+    let fname = fn_rec["name"]
+    let params = fn_rec["params"]
+    let body = fn_rec["body"]
+
+    // emit signature
+    let mut sig = "int64_t jit_" + fname + "("
+    let mut pi = 0
+    while pi < len(params) {
+        if pi > 0 { sig = sig + ", " }
+        sig = sig + "int64_t " + params[pi][0]
+        pi = pi + 1
+    }
+    sig = sig + ")"
+
+    // emit body — translate line-by-line
+    let mut c_lines = []
+    c_lines.push(sig + " {")
+
+    // record locals declared so we can promote them to int64_t
+    let mut declared = {}
+    let mut pj = 0
+    while pj < len(params) { declared[params[pj][0]] = true; pj = pj + 1 }
+
+    // Walk body characters, tokenize into statements terminated by ; or { or }.
+    // Hexa is brace-based with newline statement separation; we treat each
+    // logical line as a stmt and pass-through { and } directly.
+    let raw_lines = body.split("\n")
+    let mut bail = ""
+    let mut li = 0
+    while li < len(raw_lines) {
+        let raw = strip_comment(raw_lines[li]).trim()
+        if raw == "" { li = li + 1; continue }
+
+        // Detect simple constructs
+        if raw == "}" {
+            c_lines.push("}")
+            ir_log.push(["LABEL", "block_end"])
+            li = li + 1
+            continue
+        }
+        // `} else {`
+        if raw == "} else {" {
+            c_lines.push("} else {")
+            ir_log.push(["BR", "else_block"])
+            li = li + 1
+            continue
+        }
+        // `if EXPR {`
+        if raw.index_of("if ") == 0 && raw.substring(len(raw) - 1, len(raw)) == "{" {
+            let cond = raw.substring(3, len(raw) - 1).trim()
+            let cx = xlat_expr(cond, all_jit_names)
+            if cx == "" { bail = "if-cond-untranslatable: " + cond }
+            else {
+                c_lines.push("if (" + cx + ") {")
+                ir_log.push(["BRC", cx, "then", "else"])
+            }
+            li = li + 1
+            continue
+        }
+        // `else {`
+        if raw == "else {" {
+            c_lines.push("else {")
+            ir_log.push(["BR", "else_block"])
+            li = li + 1
+            continue
+        }
+        // `while EXPR {`
+        if raw.index_of("while ") == 0 && raw.substring(len(raw) - 1, len(raw)) == "{" {
+            let cond = raw.substring(6, len(raw) - 1).trim()
+            let cx = xlat_expr(cond, all_jit_names)
+            if cx == "" { bail = "while-cond-untranslatable: " + cond }
+            else {
+                c_lines.push("while (" + cx + ") {")
+                ir_log.push(["LABEL", "loop_head"])
+                ir_log.push(["BRC", cx, "loop_body", "loop_exit"])
+            }
+            li = li + 1
+            continue
+        }
+        // `return EXPR`
+        if raw.index_of("return ") == 0 || raw == "return" {
+            let val = if raw == "return" { "0" } else { raw.substring(7, len(raw)).trim() }
+            let vx = xlat_expr(val, all_jit_names)
+            if vx == "" { bail = "return-untranslatable: " + val }
+            else {
+                c_lines.push("return " + vx + ";")
+                ir_log.push(["RET", vx])
+            }
+            li = li + 1
+            continue
+        }
+        // `let [mut] NAME = EXPR`
+        if raw.index_of("let ") == 0 {
+            let mut rest = raw.substring(4, len(raw)).trim()
+            if rest.index_of("mut ") == 0 { rest = rest.substring(4, len(rest)).trim() }
+            let eq = rest.index_of("=")
+            if eq < 0 { bail = "let-no-eq: " + raw; li = li + 1; continue }
+            let lhs = rest.substring(0, eq).trim()
+            // strip type ascription ":Int"
+            let mut lname = lhs
+            let colon = lname.index_of(":")
+            if colon >= 0 { lname = lname.substring(0, colon).trim() }
+            let rhs = rest.substring(eq + 1, len(rest)).trim()
+            let rx = xlat_expr(rhs, all_jit_names)
+            if rx == "" { bail = "let-rhs-untranslatable: " + rhs; li = li + 1; continue }
+            if map_has_key(declared, lname) {
+                // shadowing same name: emit assign
+                c_lines.push(lname + " = " + rx + ";")
+                ir_log.push(["MOV", lname, rx])
+            } else {
+                declared[lname] = true
+                c_lines.push("int64_t " + lname + " = " + rx + ";")
+                ir_log.push(["CONST_I", lname, rx])
+            }
+            li = li + 1
+            continue
+        }
+        // `NAME = EXPR` assignment (no `let`)
+        let eq = raw.index_of("=")
+        let cmp_eq = raw.index_of("==")
+        let lt_eq = raw.index_of("<=")
+        let gt_eq = raw.index_of(">=")
+        let neq = raw.index_of("!=")
+        let plus_eq = raw.index_of("+=")
+        if eq > 0 && eq != cmp_eq && (lt_eq < 0 || eq != lt_eq + 1) && (gt_eq < 0 || eq != gt_eq + 1) && (neq < 0 || eq != neq + 1) && eq != plus_eq + 1 {
+            let lhs = raw.substring(0, eq).trim()
+            let rhs = raw.substring(eq + 1, len(raw)).trim()
+            let rx = xlat_expr(rhs, all_jit_names)
+            if rx == "" { bail = "assign-rhs-untranslatable: " + rhs; li = li + 1; continue }
+            c_lines.push(lhs + " = " + rx + ";")
+            ir_log.push(["MOV", lhs, rx])
+            li = li + 1
+            continue
+        }
+        // bare expression (e.g. final `sum` in fn that has implicit return)
+        // — at function tail, treat as `return EXPR;`
+        if li == len(raw_lines) - 1 || (li == len(raw_lines) - 2 && strip_comment(raw_lines[li + 1]).trim() == "") {
+            let vx = xlat_expr(raw, all_jit_names)
+            if vx != "" {
+                c_lines.push("return " + vx + ";")
+                ir_log.push(["RET", vx])
+                li = li + 1
+                continue
+            }
+        }
+        bail = "stmt-untranslatable: " + raw
+        li = li + 1
+    }
+
+    // safety: ensure a return is emitted
+    let last_c = c_lines[len(c_lines) - 1]
+    if last_c.index_of("return ") < 0 {
+        // guard: append `return 0;` (most fns have explicit return; this is
+        // the implicit-fall-through safety belt)
+        c_lines.push("return 0;")
+        ir_log.push(["RET", "0"])
+    }
+    c_lines.push("}")
+    if bail != "" { return ["", bail] }
+    return [c_lines.join("\n"), ""]
+}
+
+// ---------- Step 3: emit single C source covering all @jit fns ----------
+let mut c_src = "#include <stdint.h>\n#include <stdio.h>\n\n"
+
+// Pre-collect names so cross-calls between @jit fns become CALL ir.
+let mut jit_names = {}
+let mut fi = 0
+while fi < len(fns) { jit_names[fns[fi]["name"]] = true; fi = fi + 1 }
+
+let mut emitted = []
+fi = 0
+while fi < len(fns) {
+    let lo = lower_fn(fns[fi], jit_names)
+    if lo[0] == "" {
+        bail_reasons.push("[jit] bail: " + fns[fi]["name"] + " " + lo[1])
+        fi = fi + 1
+        continue
+    }
+    c_src = c_src + lo[0] + "\n\n"
+    emitted.push(fns[fi])
+    fi = fi + 1
+}
+
+if len(emitted) == 0 {
+    println("[jit] all @jit fns bailed; no compilation")
+    let mut br = 0
+    while br < len(bail_reasons) { println(bail_reasons[br]); br = br + 1 }
+    exit(1)
+}
+
+// ---------- Step 4: write C, invoke cc -O2 ----------
+let basename = exec("basename '" + input + "' .hexa").trim()
+let c_path = build_dir + "/jit_" + basename + ".c"
+let dylib_name = "jit_" + basename
+let dylib_path = build_dir + "/lib" + dylib_name + ".dylib"
+
+write_file(c_path, c_src)
+let cc_cmd = "cc -O2 -fPIC -dynamiclib -Wl,-install_name,@rpath/lib" + dylib_name + ".dylib -o " + dylib_path + " " + c_path + " 2>&1"
+let cc_out = exec(cc_cmd)
+if !file_exists(dylib_path) {
+    println("[jit] cc failed:")
+    println(cc_out)
+    exit(1)
+}
+
+// ---------- Step 5: write runner .hexa ----------
+// Strategy:
+//   1. emit `@link("jit_<basename>") extern fn jit_NAME(...) -> Int` per
+//      successfully-compiled fn (one for each).
+//   2. emit a thin Hexa wrapper `fn NAME(args)` that delegates to jit_NAME.
+//      This lets the rest of the source call `NAME(...)` unchanged.
+//   3. concatenate the original source with the @jit fn declarations
+//      excised (so the wrapper takes precedence).
+
+let mut runner = ""
+let mut ei = 0
+while ei < len(emitted) {
+    let f = emitted[ei]
+    runner = runner + "@link(\"" + dylib_name + "\")\n"
+    runner = runner + "extern fn jit_" + f["name"] + "("
+    let mut pi = 0
+    while pi < len(f["params"]) {
+        if pi > 0 { runner = runner + ", " }
+        runner = runner + f["params"][pi][0] + ": Int"
+        pi = pi + 1
+    }
+    runner = runner + ") -> Int\n"
+    // wrapper preserves original name
+    runner = runner + "fn " + f["name"] + "("
+    pi = 0
+    while pi < len(f["params"]) {
+        if pi > 0 { runner = runner + ", " }
+        runner = runner + f["params"][pi][0] + ": Int"
+        pi = pi + 1
+    }
+    runner = runner + ") -> Int { return jit_" + f["name"] + "("
+    pi = 0
+    while pi < len(f["params"]) {
+        if pi > 0 { runner = runner + ", " }
+        runner = runner + f["params"][pi][0]
+        pi = pi + 1
+    }
+    runner = runner + ") }\n\n"
+    ei = ei + 1
+}
+
+// excise original @jit fn declarations from src — work back-to-front so
+// indices stay valid.
+let mut clean_src = src
+let mut keep_ranges = []
+let mut last = 0
+let mut sorted_fns = []
+let mut si = 0
+while si < len(emitted) { sorted_fns.push(emitted[si]); si = si + 1 }
+// (already in source order)
+si = 0
+while si < len(sorted_fns) {
+    let s = sorted_fns[si]["decl_start"]
+    let e = sorted_fns[si]["decl_end"]
+    keep_ranges.push([last, s])
+    last = e
+    si = si + 1
+}
+keep_ranges.push([last, len(src)])
+let mut rebuilt = ""
+let mut ri = 0
+while ri < len(keep_ranges) {
+    rebuilt = rebuilt + src.substring(keep_ranges[ri][0], keep_ranges[ri][1])
+    ri = ri + 1
+}
+runner = runner + rebuilt
+
+write_file(out_runner, runner)
+
+println("[jit] compiled " + to_string(len(emitted)) + " fn(s) → " + dylib_path)
+println("[jit] runner written → " + out_runner)
+let mut br = 0
+while br < len(bail_reasons) { println(bail_reasons[br]); br = br + 1 }
+println("[jit] IR ops emitted: " + to_string(len(ir_log)))
