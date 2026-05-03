@@ -1,0 +1,195 @@
+// stdlib/bytes.hexa — byte/uint conversions (P1 — qmirror per-shot perf)
+//
+// @module(slug="stdlib-bytes", desc="byte-array <-> integer + hex helpers")
+// @usage(import stdlib/bytes; let u = bytes_to_uint64(qrng_bytes, 0))
+//
+// Source: anima/docs/hexa_lang_attr_review_for_qmirror_2026_05_03.md §5.5
+//
+// PROBLEM (qmirror sampler.hexa per-shot path)
+//   The hot loop pulls 8 bytes from the entropy source and folds them
+//   into a uint64 to drive the [0, 1) float used for measurement-basis
+//   selection. Today the conversion is `exec("printf '%d' 0x" + pair)`
+//   per byte pair — fork-per-shot. At 50K shots × 8B/shot that is 400K
+//   process forks, totally dominating the per-shot budget.
+//
+// FIX (additive, no runtime.c change)
+//   1. bytes_to_uint64(b, offset) -> int
+//        Big-endian fold of 8 bytes starting at b[offset]. Returns 0 if
+//        the slice would run off the end (no panic). Pure arithmetic, no
+//        exec — eliminates the per-shot fork cost.
+//   2. bytes_to_uint64_le(b, offset) -> int
+//        Little-endian variant for callers wrapping LE C structs.
+//   3. bytes_to_uint32(b, offset) -> int
+//        4-byte BE fold. Same family.
+//   4. int_from_hex(s) -> int
+//        "ff" / "0xFF" / "FF" → 255. Returns 0 on empty / bad input.
+//   5. hex_encode_bytes(b) -> string
+//        [0..255] array → "0a1bff…" lowercase. ASCII-safe.
+//   6. uint64_to_unit_float(u) -> float
+//        Convert a 64-bit uint into a [0, 1) double via division by 2^53
+//        (the largest power-of-two that fits losslessly into IEEE-754
+//        double). The top 11 bits of the uint are discarded — see caveat.
+//
+// Breaking risk: 0. New module, all new symbols. The runtime hex_encode
+// builtin (which encodes a string to hex) is untouched; this module's
+// hex_encode_bytes operates on an int-array of 0..255 byte values.
+//
+// Caveats (raw#91):
+//   · `bytes` in hexa convention is `[int]` with each element in 0..255.
+//     This module does NOT range-check input bytes — bytes outside
+//     0..255 produce silent overflow (e.g. b[i]=256 → result shifted
+//     wrong). qrng/anu byte arrays are guaranteed in-range; sister
+//     callers should pre-validate or use an upstream sanitizer.
+//   · uint64_to_unit_float discards 11 entropy bits to fit IEEE-754
+//     mantissa. For Bell-state / measurement-basis selection (4 outcomes)
+//     this is overkill precision; for cryptographic uses prefer raw
+//     bytes_to_uint64 + manual masking.
+//   · int_from_hex relies on the runtime hex_decode builtin per pair —
+//     which is itself implemented in C and runs in O(N). Acceptable for
+//     short cache-version strings; do NOT call in inner loops on KB-scale
+//     inputs (use hex_encode_bytes + cache).
+//   · No SIMD / runtime fast-path — these are pure arithmetic loops.
+//     Fine for 8-byte folds (per-shot path); KB-scale conversions
+//     should use a future C builtin if profiled hot.
+//
+// raw#9 hexa-only-strict: pure hexa, zero exec(), zero new C builtin.
+
+// ── bytes_to_uint64 — big-endian 8-byte fold ─────────────────────
+//
+// Reads b[offset..offset+8] as big-endian (network order) and returns
+// the 64-bit unsigned interpretation as a hexa int. Out-of-range
+// (offset < 0 OR offset+8 > len(b)) returns 0 — caller must pre-check
+// length if 0 is a valid result for them.
+//
+// Implementation: shift-by-multiply-256 to stay portable across hexa
+// integer types (the runtime int is signed 64; explicit shift would
+// require bit-ops on signed which behave platform-dependently).
+pub fn bytes_to_uint64(b, offset: int) -> int {
+    if offset < 0 { return 0 }
+    if type_of(b) != "array" { return 0 }
+    if offset + 8 > len(b) { return 0 }
+    let mut u = 0
+    let mut i = 0
+    while i < 8 {
+        u = u * 256 + b[offset + i]
+        i = i + 1
+    }
+    return u
+}
+
+// bytes_to_uint64_le — little-endian variant.
+//
+// Same range checks; reads b[offset+7] as the most-significant byte.
+pub fn bytes_to_uint64_le(b, offset: int) -> int {
+    if offset < 0 { return 0 }
+    if type_of(b) != "array" { return 0 }
+    if offset + 8 > len(b) { return 0 }
+    let mut u = 0
+    let mut i = 7
+    while i >= 0 {
+        u = u * 256 + b[offset + i]
+        i = i - 1
+    }
+    return u
+}
+
+// bytes_to_uint32 — big-endian 4-byte fold.
+pub fn bytes_to_uint32(b, offset: int) -> int {
+    if offset < 0 { return 0 }
+    if type_of(b) != "array" { return 0 }
+    if offset + 4 > len(b) { return 0 }
+    let mut u = 0
+    let mut i = 0
+    while i < 4 {
+        u = u * 256 + b[offset + i]
+        i = i + 1
+    }
+    return u
+}
+
+// ── int_from_hex — accept "ff", "0xff", "FF" ─────────────────────
+//
+// Decimal-only input is NOT supported (would overlap the to_int builtin
+// semantics ambiguously). Empty / non-hex input returns 0 silently —
+// caller treats 0 as the "no parse" sentinel, validating in a caller
+// scope that knows what 0 means in their problem domain.
+pub fn int_from_hex(s: string) -> int {
+    if len(s) == 0 { return 0 }
+    let mut t = s.trim()
+    if len(t) >= 2 && t.substring(0, 2) == "0x" {
+        t = t.substring(2, len(t))
+    }
+    if len(t) >= 2 && t.substring(0, 2) == "0X" {
+        t = t.substring(2, len(t))
+    }
+    if len(t) == 0 { return 0 }
+    let mut acc = 0
+    let mut i = 0
+    while i < len(t) {
+        let ch = t.substring(i, i + 1)
+        let d = _hex_digit(ch)
+        if d < 0 { return 0 }
+        acc = acc * 16 + d
+        i = i + 1
+    }
+    return acc
+}
+
+// _hex_digit — one hex char to 0..15, -1 on invalid.
+fn _hex_digit(ch: string) -> int {
+    if ch == "0" { return 0 }
+    if ch == "1" { return 1 }
+    if ch == "2" { return 2 }
+    if ch == "3" { return 3 }
+    if ch == "4" { return 4 }
+    if ch == "5" { return 5 }
+    if ch == "6" { return 6 }
+    if ch == "7" { return 7 }
+    if ch == "8" { return 8 }
+    if ch == "9" { return 9 }
+    if ch == "a" || ch == "A" { return 10 }
+    if ch == "b" || ch == "B" { return 11 }
+    if ch == "c" || ch == "C" { return 12 }
+    if ch == "d" || ch == "D" { return 13 }
+    if ch == "e" || ch == "E" { return 14 }
+    if ch == "f" || ch == "F" { return 15 }
+    return -1
+}
+
+// ── hex_encode_bytes — [0..255] array to lowercase hex string ────
+//
+// NOTE: the runtime `hex_encode` builtin operates on a STRING (encodes
+// each char's byte value). This module's `hex_encode_bytes` operates on
+// an INT-ARRAY (each element treated as a byte). Distinct functions for
+// distinct inputs — sister callers using qrng [int]-byte arrays land
+// here; callers with text strings stay on the runtime builtin.
+pub fn hex_encode_bytes(b) -> string {
+    if type_of(b) != "array" { return "" }
+    let table = "0123456789abcdef"
+    let mut s = ""
+    let mut i = 0
+    while i < len(b) {
+        let v = b[i]
+        let hi = (v / 16) % 16
+        let lo = v % 16
+        s = s + table.substring(hi, hi + 1) + table.substring(lo, lo + 1)
+        i = i + 1
+    }
+    return s
+}
+
+// ── uint64_to_unit_float — uint to [0, 1) ────────────────────────
+//
+// Scales a 64-bit unsigned (passed as a hexa int) into the half-open
+// [0, 1) interval by dividing by 2^53. The mantissa-aligned divisor
+// guarantees the result has full IEEE-754 double precision and never
+// reaches exactly 1.0.
+//
+// Only the low 53 bits of the input are used (top 11 bits discarded
+// via integer division). Adequate for ≤2^53 distinct outcomes — far
+// beyond the qmirror Bell-test 4-outcome alphabet.
+pub fn uint64_to_unit_float(u: int) -> float {
+    let denom = 9007199254740992.0  // 2^53
+    let masked = u % 9007199254740992  // keep low 53 bits
+    return to_float(masked) / denom
+}

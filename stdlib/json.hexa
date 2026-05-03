@@ -1,0 +1,155 @@
+// stdlib/json.hexa — JSON write-side helpers (P1 — qmirror calibration cache)
+//
+// @module(slug="stdlib-json", desc="write-side JSON helpers built on the runtime json_stringify builtin")
+// @usage(import stdlib/json; let s = json_dump_pretty(cache_map, 2))
+//
+// Source: anima/docs/hexa_lang_attr_review_for_qmirror_2026_05_03.md §5.3
+//
+// PROBLEM (qmirror calibration cache writeback)
+//   nexus/modules/{calibration_v2,engine_aer}.hexa need to serialize a
+//   nested map (counts, ρ matrix slices, per-shot timings) to disk with
+//   stable, diff-friendly formatting. The runtime `json_stringify` builtin
+//   produces compact one-line output — fine for transport, awkward for
+//   git-diffable cache files. Sisters were hand-concatenating
+//   `"{\"key\": " + ... + "}"` strings (escape-fragile).
+//
+// FIX (additive, no runtime.c change)
+//   1. json_stringify_value(v) -> string
+//        Stable alias over the runtime `json_stringify` builtin so callers
+//        that `use "stdlib/json"` get a guaranteed symbol path. Pure
+//        delegation — no behavioural change vs builtin.
+//   2. json_dump_pretty(v, indent) -> string
+//        Recursive pretty-printer. Indent = number of spaces per level
+//        (0 = compact, 2 = canonical cache format).
+//   3. json_object_set(obj, key, value) -> map
+//        In-place set (via index assignment) returning the same map for
+//        chaining. Mirrors hexa map convention without forcing callers to
+//        learn the `obj[key] = v` syntax inside expression contexts.
+//   4. json_array_push(arr, value) -> array
+//        Same idea for arrays — return-self push.
+//
+// Breaking risk: 0. All new symbol names; the runtime `json_stringify`
+// builtin is untouched and remains the canonical compact encoder.
+// stdlib/json_object.hexa (read side) is unchanged.
+//
+// Caveats (raw#91):
+//   · json_dump_pretty escaping is the runtime builtin's escape policy
+//     applied per-leaf — minimal `\\`, `\"`, `\n` only. Calibration cache
+//     payload is ASCII-numeric, so this is adequate. Arbitrary user input
+//     direct-serialize is NOT safe (UTF-16 surrogate pair, control chars
+//     not handled). See attr review §6 caveat 7.
+//   · The pretty-printer parses-then-re-emits via json_stringify on each
+//     leaf — O(N · depth) string concat, not the optimal single-pass
+//     emitter. For typical calibration files (<100KB) this is negligible.
+//   · json_object_set/json_array_push mutate the caller's map/array in
+//     place. The return value is the same reference — useful for
+//     chaining, NOT a copy. Callers mutating shared state should clone
+//     first via json_parse(json_stringify(orig)).
+//
+// raw#9 hexa-only-strict: pure hexa wrapper, zero exec(), zero new C
+//   builtin. The underlying serializer is the existing runtime
+//   `json_stringify` already exercised by 37+ callsites (see runtime.c
+//   line 6669 inventory).
+
+// ── json_stringify_value — runtime builtin alias ─────────────────
+//
+// Re-exports the runtime json_stringify under a path-stable name. Callers
+// that `use "stdlib/json"` can rely on this symbol surviving any future
+// runtime rename. Pure passthrough — no allocation, no escape changes.
+pub fn json_stringify_value(v) -> string {
+    return json_stringify(v)
+}
+
+// ── json_dump_pretty — recursive pretty-printer ──────────────────
+//
+// Emits `v` as JSON with `indent` spaces per nesting level. indent=0
+// degenerates to compact mode (delegates to runtime builtin one-shot).
+//
+// Type dispatch uses runtime type_of() — identical to the builtin's own
+// dispatch table. Unknown types fall through to the builtin which emits
+// "null" or a quoted string representation depending on runtime policy.
+pub fn json_dump_pretty(v, indent: int) -> string {
+    if indent <= 0 { return json_stringify(v) }
+    return _json_dump_indent(v, indent, 0)
+}
+
+// _json_dump_indent — internal recursive emitter.
+//
+// `level` is the current nesting depth (0 at root). The pad is computed
+// fresh each level; cheap O(depth) string-build, not memoised because
+// depth in calibration files is typically ≤4.
+fn _json_dump_indent(v, indent: int, level: int) -> string {
+    let t = type_of(v)
+    if t == "void" { return "null" }
+    if t == "bool" { return json_stringify(v) }
+    if t == "int" { return json_stringify(v) }
+    if t == "float" { return json_stringify(v) }
+    if t == "string" { return json_stringify(v) }
+    if t == "array" {
+        if len(v) == 0 { return "[]" }
+        let pad = _json_pad(indent, level + 1)
+        let close_pad = _json_pad(indent, level)
+        let mut out = "[\n"
+        let mut i = 0
+        while i < len(v) {
+            out = out + pad + _json_dump_indent(v[i], indent, level + 1)
+            if i + 1 < len(v) { out = out + "," }
+            out = out + "\n"
+            i = i + 1
+        }
+        out = out + close_pad + "]"
+        return out
+    }
+    if t == "map" {
+        let ks = dict_keys(v)
+        if len(ks) == 0 { return "{}" }
+        let pad = _json_pad(indent, level + 1)
+        let close_pad = _json_pad(indent, level)
+        let mut out = "{\n"
+        let mut i = 0
+        while i < len(ks) {
+            let k = ks[i]
+            out = out + pad + json_stringify(k) + ": " + _json_dump_indent(v[k], indent, level + 1)
+            if i + 1 < len(ks) { out = out + "," }
+            out = out + "\n"
+            i = i + 1
+        }
+        out = out + close_pad + "}"
+        return out
+    }
+    return json_stringify(v)
+}
+
+// _json_pad — N spaces per level, computed on demand.
+fn _json_pad(indent: int, level: int) -> string {
+    let total = indent * level
+    let mut s = ""
+    let mut i = 0
+    while i < total {
+        s = s + " "
+        i = i + 1
+    }
+    return s
+}
+
+// ── json_object_set / json_array_push — in-place builders ────────
+//
+// Conventional hexa style is `m[k] = v` and `arr.push(v)`. These
+// helpers exist for two ergonomic reasons:
+//   1. Chainable: `json_object_set(json_object_set(m, "a", 1), "b", 2)`
+//      builds a map in expression context (no statement chain needed).
+//   2. Symbol stability: callers using `use "stdlib/json"` get a
+//      guaranteed-named entry point that survives map literal syntax
+//      churn (the language has had three map literal forms — `{}`,
+//      `#{}`, `json_parse("{}")` — over its lifetime).
+//
+// Return value is the SAME map/array reference (mutated in place).
+pub fn json_object_set(obj, key: string, value) {
+    obj[key] = value
+    return obj
+}
+
+pub fn json_array_push(arr, value) {
+    arr.push(value)
+    return arr
+}
