@@ -1,0 +1,453 @@
+// stdlib/websocket.hexa — WebSocket client (RFC 6455) over ws:// + wss://
+//
+// @module(slug="stdlib-websocket", desc="RFC 6455 WebSocket client (connect/send/recv/close)")
+// @usage(import stdlib/websocket; let ws = ws_connect("wss://echo.websocket.events"); ws_send(ws, "hello"))
+//
+// @version 1.0.0
+// @capabilities [ws_connect, ws_send, ws_recv, ws_close, ws_request_response, ws_available]
+// @stability stable
+// @since 2026-05-04
+// @maintainer anima-core
+// @priority P1
+//
+// PROBLEM
+//   Hexa stdlib has stdlib/net/socket (raw TCP) and stdlib/net/http_*
+//   (curl-shellout HTTP) but no WebSocket layer. WebSockets are required
+//   for streaming inference APIs (HF/OpenAI realtime, ElevenLabs TTS,
+//   AnimaQ live qubit telemetry) — anything where one TCP+TLS handshake
+//   amortizes over a long bidirectional message stream.
+//
+//   Implementing RFC 6455 in pure hexa would need:
+//     · TLS handshake for wss:// (no hexa TLS primitive yet)
+//     · Sec-WebSocket-Key SHA-1 + base64 (no SHA-1 builtin yet)
+//     · Frame masking (XOR), opcode tagging, fragmentation
+//   This is a multi-week C-runtime addition. We sidestep it with a
+//   ubiquitous-tool wrapper that keeps the API hexa-native.
+//
+// FIX (additive, no runtime.c change)
+//   Wrap a portable WebSocket helper. Two backends, auto-selected:
+//     1. `websocat` (preferred): a single-binary wss client. If
+//        $(command -v websocat) succeeds, use the streaming subprocess
+//        spawned via stdlib/proc.proc_spawn_supervised. One-shot
+//        request-response uses the simpler synchronous path.
+//     2. `python3` fallback: emit an inline Python script (stdlib only:
+//        socket + ssl + base64 + hashlib + os.urandom) and pipe it
+//        through stdlib/proc.proc_run_with_stdin. python3 ships in macOS
+//        ≥ 12 and every modern Linux/BSD; the script implements the
+//        masked-client-frame subset of RFC 6455 sufficient for text
+//        request-response + close.
+//
+//   The high-level hexa-side API stays the same regardless of backend:
+//     ws_request_response(url, message, timeout_sec) -> map
+//        One-shot connect + send-text + recv-text + close. Returns
+//        {"ok": bool, "reply": string, "error": string, "backend": string}.
+//
+//     ws_connect(url, timeout_sec) -> map
+//        Long-lived stream (websocat backend only — pid + .resource).
+//        Returns {"ok": bool, "pid": int, "in": string, "out": string,
+//                 "error": string, "backend": string} where in/out are
+//        named-pipe paths. Falls through to {"ok": false, ...} when only
+//        the python fallback is available.
+//     ws_send(handle, message) -> bool
+//     ws_recv(handle, timeout_sec) -> string  (empty on timeout/close)
+//     ws_close(handle) -> bool
+//
+//     ws_available() -> map  Probe which backends are usable.
+//
+// Breaking risk: 0. New module, new symbols.
+//
+// Caveats (raw#91):
+//   · websocat is NOT a default install on macOS or stock Linux. The
+//     python3 fallback covers most environments but is one-shot only
+//     (no streaming). For streaming workloads the operator must
+//     `brew install websocat` / `cargo install websocat`.
+//   · python3 fallback uses a 16-byte random mask via os.urandom and a
+//     SHA-1+base64 Sec-WebSocket-Accept verification. Server TLS cert
+//     chain is verified via the system trust store (ssl.create_default_
+//     context); self-signed/MITM origins fail with ok=false. (P2: pass
+//     a CA-bundle path through.)
+//   · Binary frames are NOT supported by ws_request_response — only
+//     opcode 0x1 (text). Streaming via websocat backend is byte-clean.
+//   · Frames > 64KB in the python fallback fragment to two reads; the
+//     helper script reassembles before returning. No 4GB-frame test —
+//     limit is python-int / hexa-string practical (a few MB).
+//   · Close opcode 0x8 sent on exit; close-code is hard-coded 1000 (Normal).
+//
+// raw#9 hexa-only-strict: hexa source emits the python helper inline
+// — no separate file shipped. Caller's filesystem stays clean
+// (proc_run_with_stdin's tempfile is /tmp + auto-unlinked).
+
+use "stdlib/proc"
+
+// ws_available — probe backends.
+//
+// Returns a map: {"websocat": bool, "python3": bool, "any": bool}.
+// Callers use this to decide whether to skip a test gracefully (e.g.
+// `if !ws_available()["any"] { return }` mirrors SKIP_NET=1 semantics).
+pub fn ws_available() {
+    let result = #{}
+    let ws = to_string(exec("command -v websocat >/dev/null 2>&1 && echo y || echo n")).trim()
+    let py = to_string(exec("command -v python3 >/dev/null 2>&1 && echo y || echo n")).trim()
+    result["websocat"] = ws == "y"
+    result["python3"] = py == "y"
+    result["any"] = result["websocat"] || result["python3"]
+    return result
+}
+
+// _ws_shell_escape — reused single-quote escape pattern.
+fn _ws_shell_escape(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+// _ws_python_helper_source — emit the inline python3 RFC 6455 client.
+//
+// Reads JSON `{"url": "...", "msg": "...", "timeout": int}` from stdin,
+// writes JSON `{"ok": 0/1, "reply": "...", "error": "..."}` to stdout.
+//
+// Subset implemented:
+//   · ws://  (plain TCP)  +  wss://  (ssl-wrapped TCP)
+//   · Client-to-server text frame (opcode 0x1) with 16-byte random mask
+//   · Server-to-client text frame, single fragment, payload < 2^63
+//   · Close handshake (opcode 0x8) on exit
+//
+// Not implemented (out of scope for one-shot request-response):
+//   · Frame fragmentation (FIN=0)  ·  Ping/Pong (opcode 0x9 / 0xA)
+//   · Permessage-deflate extension  ·  Subprotocol negotiation
+fn _ws_python_helper_source() -> string {
+    let mut s = ""
+    s = s + "import sys, json, socket, ssl, os, base64, hashlib, struct\n"
+    s = s + "from urllib.parse import urlsplit\n"
+    s = s + "def fail(msg):\n"
+    s = s + "    print(json.dumps({'ok': 0, 'reply': '', 'error': msg}))\n"
+    s = s + "    sys.exit(0)\n"
+    s = s + "try:\n"
+    s = s + "    req = json.loads(sys.stdin.read())\n"
+    s = s + "    url = req['url']; msg = req.get('msg', ''); timeout = float(req.get('timeout', 10))\n"
+    s = s + "    u = urlsplit(url)\n"
+    s = s + "    secure = (u.scheme == 'wss')\n"
+    s = s + "    host = u.hostname\n"
+    s = s + "    port = u.port or (443 if secure else 80)\n"
+    s = s + "    path = u.path or '/'\n"
+    s = s + "    if u.query: path = path + '?' + u.query\n"
+    s = s + "    sock = socket.create_connection((host, port), timeout=timeout)\n"
+    s = s + "    if secure:\n"
+    s = s + "        ctx = ssl.create_default_context()\n"
+    s = s + "        sock = ctx.wrap_socket(sock, server_hostname=host)\n"
+    s = s + "    key = base64.b64encode(os.urandom(16)).decode()\n"
+    s = s + "    handshake = ('GET ' + path + ' HTTP/1.1\\r\\n'\n"
+    s = s + "                 'Host: ' + host + '\\r\\n'\n"
+    s = s + "                 'Upgrade: websocket\\r\\n'\n"
+    s = s + "                 'Connection: Upgrade\\r\\n'\n"
+    s = s + "                 'Sec-WebSocket-Key: ' + key + '\\r\\n'\n"
+    s = s + "                 'Sec-WebSocket-Version: 13\\r\\n'\n"
+    s = s + "                 'User-Agent: hexa-stdlib-websocket/1.0\\r\\n'\n"
+    s = s + "                 '\\r\\n')\n"
+    s = s + "    sock.sendall(handshake.encode())\n"
+    s = s + "    buf = b''\n"
+    s = s + "    while b'\\r\\n\\r\\n' not in buf:\n"
+    s = s + "        chunk = sock.recv(4096)\n"
+    s = s + "        if not chunk: fail('handshake closed early')\n"
+    s = s + "        buf += chunk\n"
+    s = s + "    head, _, rest = buf.partition(b'\\r\\n\\r\\n')\n"
+    s = s + "    status = head.split(b'\\r\\n', 1)[0]\n"
+    s = s + "    if b'101' not in status: fail('handshake status: ' + status.decode('latin-1', 'replace'))\n"
+    s = s + "    expect = base64.b64encode(hashlib.sha1((key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').encode()).digest()).decode()\n"
+    s = s + "    if expect.encode().lower() not in head.lower(): fail('Sec-WebSocket-Accept mismatch')\n"
+    s = s + "    payload = msg.encode('utf-8')\n"
+    s = s + "    n = len(payload)\n"
+    s = s + "    frame = bytearray([0x81])\n"
+    s = s + "    if n < 126: frame.append(0x80 | n)\n"
+    s = s + "    elif n < 65536: frame.append(0x80 | 126); frame += struct.pack('>H', n)\n"
+    s = s + "    else: frame.append(0x80 | 127); frame += struct.pack('>Q', n)\n"
+    s = s + "    mask = os.urandom(4); frame += mask\n"
+    s = s + "    frame += bytes(b ^ mask[i % 4] for i, b in enumerate(payload))\n"
+    s = s + "    sock.sendall(bytes(frame))\n"
+    s = s + "    sock.settimeout(timeout)\n"
+    s = s + "    def recv_n(n):\n"
+    s = s + "        out = b''\n"
+    s = s + "        while len(out) < n:\n"
+    s = s + "            c = sock.recv(n - len(out))\n"
+    s = s + "            if not c: break\n"
+    s = s + "            out += c\n"
+    s = s + "        return out\n"
+    s = s + "    pre = rest\n"
+    s = s + "    def take(n):\n"
+    s = s + "        nonlocal pre\n"
+    s = s + "        while len(pre) < n:\n"
+    s = s + "            c = sock.recv(4096)\n"
+    s = s + "            if not c: break\n"
+    s = s + "            pre += c\n"
+    s = s + "        out, pre = pre[:n], pre[n:]\n"
+    s = s + "        return out\n"
+    s = s + "    h = take(2)\n"
+    s = s + "    if len(h) < 2: fail('truncated frame header')\n"
+    s = s + "    b1, b2 = h[0], h[1]\n"
+    s = s + "    op = b1 & 0x0F\n"
+    s = s + "    masked = (b2 & 0x80) != 0\n"
+    s = s + "    plen = b2 & 0x7F\n"
+    s = s + "    if plen == 126: plen = struct.unpack('>H', take(2))[0]\n"
+    s = s + "    elif plen == 127: plen = struct.unpack('>Q', take(8))[0]\n"
+    s = s + "    mkey = take(4) if masked else b''\n"
+    s = s + "    body = take(plen)\n"
+    s = s + "    if masked: body = bytes(b ^ mkey[i % 4] for i, b in enumerate(body))\n"
+    s = s + "    if op == 0x8:\n"
+    s = s + "        print(json.dumps({'ok': 0, 'reply': '', 'error': 'server closed: ' + body[2:].decode('utf-8', 'replace')}))\n"
+    s = s + "        sys.exit(0)\n"
+    s = s + "    if op != 0x1:\n"
+    s = s + "        print(json.dumps({'ok': 0, 'reply': '', 'error': 'non-text opcode 0x%x' % op}))\n"
+    s = s + "        sys.exit(0)\n"
+    s = s + "    reply = body.decode('utf-8', 'replace')\n"
+    s = s + "    cmask = os.urandom(4)\n"
+    s = s + "    cframe = bytes([0x88, 0x82]) + cmask + bytes([cmask[0] ^ 0x03, cmask[1] ^ 0xE8])\n"
+    s = s + "    try: sock.sendall(cframe); sock.close()\n"
+    s = s + "    except Exception: pass\n"
+    s = s + "    print(json.dumps({'ok': 1, 'reply': reply, 'error': ''}))\n"
+    s = s + "except Exception as e:\n"
+    s = s + "    fail(type(e).__name__ + ': ' + str(e))\n"
+    return s
+}
+
+// _ws_request_response_python — python3 fallback path.
+fn _ws_request_response_python(url: string, message: string, timeout_sec: int) {
+    let result = #{}
+    result["ok"] = false
+    result["reply"] = ""
+    result["error"] = ""
+    result["backend"] = "python3"
+
+    let payload = #{}
+    payload["url"] = url
+    payload["msg"] = message
+    payload["timeout"] = timeout_sec
+    let stdin_str = json_stringify(payload)
+
+    let helper = _ws_python_helper_source()
+    let nonce = to_string(exec("date +%s%N | tr -d '\\n'")).trim()
+    if len(nonce) == 0 { nonce = "0" }
+    let helper_path = "/tmp/hexa_ws_helper_" + nonce + ".py"
+    write_file(helper_path, helper)
+
+    let cmd = "python3 " + _ws_shell_escape(helper_path)
+    let stdout = proc_run_with_stdin(cmd, stdin_str)
+    let _drop = exec("rm -f " + _ws_shell_escape(helper_path))
+
+    // Locate last JSON object — same heuristic as proc_run_json_bridge,
+    // but inlined here because we want the parsed shape on the wrapper's
+    // result map (not the raw bridge map).
+    let last_open = stdout.last_index_of("{")
+    let last_close = stdout.last_index_of("}")
+    if last_open < 0 || last_close < 0 || last_close < last_open {
+        result["error"] = "python helper: no JSON in stdout: " + stdout
+        return result
+    }
+    let parsed = json_parse(stdout.substring(last_open, last_close + 1))
+    if type_of(parsed) != "map" {
+        result["error"] = "python helper: stdout was not JSON map"
+        return result
+    }
+    let ok_v = parsed["ok"]
+    result["ok"] = to_int(ok_v) == 1
+    result["reply"] = to_string(parsed["reply"])
+    result["error"] = to_string(parsed["error"])
+    return result
+}
+
+// _ws_request_response_websocat — websocat one-shot path.
+//
+// `websocat -n1` reads a single line from stdin, sends it as a text
+// frame, prints the first received text frame to stdout, then exits.
+// We pipe `message + "\n"` via proc_run_with_stdin and trim the trailing
+// newline from the reply.
+fn _ws_request_response_websocat(url: string, message: string, timeout_sec: int) {
+    let result = #{}
+    result["ok"] = false
+    result["reply"] = ""
+    result["error"] = ""
+    result["backend"] = "websocat"
+
+    let t = if timeout_sec > 0 { timeout_sec } else { 10 }
+    // -n1: exit after one received frame; -E: close on stdin EOF;
+    // --no-close: don't auto-send close frame (server will reciprocate).
+    let cmd = "websocat -n1 -E " + _ws_shell_escape(url)
+    // Wrap with `timeout` if available — websocat itself has no
+    // built-in handshake/recv timeout flag.
+    let has_timeout = to_string(exec("command -v timeout >/dev/null 2>&1 && echo y || echo n")).trim()
+    let wrapped = if has_timeout == "y" {
+        "timeout " + to_string(t) + " " + cmd
+    } else {
+        cmd
+    }
+    let stdout = proc_run_with_stdin(wrapped + " 2>&1", message + "\n")
+
+    if len(stdout) == 0 {
+        result["error"] = "websocat: empty reply (timeout or close before frame)"
+        return result
+    }
+    // websocat emits the reply followed by "\n"; trim one trailing newline.
+    let mut reply = stdout
+    if reply.substring(len(reply) - 1, len(reply)) == "\n" {
+        reply = reply.substring(0, len(reply) - 1)
+    }
+    result["ok"] = true
+    result["reply"] = reply
+    return result
+}
+
+// ws_request_response — one-shot WebSocket text-message exchange.
+//
+// Connect, send `message`, receive one text frame, close. Returns
+// {"ok": bool, "reply": string, "error": string, "backend": string}.
+//
+// Backend selection:
+//   1. websocat if installed (streams cleanly; better for binary frames
+//      future P2 — though current wrapper is text-only).
+//   2. python3 fallback (universally available).
+//   3. Both missing → ok=false, error="no websocket backend available".
+//
+// Skip-on-offline policy: callers gate on ws_available()["any"] OR on
+// env var SKIP_NET=1 BEFORE invoking, since this function will block on
+// DNS / TCP for up to timeout_sec.
+pub fn ws_request_response(url: string, message: string, timeout_sec: int) {
+    let avail = ws_available()
+    if avail["websocat"] {
+        return _ws_request_response_websocat(url, message, timeout_sec)
+    }
+    if avail["python3"] {
+        return _ws_request_response_python(url, message, timeout_sec)
+    }
+    let result = #{}
+    result["ok"] = false
+    result["reply"] = ""
+    result["error"] = "no websocket backend available (need websocat or python3)"
+    result["backend"] = ""
+    return result
+}
+
+// ── streaming API (websocat-only) ───────────────────────────────────
+//
+// The streaming API spawns a long-lived websocat as a supervised
+// subprocess (stdlib/proc). Two FIFOs (named pipes) carry stdin/stdout
+// to/from the subprocess. Hexa-side ws_send / ws_recv are line-oriented
+// writes/reads on those pipes.
+//
+// Limitations:
+//   · Text frames only (websocat default mode). Binary requires `-b`
+//     and a separate API surface — left as P2.
+//   · ws_recv is line-buffered; servers that emit multi-line text
+//     frames will surface as multiple ws_recv calls. Callers that need
+//     framing must tag messages themselves.
+//   · No streaming backend on python3 (would need select/asyncio +
+//     two-way fifo plumbing — too heavy for a one-file fallback).
+
+// ws_connect — open a streaming WebSocket via supervised websocat.
+//
+// Returns a handle map {"ok": bool, "pid": int, "in": string,
+// "out": string, "error": string, "backend": string}. `in` is the path
+// to a FIFO the caller writes to (each write becomes a websocat stdin
+// line → text frame); `out` is the FIFO the caller reads from (each
+// websocat stdout line is one received text frame).
+pub fn ws_connect(url: string, timeout_sec: int) {
+    let h = #{}
+    h["ok"] = false
+    h["pid"] = 0
+    h["in"] = ""
+    h["out"] = ""
+    h["error"] = ""
+    h["backend"] = ""
+
+    let avail = ws_available()
+    if !avail["websocat"] {
+        h["error"] = "ws_connect requires websocat (python3 fallback is one-shot only)"
+        return h
+    }
+    h["backend"] = "websocat"
+
+    let nonce = to_string(exec("date +%s%N | tr -d '\\n'")).trim()
+    let in_path = "/tmp/hexa_ws_in_" + nonce + ".fifo"
+    let out_path = "/tmp/hexa_ws_out_" + nonce + ".fifo"
+    let mk1 = to_string(exec("mkfifo " + _ws_shell_escape(in_path) + " 2>&1; echo $?")).trim()
+    let mk2 = to_string(exec("mkfifo " + _ws_shell_escape(out_path) + " 2>&1; echo $?")).trim()
+    if !mk1.ends_with("0") || !mk2.ends_with("0") {
+        h["error"] = "mkfifo failed: in=" + mk1 + " out=" + mk2
+        return h
+    }
+
+    let t = if timeout_sec > 0 { timeout_sec } else { 30 }
+    let cmd = "websocat " + _ws_shell_escape(url) + " < " + _ws_shell_escape(in_path) + " > " + _ws_shell_escape(out_path) + " 2>/dev/null"
+    let pid = proc_spawn_supervised(cmd, t * 4, "websocket stream to " + url)
+    if pid <= 0 {
+        let _drop1 = exec("rm -f " + _ws_shell_escape(in_path))
+        let _drop2 = exec("rm -f " + _ws_shell_escape(out_path))
+        h["error"] = "proc_spawn_supervised returned 0"
+        return h
+    }
+    h["ok"] = true
+    h["pid"] = pid
+    h["in"] = in_path
+    h["out"] = out_path
+    return h
+}
+
+// ws_send — write one text-frame message on the connection.
+//
+// Appends `\n` to delimit the frame for websocat's line mode.
+pub fn ws_send(h, message: string) -> bool {
+    if type_of(h) != "map" { return false }
+    let in_path = to_string(h["in"])
+    if len(in_path) == 0 { return false }
+    // Append-write to the FIFO. We do this via shell `printf` rather
+    // than write_file/append_file because FIFO writes need to block
+    // until the reader is present — append_file may not have FIFO
+    // semantics on every runtime backend.
+    let escaped = _ws_shell_escape(message + "\n")
+    let _w = exec("printf %s " + escaped + " > " + _ws_shell_escape(in_path) + " &")
+    return true
+}
+
+// ws_recv — block-read up to one frame (one line).
+//
+// Returns the received string ("" on timeout / connection-closed).
+// Implementation: `head -n 1` blocks on the FIFO until websocat emits
+// a line, or closes (returns ""). Wrap with `timeout` if available so a
+// dead connection doesn't hang forever.
+pub fn ws_recv(h, timeout_sec: int) -> string {
+    if type_of(h) != "map" { return "" }
+    let out_path = to_string(h["out"])
+    if len(out_path) == 0 { return "" }
+    let t = if timeout_sec > 0 { timeout_sec } else { 30 }
+    let has_timeout = to_string(exec("command -v timeout >/dev/null 2>&1 && echo y || echo n")).trim()
+    let cmd = if has_timeout == "y" {
+        "timeout " + to_string(t) + " head -n 1 " + _ws_shell_escape(out_path)
+    } else {
+        "head -n 1 " + _ws_shell_escape(out_path)
+    }
+    let raw = to_string(exec(cmd))
+    if len(raw) == 0 { return "" }
+    if raw.substring(len(raw) - 1, len(raw)) == "\n" {
+        return raw.substring(0, len(raw) - 1)
+    }
+    return raw
+}
+
+// ws_shell_escape_for_test — expose the single-quote escape for golden-
+// fixture tests. Pure string transform; identical to the rest of the
+// stdlib's shell-escape idiom.
+pub fn ws_shell_escape_for_test(s: string) -> string {
+    return _ws_shell_escape(s)
+}
+
+// ws_close — terminate the supervised websocat + clean up FIFOs.
+pub fn ws_close(h) -> bool {
+    if type_of(h) != "map" { return false }
+    let pid = to_int(h["pid"])
+    let in_path = to_string(h["in"])
+    let out_path = to_string(h["out"])
+    let reaped = if pid > 0 { proc_reap(pid) } else { false }
+    if len(in_path) > 0 {
+        let _drop1 = exec("rm -f " + _ws_shell_escape(in_path))
+    }
+    if len(out_path) > 0 {
+        let _drop2 = exec("rm -f " + _ws_shell_escape(out_path))
+    }
+    return reaped
+}

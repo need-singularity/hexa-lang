@@ -1,0 +1,243 @@
+// stdlib/test/golden.hexa — golden-value fixture loader for native modules.
+//
+// @module(slug="stdlib-test-golden", desc="loader + assertion helpers for fixtures/<module>/golden_<case>.json")
+// @usage(import stdlib/test/golden; let g = golden_load("fixtures/bytes/golden_bytes_to_uint64_be.json"); golden_assert_eq(g, actual))
+//
+// ── module governance metadata (hexa-lang module versioning spec 2026-05-03) ──
+// @version 1.0.0
+// @capabilities [golden_load, golden_assert_eq, golden_value_eq, golden_canonical_str, golden_modules_in_dir, golden_files_for_module]
+// @stability stable
+// @since 2026-05-04
+// @maintainer anima-core
+// @priority P1
+// Versioning policy: docs/hexa_lang_module_versioning_spec_2026_05_03.md
+//
+// PROBLEM (F-FIXTURES-1)
+//   Native modules (FFI/builtin-backed: bytes, json, parse, yaml,
+//   safetensors, qrng_anu, sqlite, proc, http, websocket, http2,
+//   registry_autodiscover) historically embedded their reference values
+//   inline inside test_<m>.hexa as string/int literals. Cross-module the
+//   pattern was ad-hoc — `_pcg32_reference`-style helpers, raw#37 transient
+//   constants — every module re-invented its own assertion shape.
+//
+// FIX (additive, no runtime.c change)
+//   1. Canonical fixture file layout —
+//        fixtures/<module>/golden_<case>.json
+//      with content shape:
+//        {
+//          "module":   "<module>",
+//          "fn":       "<public function under test>",
+//          "case":     "<short case slug>",
+//          "input":    <any json value — the call's input>,
+//          "expected": <any json value — the expected output>,
+//          "notes":    "<optional human-readable provenance>"
+//        }
+//   2. golden_load(path) -> map         — reads + json_parse-es a fixture
+//   3. golden_assert_eq(g, actual)      — recursive equality vs g["expected"]
+//   4. golden_value_eq(a, b) -> bool    — deep equality (map/array/scalar)
+//   5. golden_canonical_str(v) -> str   — stable ordered JSON for diffs
+//   6. golden_modules_in_dir(root)      — list immediate-child module slugs
+//   7. golden_files_for_module(root, m) — list golden_*.json file names
+//
+// Determinism notes:
+//   · Fixtures are shipped as JSON literals, NOT generated at runtime.
+//     This keeps them git-diffable and immune to host endian / locale.
+//   · For modules whose primary fn is non-deterministic (network, fork,
+//     sleep), the golden covers a deterministic sub-helper (parser, escape,
+//     dtype-table) — see fixtures/<module>/golden_*.json `notes` field.
+//
+// raw#9 hexa-only-strict: pure hexa, zero exec(), zero new C builtin.
+// Built on runtime json_parse + json_stringify + read_file.
+
+use "stdlib/json"
+use "stdlib/json_object"
+
+// ── golden_load ─────────────────────────────────────────────────────────────
+//
+// Read a fixture JSON file and return its parsed map. On any failure
+// (missing file, malformed JSON, non-object root) returns an empty map
+// with `_loaded=false` so callers can detect the load miss without crashing
+// the entire test runner. Successful loads have `_loaded=true`.
+pub fn golden_load(path: string) -> map {
+    let mut out = #{}
+    out["_loaded"] = false
+    out["_path"] = path
+    let raw = read_file(path)
+    let text = to_string(raw)
+    if len(text) == 0 {
+        out["_error"] = "empty_or_missing"
+        return out
+    }
+    let parsed = json_parse_object(text)
+    let ks = dict_keys(parsed)
+    if len(ks) == 0 {
+        out["_error"] = "non_object_root"
+        return out
+    }
+    parsed["_loaded"] = true
+    parsed["_path"] = path
+    return parsed
+}
+
+// ── golden_value_eq ─────────────────────────────────────────────────────────
+//
+// Recursive structural equality across hexa scalar/map/array. Map equality
+// is order-independent (key set + per-key value). Float comparison is
+// exact — fixtures should hold integer-valued floats or canonical
+// stringified floats to avoid cross-platform drift.
+pub fn golden_value_eq(a, b) -> bool {
+    let ta = type_of(a)
+    let tb = type_of(b)
+    if ta != tb { return false }
+    if ta == "map" {
+        let ka = dict_keys(a)
+        let kb = dict_keys(b)
+        if len(ka) != len(kb) { return false }
+        let mut i = 0
+        while i < len(ka) {
+            let k = ka[i]
+            if !has_key(b, k) { return false }
+            if !golden_value_eq(a[k], b[k]) { return false }
+            i = i + 1
+        }
+        return true
+    }
+    if ta == "array" {
+        if len(a) != len(b) { return false }
+        let mut i = 0
+        while i < len(a) {
+            if !golden_value_eq(a[i], b[i]) { return false }
+            i = i + 1
+        }
+        return true
+    }
+    return a == b
+}
+
+// ── golden_canonical_str ────────────────────────────────────────────────────
+//
+// Produce a stable diff-friendly string for a hexa value (used in FAIL
+// messages so the user sees exactly what mismatched). Maps are emitted
+// with sorted keys.
+pub fn golden_canonical_str(v) -> string {
+    let t = type_of(v)
+    if t == "map" {
+        let ks = dict_keys(v)
+        // insertion sort — hexa interp has no .sort on string arrays we can rely on.
+        let mut sorted = []
+        let mut i = 0
+        while i < len(ks) {
+            let k = ks[i]
+            let mut j = 0
+            let mut inserted = false
+            let mut next = []
+            while j < len(sorted) {
+                if !inserted && k < sorted[j] {
+                    next.push(k)
+                    inserted = true
+                }
+                next.push(sorted[j])
+                j = j + 1
+            }
+            if !inserted { next.push(k) }
+            sorted = next
+            i = i + 1
+        }
+        let mut s = "{"
+        let mut p = 0
+        while p < len(sorted) {
+            if p > 0 { s = s + "," }
+            let k = sorted[p]
+            s = s + json_stringify(k) + ":" + golden_canonical_str(v[k])
+            p = p + 1
+        }
+        return s + "}"
+    }
+    if t == "array" {
+        let mut s = "["
+        let mut i = 0
+        while i < len(v) {
+            if i > 0 { s = s + "," }
+            s = s + golden_canonical_str(v[i])
+            i = i + 1
+        }
+        return s + "]"
+    }
+    return json_stringify(v)
+}
+
+// ── golden_assert_eq ────────────────────────────────────────────────────────
+//
+// Compare `actual` against `g["expected"]`. Returns map:
+//   {"ok": bool, "tag": "<module>/<fn>/<case>", "diff": "<canonical>" | ""}
+// Caller increments its pass/fail counters off `ok`.
+pub fn golden_assert_eq(g: map, actual) -> map {
+    let mut r = #{}
+    r["ok"] = false
+    r["tag"] = ""
+    r["diff"] = ""
+    if !has_key(g, "_loaded") || !g["_loaded"] {
+        r["tag"] = to_string(g["_path"])
+        r["diff"] = "fixture_not_loaded:" + to_string(g["_error"])
+        return r
+    }
+    let mod_ = to_string(g["module"])
+    let fn_ = to_string(g["fn"])
+    let case_ = to_string(g["case"])
+    r["tag"] = mod_ + "/" + fn_ + "/" + case_
+    let expected = g["expected"]
+    if golden_value_eq(actual, expected) {
+        r["ok"] = true
+        return r
+    }
+    r["diff"] = "expected=" + golden_canonical_str(expected) + " actual=" + golden_canonical_str(actual)
+    return r
+}
+
+// ── directory listing helpers ───────────────────────────────────────────────
+//
+// The runtime exposes `list_dir(path)` returning an array of names (hidden
+// entries elided). We use it to discover modules + fixture files. If the
+// runtime lacks list_dir on a host, callers still know the static layout
+// (fixtures/<module>/golden_<case>.json) and can hardcode names.
+
+// golden_modules_in_dir — return immediate child names under `root` that
+// look like a module directory (non-empty, non-dotfile). Order is the
+// runtime's natural directory order; callers that need stable order should
+// sort.
+pub fn golden_modules_in_dir(root: string) -> array {
+    let entries = list_dir(root)
+    let out = []
+    if type_of(entries) != "array" { return out }
+    let mut i = 0
+    while i < len(entries) {
+        let n = to_string(entries[i])
+        if len(n) > 0 && n.substring(0, 1) != "." {
+            out.push(n)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// golden_files_for_module — list `golden_*.json` filenames under
+// `<root>/<module>`. Returns an empty array on missing path.
+pub fn golden_files_for_module(root: string, mod_: string) -> array {
+    let dir = root + "/" + mod_
+    let entries = list_dir(dir)
+    let out = []
+    if type_of(entries) != "array" { return out }
+    let mut i = 0
+    while i < len(entries) {
+        let n = to_string(entries[i])
+        // must start with "golden_" and end ".json"
+        if len(n) >= 12 && n.substring(0, 7) == "golden_" {
+            let tail = n.substring(len(n) - 5, len(n))
+            if tail == ".json" {
+                out.push(n)
+            }
+        }
+        i = i + 1
+    }
+    return out
+}

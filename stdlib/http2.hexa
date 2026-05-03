@@ -1,0 +1,228 @@
+// stdlib/http2.hexa — HTTP/2 client over TLS via curl --http2
+//
+// @module(slug="stdlib-http2", desc="curl-based HTTP/2-over-TLS client (GET/POST + headers + body)")
+// @usage(import stdlib/http2; let r = http2_get("https://www.google.com/", #{}, 30))
+//
+// @version 1.0.0
+// @capabilities [http2_get, http2_get_status, http2_post, http2_post_status, http2_request]
+// @stability stable
+// @since 2026-05-04
+// @maintainer anima-core
+// @priority P1
+//
+// PROBLEM
+//   stdlib/http (P1 headers) and stdlib/net/http_client (no headers) both
+//   shell-out to curl with HTTP/1.1 negotiation. ANU/IBM/HF and modern
+//   public APIs increasingly require — or strongly prefer — HTTP/2 with
+//   ALPN over TLS for connection multiplexing and lower handshake cost.
+//   With HTTP/1.1 every header-required GET re-handshakes a fresh TCP+TLS
+//   socket; with HTTP/2 multiple in-flight requests on one connection
+//   reduce qmirror's ANU-rate-limited polling jitter.
+//
+// FIX (additive, no runtime.c change, parallel API to stdlib/http)
+//   1. http2_get(url, headers, timeout_sec) -> string
+//   2. http2_get_status(url, headers, timeout_sec) -> map
+//   3. http2_post(url, headers, body, timeout_sec) -> string
+//   4. http2_post_status(url, headers, body, timeout_sec) -> map
+//   5. http2_request(method, url, headers, body, timeout_sec) -> map
+//        Generic verb dispatcher — used by the wrappers above.
+//
+// Breaking risk: 0. New module, new symbols. stdlib/http and
+// stdlib/net/http_client remain canonical for HTTP/1.1 paths.
+//
+// Caveats (raw#91):
+//   · curl is a hard dependency (same as stdlib/http). The build MUST
+//     have nghttp2 linked; on macOS BSD curl 7.50+ this is default
+//     (`curl --version | grep -i http2`). On airgap Alpine the package
+//     `curl` may lack nghttp2 — `--http2` then prints a warning and
+//     falls back to HTTP/1.1. The wrapper does NOT force-fail in that
+//     case (graceful degrade) — the caller can inspect "http_version"
+//     in the status map to confirm protocol.
+//   · We pass `--http2` (which permits ALPN downgrade to HTTP/1.1 for
+//     plain http://) rather than `--http2-prior-knowledge` (which forces
+//     h2c and breaks against TLS-only origins). Use --http2-prior-
+//     knowledge manually via http2_request("GET", ...) only when the
+//     origin is known h2c.
+//   · Body POST is piped to curl via the proc_run_with_stdin helper from
+//     stdlib/proc — sidesteps shell ARG_MAX (~256KB on macOS) for large
+//     JSON / protobuf payloads.
+//   · binary response body is unsafe (NUL truncation in hexa string).
+//     JSON / text only.
+//   · `--max-time` is whole-seconds; sub-second SLAs aren't expressible.
+//
+// TLS edge cases:
+//   · Self-signed / corporate-MITM certs: curl uses SecureTransport on
+//     macOS (system keychain) and OpenSSL/LibreSSL on Linux (/etc/ssl).
+//     Origins not in the system trust store fail with status=0 (curl
+//     exits 60). Caller must install the cert into the OS trust store
+//     — we do NOT expose `--insecure`. (P2: optional CA-bundle parameter.)
+//   · ALPN negotiation requires TLS 1.2+. curl 7.50+ default-min is 1.2,
+//     so this is implicit. Older curl on RHEL 7 may negotiate 1.0/1.1
+//     and silently fall back to HTTP/1.1.
+//
+// raw#9 hexa-only-strict: pure hexa wrapper, exec("curl ...") shell-out.
+
+use "stdlib/proc"
+
+// _h2_shell_escape — single-quote wrap with internal quote escape.
+// Duplicated from stdlib/http for resolver simplicity (no cross-module
+// dep on a private helper).
+fn _h2_shell_escape(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+// _h2_last_index_of — reverse-scan for needle. Used to peel the
+// `\n%{http_code}` sentinel off curl -w output.
+fn _h2_last_index_of(s: string, needle: string) -> int {
+    let nlen = len(needle)
+    let slen = len(s)
+    if nlen == 0 { return -1 }
+    if slen < nlen { return -1 }
+    let mut i = slen - nlen
+    while i >= 0 {
+        if s.substring(i, i + nlen) == needle {
+            return i
+        }
+        i = i - 1
+    }
+    return -1
+}
+
+// _h2_build_header_flags — emit `-H 'k: v' -H 'k2: v2' ...` from a header map.
+fn _h2_build_header_flags(headers) -> string {
+    if type_of(headers) != "map" { return "" }
+    let ks = dict_keys(headers)
+    let mut out = ""
+    let mut i = 0
+    while i < len(ks) {
+        let k = ks[i]
+        let v = to_string(headers[k])
+        out = out + " -H " + _h2_shell_escape(k + ": " + v)
+        i = i + 1
+    }
+    return out
+}
+
+// _h2_parse_status_block — split curl output on the trailing
+// `\n<protocol>\n<code>` sentinel. Returns map {body, status, version}.
+fn _h2_parse_status_block(raw: string) {
+    let result = #{}
+    result["body"] = ""
+    result["status"] = 0
+    result["http_version"] = ""
+
+    if len(raw) == 0 { return result }
+    let nl2 = _h2_last_index_of(raw, "\n")
+    if nl2 < 0 { return result }
+    let status_str = raw.substring(nl2 + 1, len(raw)).trim()
+    let head = raw.substring(0, nl2)
+    let nl1 = _h2_last_index_of(head, "\n")
+    if nl1 < 0 {
+        // No version sentinel — treat the whole prefix as body and
+        // status is the only trailing line. (Older curl without
+        // %{http_version} substitution.)
+        result["body"] = head
+        result["status"] = to_int(status_str)
+        return result
+    }
+    let version_str = head.substring(nl1 + 1, len(head)).trim()
+    let body = head.substring(0, nl1)
+    result["body"] = body
+    result["status"] = to_int(status_str)
+    result["http_version"] = version_str
+    return result
+}
+
+// http2_request — generic verb dispatcher.
+//
+// method: "GET" | "POST" | "PUT" | "DELETE" | "PATCH" | "HEAD" (any
+//         method curl -X accepts).
+// url:    https:// origin (http:// also works; ALPN negotiation will
+//         downgrade to HTTP/1.1 on a non-TLS socket).
+// headers: hexa map, may be empty.
+// body:   request body string. Empty string means no body.
+// timeout_sec: int, integer seconds; defaults to 30 if <= 0.
+//
+// Returns a map:
+//   {"status": int, "body": string, "http_version": string, "ok": bool}
+//   status==0 indicates curl itself failed (DNS, TLS, timeout, missing
+//   binary).
+//   http_version is "2" / "1.1" / "1.0" — caller can verify HTTP/2 was
+//   actually negotiated. Empty string when curl predates %{http_version}.
+pub fn http2_request(method: string, url: string, headers, body: string, timeout_sec: int) {
+    let result = #{}
+    result["status"] = 0
+    result["body"] = ""
+    result["http_version"] = ""
+    result["ok"] = false
+
+    if len(url) == 0 { return result }
+    if len(method) == 0 { return result }
+    let t = if timeout_sec > 0 { timeout_sec } else { 30 }
+    let hflags = _h2_build_header_flags(headers)
+
+    // -X METHOD; --http2 (permits ALPN downgrade for http://); -sSL
+    // (silent + show errs + follow redirects); --max-time int seconds;
+    // -w "\n%{http_version}\n%{http_code}" sentinel for split.
+    let mut cmd = "curl -sSL --http2 -X " + _h2_shell_escape(method)
+    cmd = cmd + " --max-time " + to_string(t)
+    cmd = cmd + hflags
+    cmd = cmd + " -w '\\n%{http_version}\\n%{http_code}'"
+
+    let raw = if len(body) > 0 {
+        // Pipe body via proc_run_with_stdin (spills to /tmp file →
+        // sidesteps macOS ARG_MAX). curl reads body from stdin via
+        // `--data-binary @-`.
+        let full = cmd + " --data-binary @- " + _h2_shell_escape(url) + " 2>/dev/null"
+        proc_run_with_stdin(full, body)
+    } else {
+        to_string(exec(cmd + " " + _h2_shell_escape(url) + " 2>/dev/null"))
+    }
+
+    let parsed = _h2_parse_status_block(raw)
+    result["status"] = parsed["status"]
+    result["body"] = parsed["body"]
+    result["http_version"] = parsed["http_version"]
+    let st = result["status"]
+    result["ok"] = st >= 200 && st < 300
+    return result
+}
+
+// http2_get — body-only GET. Returns body on 2xx, "" on any failure.
+//
+// Mirrors stdlib/http::http_get_with_headers behaviour for drop-in
+// compat — caller treats "" as failure indistinguishable from real
+// empty body. Use http2_get_status for diagnostics.
+pub fn http2_get(url: string, headers, timeout_sec: int) -> string {
+    let r = http2_request("GET", url, headers, "", timeout_sec)
+    if r["ok"] {
+        return r["body"]
+    }
+    return ""
+}
+
+// http2_get_status — full GET result.
+pub fn http2_get_status(url: string, headers, timeout_sec: int) {
+    return http2_request("GET", url, headers, "", timeout_sec)
+}
+
+// http2_post — body-only POST. Returns body on 2xx, "" on any failure.
+pub fn http2_post(url: string, headers, body: string, timeout_sec: int) -> string {
+    let r = http2_request("POST", url, headers, body, timeout_sec)
+    if r["ok"] {
+        return r["body"]
+    }
+    return ""
+}
+
+// http2_post_status — full POST result.
+pub fn http2_post_status(url: string, headers, body: string, timeout_sec: int) {
+    return http2_request("POST", url, headers, body, timeout_sec)
+}
+
+// http2_parse_curl_output — expose the trailing-sentinel parser for
+// golden-fixture tests + caller-side dry-run replay (offline curl
+// captures). Pure string transform, no exec(), no I/O.
+pub fn http2_parse_curl_output(raw: string) {
+    return _h2_parse_status_block(raw)
+}
