@@ -1,0 +1,5 @@
+import asyncio
+async def main():
+    d = {x: (x * x) for x in [1, 2, 3]}
+    return d
+print(asyncio.run(main()))
