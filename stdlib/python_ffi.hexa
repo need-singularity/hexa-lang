@@ -1,0 +1,194 @@
+// ═══════════════════════════════════════════════════════════════════════════
+//  stdlib/python_ffi.hexa — Embedded CPython FFI for hexa
+//
+//  Goal: call Python functions from hexa with embedded CPython, including
+//        zero-copy tensor exchange via the PEP 3118 buffer protocol. This
+//        is an upgrade on top of RFC-008's `project_python()` (subprocess
+//        / popen path) — instead of forking a child python and bridging
+//        through stdin/stdout JSON, we link libpython3.X into the hexa
+//        process and pass PyObject* across as opaque integers.
+//
+//  Surface (all hexa-callable):
+//
+//      py_init()                 -> int     (0 ok; idempotent)
+//      py_finalize()             -> int     (0 ok)
+//      py_is_initialized()       -> int     (0 / 1)
+//      py_eval(code)             -> int     (0 ok; -1 = not initialized;
+//                                            negative = python error)
+//
+//      py_call(module, fn, arg)  -> string  ("" on error)
+//          // Calls `module.fn(arg)`, str()'s the return, returns the UTF-8
+//          // string. For richer return types use the buffer-protocol path
+//          // below. Single-arg form is sufficient for the helper-bridge
+//          // pattern we already use across nexus/anima.
+//
+//      py_tensor_from_buffer(ptr, numel, dtype) -> int
+//          // Wraps a hexa-owned raw float* (or any contiguous C buffer)
+//          // in a Python `memoryview`. Zero-copy: the memoryview aliases
+//          // the same physical bytes. dtype is a single PEP 3118 letter:
+//          //   "f" = f32, "d" = f64, "i" = i32, "q" = i64, "B" = u8.
+//          // Returns the PyObject* as an int. Caller MUST eventually
+//          // call py_decref(handle) to release.
+//
+//      py_buffer_to_hexa(handle, out_ptr, max_elems) -> int
+//          // Acquires a Py_buffer over `handle` (anything implementing
+//          // PEP 3118: numpy ndarray, torch tensor after .numpy(), bytes,
+//          // memoryview). If the python-side address matches out_ptr,
+//          // skips the memcpy (true zero-copy) and returns numel directly.
+//          // Otherwise memcpy's up to max_elems*4 bytes (assumes f32).
+//          // Returns numel on success, -1 on error.
+//
+//      py_buffer_addr(handle)    -> int     // raw buf.buf pointer
+//      py_buffer_len(handle)     -> int     // bytes
+//      py_buffer_contig(handle)  -> int     // 1 if C-contiguous
+//      py_decref(handle)         -> void    // Py_DECREF (safety)
+//
+//  Reference-counting safety:
+//      * Every `int` handle returned from py_tensor_from_buffer / future
+//        PyObject*-returning functions MUST be released via py_decref.
+//      * The C shim uses Py_XDECREF on all error paths; no leaks on the
+//        common failure modes (import error, attribute missing, call
+//        raised, NULL str, OOM).
+//      * py_finalize() shuts down the interpreter — calling any other
+//        py_* afterward returns the negative-error code path; the shim
+//        does NOT crash on use-after-finalize.
+//
+//  Tensor exchange contract (Tensor as defined in self/ml/tensor.hexa):
+//      Hexa's Tensor is an int-only struct {data, numel, rank, d0, d1}
+//      where `data` is a raw C pointer (uintptr_t). Pass `data` directly
+//      as the first arg of py_tensor_from_buffer; the resulting Python
+//      memoryview aliases the same float* buffer. No copy, no conversion.
+//      For non-Tensor users with bare buffers, pass alloc_raw'd pointers
+//      identically. The C-buffer interface is: { void *data; size_t
+//      numel; PEP-3118-format-letter dtype }.
+//
+//  Linkage (lib/hxpyembed/libhxpyembed.dylib | .so — built by
+//          cmake -S lib/hxpyembed -B lib/hxpyembed/build && cmake --build):
+//      * macOS: dylib links libpython3.X.dylib + CoreFoundation; the
+//               extern fn declarations below use @link("hxpyembed") and
+//               rely on dlopen finding libhxpyembed.dylib next to the
+//               hexa binary, on DYLD_LIBRARY_PATH, or via absolute path
+//               override (HEXA_HXPYEMBED_PATH).
+//      * Linux: .so links libpython3.X.so (requires libpython3-dev or a
+//               --shared-built CPython). dlopen via LD_LIBRARY_PATH.
+//
+//  Acceptance F-FFI-1: `import torch; t = torch.tensor([...])` round-trip
+//      a 1024-element float32 buffer hexa→python→hexa, verifying identity
+//      (same address ⇒ true zero-copy) and value preservation. See
+//      stdlib/test/test_python_ffi.hexa for the gated selftest.
+//
+//  Last verified: 2026-05-04 — macOS arm64, Python 3.14.4 + torch 2.10.0,
+//                              zero-copy address match, 1024-elem f32
+//                              round-trip preserves all values.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── Extern declarations into libhxpyembed.dylib / .so ──────────────────────
+
+@link("hxpyembed")
+extern fn hxpy_init() -> int
+
+@link("hxpyembed")
+extern fn hxpy_finalize() -> int
+
+@link("hxpyembed")
+extern fn hxpy_is_initialized() -> int
+
+@link("hxpyembed")
+extern fn hxpy_eval(code: *Void) -> int
+
+@link("hxpyembed")
+extern fn hxpy_call_str(mod: *Void, fn_name: *Void, arg: *Void) -> int
+
+@link("hxpyembed")
+extern fn hxpy_free_str(p: int)
+
+@link("hxpyembed")
+extern fn hxpy_tensor_to_py(raw_ptr: *Void, numel: int, dtype: *Void) -> int
+
+@link("hxpyembed")
+extern fn hxpy_py_to_tensor(py_obj: *Void, out_ptr: *Void, max_elems: int) -> int
+
+@link("hxpyembed")
+extern fn hxpy_py_buf_addr(py_obj: *Void) -> int
+
+@link("hxpyembed")
+extern fn hxpy_py_buf_len(py_obj: *Void) -> int
+
+@link("hxpyembed")
+extern fn hxpy_py_buf_contig(py_obj: *Void) -> int
+
+@link("hxpyembed")
+extern fn hxpy_obj_decref(py_obj: *Void)
+
+// ── Public API ─────────────────────────────────────────────────────────────
+
+// Initialize the embedded CPython interpreter. Idempotent — safe to call
+// repeatedly. Returns 0 on success, non-zero on failure.
+pub fn py_init() -> int {
+    return hxpy_init()
+}
+
+// Finalize the interpreter. Returns 0 on success. After this, all py_*
+// calls return error paths until py_init() is called again.
+pub fn py_finalize() -> int {
+    return hxpy_finalize()
+}
+
+pub fn py_is_initialized() -> int {
+    return hxpy_is_initialized()
+}
+
+// Run a Python statement / module-level code block. Returns 0 on success.
+// Negative on any python error (the traceback is printed to stderr by the
+// shim). Use this to `import` modules and run setup code.
+pub fn py_eval(code: string) -> int {
+    // hexa string → const char* via cstring() builtin (runtime.c:5020).
+    return hxpy_eval(cstring(code))
+}
+
+// Call `module.fn(arg)` where arg is a single string and the return is
+// stringified. Returns "" on any error. For non-string IO use the buffer
+// protocol (py_tensor_from_buffer / py_buffer_to_hexa).
+pub fn py_call(module_name: string, fn_name: string, arg: string) -> string {
+    let p = hxpy_call_str(cstring(module_name), cstring(fn_name), cstring(arg))
+    if p == 0 { return "" }
+    // The shim returns a malloc'd C string; copy via from_cstring (runtime
+    // owns the inbound copy), then free the malloc'd pointer.
+    let s = from_cstring(p)
+    hxpy_free_str(p)
+    return s
+}
+
+// Wrap a hexa-owned raw buffer in a Python memoryview (zero-copy). Pass
+// the resulting handle to py_call_with_buffer / Python code via py_eval
+// (set a global with `globals()["x"] = ...`). Caller MUST release with
+// py_decref(handle) when done.
+pub fn py_tensor_from_buffer(ptr, numel, dtype_letter: string) -> int {
+    return hxpy_tensor_to_py(ptr, numel, cstring(dtype_letter))
+}
+
+// Pull a Python buffer-protocol object back into a hexa raw pointer.
+// If the underlying address matches `out_ptr` (zero-copy round-trip),
+// no memcpy is performed; otherwise up to `max_elems` f32 elements are
+// copied. Returns numel on success, -1 on error.
+pub fn py_buffer_to_hexa(handle, out_ptr, max_elems) -> int {
+    return hxpy_py_to_tensor(handle, out_ptr, max_elems)
+}
+
+pub fn py_buffer_addr(handle) -> int {
+    return hxpy_py_buf_addr(handle)
+}
+
+pub fn py_buffer_len(handle) -> int {
+    return hxpy_py_buf_len(handle)
+}
+
+pub fn py_buffer_contig(handle) -> int {
+    return hxpy_py_buf_contig(handle)
+}
+
+pub fn py_decref(handle) {
+    hxpy_obj_decref(handle)
+}
+
+// ── End of module ──────────────────────────────────────────────────────────

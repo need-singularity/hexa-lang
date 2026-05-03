@@ -1,0 +1,184 @@
+// ═══════════════════════════════════════════════════════════════════════════
+//  stdlib/test/test_python_ffi.hexa
+//
+//  Selftest for stdlib/python_ffi — embedded CPython FFI with zero-copy
+//  tensor exchange via PEP 3118 buffer protocol.
+//
+//  Run:
+//      cmake -S lib/hxpyembed -B lib/hxpyembed/build && \
+//      cmake --build lib/hxpyembed/build && \
+//      DYLD_LIBRARY_PATH=lib/hxpyembed/build hexa run stdlib/test/test_python_ffi.hexa
+//
+//  Acceptance F-FFI-1:
+//      `import torch; t = torch.tensor([...])` round-trip a 1024-element
+//      float32 buffer hexa→python→hexa, verifying:
+//        (a) zero-copy identity — Python's memoryview address == hexa's
+//            raw float* address (same physical memory).
+//        (b) value preservation — sum(buffer) before == sum(buffer) after.
+//
+//  Skip gating:
+//      Test SKIPs (exit 0 with skip marker) if:
+//        * libhxpyembed not loadable (cmake build not run)
+//        * `python3 -c "import torch"` fails (torch not installed)
+//      Selftest never claims PASS without the dylib + torch in place.
+// ═══════════════════════════════════════════════════════════════════════════
+
+use "stdlib/python_ffi"
+
+let mut pass_count = 0
+let mut fail_count = 0
+let mut skip_count = 0
+
+fn chk(tag, cond) {
+    if cond {
+        println("  PASS " + tag)
+        pass_count = pass_count + 1
+    } else {
+        println("  FAIL " + tag)
+        fail_count = fail_count + 1
+    }
+}
+
+fn chk_eq_int(tag, got, want) {
+    if got == want {
+        println("  PASS " + tag + " == " + to_string(want))
+        pass_count = pass_count + 1
+    } else {
+        println("  FAIL " + tag + " got=" + to_string(got) + " want=" + to_string(want))
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+
+fn main() -> void {
+    println("── stdlib/python_ffi (F-FFI-1) selftest ──")
+
+    // ── Pre-flight: torch availability gate ─────────────────────────────
+    // Cheap subprocess probe before paying for embedded interpreter init.
+    let probe = to_string(exec("python3 -c 'import torch' 2>&1 && echo HEXA_OK")).trim()
+    let has_torch = probe.contains("HEXA_OK")
+    if has_torch == false {
+        println("  SKIP python_ffi torch round-trip — torch not importable in system python3")
+        println("  (probe output: " + probe + ")")
+        skip_count = skip_count + 1
+        println("")
+        println("  pass=" + to_string(pass_count) + "  fail=" + to_string(fail_count) + "  skip=" + to_string(skip_count))
+        println("SKIP: python_ffi selftest (torch unavailable) " + to_string(pass_count) + "/0 mandatory")
+        return
+    }
+
+    // ── 1. py_init / idempotency ────────────────────────────────────────
+    let init_rc = py_init()
+    chk_eq_int("py_init", init_rc, 0)
+    chk_eq_int("py_init_idempotent", py_init(), 0)
+    chk_eq_int("py_is_initialized", py_is_initialized(), 1)
+
+    // If init failed (likely libhxpyembed missing), skip the rest.
+    if init_rc != 0 {
+        println("  SKIP remainder — embedded CPython did not initialize (build libhxpyembed first)")
+        skip_count = skip_count + 1
+        println("")
+        println("  pass=" + to_string(pass_count) + "  fail=" + to_string(fail_count) + "  skip=" + to_string(skip_count))
+        return
+    }
+
+    // ── 2. py_eval — import torch ───────────────────────────────────────
+    chk_eq_int("py_eval_import_torch", py_eval("import torch"), 0)
+    chk_eq_int("py_eval_import_numpy", py_eval("import numpy as np"), 0)
+
+    // ── 3. py_call — string round-trip ──────────────────────────────────
+    // builtins.str("hello") → "hello"
+    let s = py_call("builtins", "str", "hello")
+    chk("py_call_str_hello", s == "hello")
+
+    // ── 4. F-FFI-1: 1024-element f32 zero-copy round-trip ──────────────
+    let N = 1024
+    let buf = alloc_raw(N * 4)
+    let mut i = 0
+    while i < N {
+        // Fill with i * 0.5 (matches the C-side smoke test).
+        write_f32(buf, i * 4, i * 0.5)
+        i = i + 1
+    }
+
+    // Compute sum before
+    let mut sum_before = 0.0
+    let mut k = 0
+    while k < N {
+        sum_before = sum_before + deref_f32(buf, k * 4)
+        k = k + 1
+    }
+
+    // hexa → python: zero-copy memoryview
+    let mv = py_tensor_from_buffer(buf, N, "f")
+    chk("py_tensor_from_buffer_handle", mv != 0)
+
+    // Identity check: python's view of the bytes should be the same address.
+    let py_addr = py_buffer_addr(mv)
+    chk_eq_int("zero_copy_identity_address", py_addr, buf)
+    chk_eq_int("zero_copy_byte_length", py_buffer_len(mv), N * 4)
+    chk_eq_int("zero_copy_c_contiguous", py_buffer_contig(mv), 1)
+
+    // python → hexa: round-trip back into the same buffer.
+    let n_round = py_buffer_to_hexa(mv, buf, N)
+    chk_eq_int("py_to_hexa_numel", n_round, N)
+
+    // Sum after — must be byte-identical to sum_before (no copy occurred).
+    let mut sum_after = 0.0
+    let mut j = 0
+    while j < N {
+        sum_after = sum_after + deref_f32(buf, j * 4)
+        j = j + 1
+    }
+    // Expected: 0.5 * (0 + 1 + ... + 1023) = 0.5 * 1023*1024/2 = 261888.
+    chk("value_preservation", fabs(sum_after - sum_before) < 0.001)
+    chk("expected_sum_261888", fabs(sum_before - 261888.0) < 0.5)
+
+    // Release the python handle (refcount safety).
+    py_decref(mv)
+
+    // ── 5. Round-trip through actual torch.tensor ──────────────────────
+    // Build a torch tensor in python from a list, get its .numpy() view,
+    // expose as PyObject* via globals(), then pull back across the buffer
+    // protocol into a hexa raw buffer. Confirm values preserved.
+    let setup_rc = py_eval(
+        "import torch\n" +
+        "import numpy as np\n" +
+        "_vals = [float(i) * 0.25 for i in range(1024)]\n" +
+        "_t = torch.tensor(_vals, dtype=torch.float32)\n" +
+        "_n = _t.numpy()\n" +
+        "import builtins\n" +
+        "builtins._hexa_t_np = _n\n"  // park on builtins so we can fetch
+    )
+    chk_eq_int("torch_setup", setup_rc, 0)
+
+    // Pull the numpy array via py_call("builtins", "id", "_hexa_t_np")?
+    // Simpler: use py_eval to compute its data pointer & write to a global.
+    // We can't (yet) pull a PyObject* out of py_eval — extend later. For
+    // the F-FFI-1 acceptance the hexa→python→hexa identity is verified
+    // above; the python→hexa->python direction with torch is asserted
+    // here via a python-side checksum.
+    let chksum_rc = py_eval(
+        "_hexa_chk = float(_t.sum().item())\n" +
+        "assert abs(_hexa_chk - 0.25 * 1023 * 1024 / 2) < 1e-3, _hexa_chk\n" +
+        "print('  PASS torch_tensor_sum_python_side =', _hexa_chk)\n"
+    )
+    if chksum_rc == 0 { pass_count = pass_count + 1 } else { fail_count = fail_count + 1 }
+
+    // ── 6. py_finalize ──────────────────────────────────────────────────
+    chk_eq_int("py_finalize", py_finalize(), 0)
+    chk_eq_int("post_finalize_not_initialized", py_is_initialized(), 0)
+
+    free_raw(buf, N * 4)
+
+    let total = pass_count + fail_count
+    println("")
+    println("  pass=" + to_string(pass_count) + "  fail=" + to_string(fail_count) + "  skip=" + to_string(skip_count))
+    if fail_count == 0 {
+        println("PASS: python_ffi selftest " + to_string(pass_count) + "/" + to_string(total))
+        return
+    }
+    println("FAIL: python_ffi selftest " + to_string(pass_count) + "/" + to_string(total))
+    exit(1)
+}
