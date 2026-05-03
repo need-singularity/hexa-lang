@@ -288,22 +288,28 @@ fn main() {
             exit(3)
         }
 
-        let host_obj = out_dir + "/hxqwen14b.host.o"
-        let cuda_obj = out_dir + "/hxqwen14b_cuda.cu.o"
+        let host_obj      = out_dir + "/hxqwen14b.host.o"
+        let cuda_obj      = out_dir + "/hxqwen14b_cuda.cu.o"
+        let lora_cu_obj   = out_dir + "/lora_cuda.cu.o"
+        let lora_host_obj = out_dir + "/lora_cuda_host.o"
 
-        // H100 = sm_90; A100 = sm_80; pass both for portability across pods.
-        // Allow override via NVCC_ARCH env.
+        // sm_80 default = A100; sm_90 = H100; sm_120 = RTX 5070 (Ada-next / Blackwell mobile).
+        // Pass all three so a single .so deploys across the dev-pod fleet (ubu1 RTX 5070,
+        // train pod H100, A100 fallback). Allow override via NVCC_ARCH env.
         let nvcc_arch = if env("NVCC_ARCH") != "" { env("NVCC_ARCH") }
-                        else { "-gencode arch=compute_80,code=sm_80 -gencode arch=compute_90,code=sm_90" }
+                        else { "-gencode arch=compute_80,code=sm_80 -gencode arch=compute_90,code=sm_90 -gencode arch=compute_120,code=sm_120" }
 
-        println("[1/3] compiling hxqwen14b.c → " + host_obj + " (gcc -DHXQWEN14B_CUDA)")
+        println("[1/4] compiling hxqwen14b.c → " + host_obj + " (gcc -DHXQWEN14B_CUDA)")
         // -fPIC -c (no -shared) — produces a relocatable host object.
         let host_cflags = if mode == "--debug" { "-O0 -g -fPIC -c" }
                           else { "-O3 -fPIC -c -march=native" }
         run(cc + " " + host_cflags + " -DHXQWEN14B_CUDA -I" + cuda_home + "/include " +
             src_dir + "/hxqwen14b.c -o " + host_obj)
+        // F-CUDA-LORA-1: host-side LoRA dispatch + CPU reference (gcc, no CUDA).
+        run(cc + " " + host_cflags + " -I" + src_dir + " " +
+            src_dir + "/lora_cuda_host.c -o " + lora_host_obj)
 
-        println("[2/3] compiling hxqwen14b_cuda.cu → " + cuda_obj + " (nvcc)")
+        println("[2/4] compiling hxqwen14b_cuda.cu → " + cuda_obj + " (nvcc)")
         // -Xcompiler -fPIC so the resulting object can be linked into a .so.
         // -lineinfo lets cuda-gdb / nsight map back to source.
         let nvcc_flags = if mode == "--debug" { "-O0 -g -G -Xcompiler -fPIC -c" }
@@ -311,14 +317,25 @@ fn main() {
         run(nvcc + " " + nvcc_flags + " " + nvcc_arch + " " +
             src_dir + "/hxqwen14b_cuda.cu -o " + cuda_obj)
 
-        println("[3/3] linking libhxqwen14b.so (gcc -shared, cudart + cublas)")
-        run(cc + " -shared -fPIC " + host_obj + " " + cuda_obj +
+        println("[3/4] compiling lora_cuda.cu → " + lora_cu_obj + " (nvcc, F-CUDA-LORA-1 kernels)")
+        run(nvcc + " " + nvcc_flags + " " + nvcc_arch + " -I" + src_dir + " " +
+            src_dir + "/lora_cuda.cu -o " + lora_cu_obj)
+
+        println("[4/4] linking libhxqwen14b.so (gcc -shared, cudart + cublas)")
+        run(cc + " -shared -fPIC " + host_obj + " " + cuda_obj + " " +
+            lora_cu_obj + " " + lora_host_obj +
             " -L" + cuda_home + "/lib64 -lcudart -lcublas -lm" +
             " -o " + out_dir + "/libhxqwen14b.so")
     } else {
         // v0 stub path — no CUDA linked. Symbol surface only.
-        println("[1/1] building libhxqwen14b.so (stub path — no CUDA)")
-        run(cc + " " + cflags_base + " " + src_dir + "/hxqwen14b.c -o " + out_dir + "/libhxqwen14b.so -lm")
+        // F-CUDA-LORA-1: lora_cuda_host.c provides weak no-CUDA stubs of
+        // lora_cuda_{forward,backward}_launch + the CPU reference path so
+        // dispatch falls through to CPU when the .so is loaded on a non-CUDA
+        // host (Mac dev or CI runner without GPU).
+        println("[1/1] building libhxqwen14b.so (stub path — no CUDA, with LoRA CPU fallback)")
+        run(cc + " " + cflags_base + " -I" + src_dir + " " +
+            src_dir + "/hxqwen14b.c " + src_dir + "/lora_cuda_host.c " +
+            "-o " + out_dir + "/libhxqwen14b.so -lm")
     }
 
     for sym in symbols {
