@@ -193,3 +193,182 @@ pub fn uint64_to_unit_float(u: int) -> float {
     let masked = u % 9007199254740992  // keep low 53 bits
     return to_float(masked) / denom
 }
+
+// ═══════════════════════════════════════════════════════════════════
+//  Chunked I/O primitives — interp-memory escape hatch (P1)
+//
+//  WHY (see tool/docs/interp_memory.md for the full write-up)
+//
+//  Every "byte" in a hexa int-array is a boxed HexaVal (~24 B tagged
+//  union + heap descriptor overhead). A 1 MiB byte payload therefore
+//  costs ~25 MB of element storage on its own; the same payload fed
+//  through `out = out + [b]` (concat-rebuild idiom) explodes to O(n²)
+//  copies and trips the 2 GB RSS soft cap before reaching 64 KiB.
+//
+//  Prior-art:
+//   · 947944ed (F-SAFETENSORS-1) — defaults to 8 K f32 (32 KiB) and
+//     gates the full 1 MiB stress run behind HEXA_SAFETENSORS_FULL_MB.
+//   · e7673823 (F-SQLITE)        — rewrote 1000-row single-shot fetch
+//     as 100-row LIMIT/OFFSET chunked walks.
+//   · stdlib/ckpt/format.hexa    — `bytes_append` uses .push (not +)
+//     and the format itself is chunk-addressable at 4 MiB.
+//
+//  This block extends bytes.hexa with the same chunking idiom in the
+//  general filesystem case, so callers can stream multi-MiB payloads
+//  without inventing a new module each time.
+//
+//  All four helpers below use:
+//    · `out.push(...)` — amortised O(1) growth, NEVER `out + [x]`.
+//    · `read_bytes_at(path, offset, n)` / `write_bytes_append` /
+//      `file_size` builtins (already in runtime.c — added 2026-04
+//      for the safetensors→hexaw multi-GB pipeline).
+//    · A default chunk size of 65536 (64 KiB) — well under the
+//      ~1 MiB threshold, large enough to amortise per-chunk fopen.
+// ═══════════════════════════════════════════════════════════════════
+
+let BYTES_DEFAULT_CHUNK = 65536  // 64 KiB — see rationale above
+
+pub fn bytes_default_chunk() -> int {
+    return BYTES_DEFAULT_CHUNK
+}
+
+// ── bytes_iter_chunked — visit a file in [chunk_size] byte windows ──
+//
+// Reads `path` in successive `read_bytes_at` calls of `chunk_size`
+// bytes each, invoking `fn(chunk, offset)` for every non-empty slice.
+// The chunk is freed (drops out of scope) before the next read, so
+// peak hexa-side RSS stays at O(chunk_size × 24 B) regardless of
+// total file size. Use when:
+//   · The file is multi-MiB and you only need streaming access.
+//   · Your processing is per-byte / per-window (hash, scan, transform).
+//
+// `fn` semantics: receives (chunk: [int], offset: int). Return value
+// ignored. To collect a result, mutate a captured outer variable.
+//
+// Returns total bytes visited (== file_size on success).
+pub fn bytes_iter_chunked(path: string, chunk_size: int, fn) -> int {
+    let mut size = file_size(path)
+    if size <= 0 { return 0 }
+    let mut step = chunk_size
+    if step <= 0 { step = BYTES_DEFAULT_CHUNK }
+    let mut offset = 0
+    while offset < size {
+        let want = if (size - offset) < step { size - offset } else { step }
+        let chunk = read_bytes_at(path, offset, want)
+        if len(chunk) == 0 { return offset }
+        fn(chunk, offset)
+        offset = offset + len(chunk)
+    }
+    return offset
+}
+
+// ── bytes_read_chunked — read a file as [int] without exceeding RSS ─
+//
+// Convenience wrapper around bytes_iter_chunked that materialises the
+// full file into a single int-array — but uses .push (not concat) and
+// frees each chunk between iterations. Caller still pays O(file_size
+// × 24 B); this only avoids the O(file_size²) concat blow-up.
+//
+// SAFETY: do NOT call this on files that don't fit your RSS budget.
+// Computing the safe limit: usable_RSS_MB × 1024 / 24 ≈ max bytes.
+// On a 1.8 GB working budget that is roughly ~75 MiB of file payload.
+// Above that, switch to bytes_iter_chunked + your own folding fn.
+pub fn bytes_read_chunked(path: string, chunk_size: int) -> [int] {
+    let mut out = []
+    let mut step = chunk_size
+    if step <= 0 { step = BYTES_DEFAULT_CHUNK }
+    let mut size = file_size(path)
+    if size <= 0 { return out }
+    let mut offset = 0
+    while offset < size {
+        let want = if (size - offset) < step { size - offset } else { step }
+        let chunk = read_bytes_at(path, offset, want)
+        let n = len(chunk)
+        if n == 0 { return out }
+        let mut i = 0
+        while i < n {
+            out.push(chunk[i])
+            i = i + 1
+        }
+        offset = offset + n
+    }
+    return out
+}
+
+// ── bytes_write_chunked — emit an int-array in chunk-sized appends ──
+//
+// Materialising the whole `data` array is the caller's problem; this
+// helper just splits the write side so each fwrite stays under the
+// runtime's per-call temp buffer (a malloc-then-fwrite-then-free
+// triplet inside rt_write_bytes_append). Useful when:
+//   · `data` came from bytes_read_chunked + transform and is large
+//     enough that one rt_write_bytes call would temp-malloc it all.
+//   · Caller is composing a result on the fly (loop where each
+//     iteration produces ≤ chunk_size bytes, then flushes).
+//
+// First call truncates (rt_write_bytes), subsequent calls append
+// (rt_write_bytes_append). Returns total bytes written.
+pub fn bytes_write_chunked(path: string, data, chunk_size: int) -> int {
+    let n = len(data)
+    if n == 0 {
+        write_bytes(path, [])
+        return 0
+    }
+    let mut step = chunk_size
+    if step <= 0 { step = BYTES_DEFAULT_CHUNK }
+    let mut offset = 0
+    let mut first = 1
+    while offset < n {
+        let end = if (offset + step) < n { offset + step } else { n }
+        let mut buf = []
+        let mut i = offset
+        while i < end {
+            buf.push(data[i])
+            i = i + 1
+        }
+        if first == 1 {
+            write_bytes(path, buf)
+            first = 0
+        } else {
+            write_bytes_append(path, buf)
+        }
+        offset = end
+    }
+    return offset
+}
+
+// ── bytes_copy_chunked — file → file via fixed-size windows ──────────
+//
+// Reads src in chunk_size windows, writes each window straight to dst
+// (truncating on first chunk, appending after). Peak hexa-side RSS
+// stays at O(chunk_size × 24 B) regardless of file size — the safe
+// idiom for multi-GB safetensors / checkpoint copies.
+//
+// Returns total bytes copied (== file_size(src) on success), or -1 on
+// fopen / write failure (size mismatch sentinel; caller compares vs.
+// file_size(src) themselves to detect partial copies).
+pub fn bytes_copy_chunked(src: string, dst: string, chunk_size: int) -> int {
+    let mut step = chunk_size
+    if step <= 0 { step = BYTES_DEFAULT_CHUNK }
+    let mut size = file_size(src)
+    if size <= 0 {
+        write_bytes(dst, [])
+        return 0
+    }
+    let mut offset = 0
+    let mut first = 1
+    while offset < size {
+        let want = if (size - offset) < step { size - offset } else { step }
+        let chunk = read_bytes_at(src, offset, want)
+        let n = len(chunk)
+        if n == 0 { return offset }
+        if first == 1 {
+            write_bytes(dst, chunk)
+            first = 0
+        } else {
+            write_bytes_append(dst, chunk)
+        }
+        offset = offset + n
+    }
+    return offset
+}
