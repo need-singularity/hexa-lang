@@ -85,9 +85,10 @@ and free the chunk between iterations:
 use "stdlib/bytes"
 
 // Iterate without materialising — peak hexa RSS = O(chunk_size · 24 B)
-bytes_iter_chunked("/path/to/blob", 65536, fn(chunk, offset) {
-    // ... fold / hash / scan ...
-})
+fn _process_chunk(chunk, offset) {
+    // ... fold / hash / scan ... (mutate captured outer state)
+}
+bytes_iter_chunked("/path/to/blob", 65536, _process_chunk)
 
 // Materialise the whole file (still safe up to ~75 MiB on 1.8 GB cap)
 let payload = bytes_read_chunked("/path/to/blob", 65536)
