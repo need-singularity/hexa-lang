@@ -79,6 +79,163 @@ HexaVal hexa_ptr_read_i32(HexaVal ptr, HexaVal offset) {
     return hexa_int((int64_t)v);
 }
 
+/* IEEE-754 bit-cast helpers — bytes <-> Float (little-endian).
+ * Required by safetensors B5 (encoder) and any pure-hexa caller that
+ * needs the wire-level binary32/binary64 representation without an
+ * external pointer allocation. Returns/accepts a TAG_ARRAY of int
+ * (each element 0..255) — the project's canonical "bytes" shape.
+ *
+ * NaN handling: payload-preserving. The C `memcpy` round-trip copies
+ * all 32/64 bits including the quiet/signaling bit and payload. We do
+ * NOT canonicalize NaN — callers that need a single canonical NaN
+ * must mask before encoding. Both signaling and quiet NaNs survive
+ * a round-trip bit-identically (subject to platform float promotion;
+ * see f32 narrowing note below).
+ *
+ * f32 narrowing note: hexa's runtime Float is C `double`. The
+ * `f32_to_bytes_le` path performs a `(float)d` narrow which is
+ * lossy for any double whose magnitude exceeds float range or whose
+ * mantissa needs >24 bits. The reverse `bytes_to_f32_le` widens via
+ * `(double)f` which IS lossless (every binary32 has an exact binary64
+ * representation). Therefore round-trip is bit-identical ONLY for
+ * values that already fit in binary32. Callers feeding arbitrary
+ * doubles into f32_to_bytes_le accept the standard IEEE-754
+ * round-to-nearest-even narrowing; ±inf and ±0 are preserved exactly,
+ * subnormals/denormals follow the platform FPU mode (default IEEE).
+ */
+
+HexaVal hexa_f32_to_bytes_le(HexaVal val) {
+    float f = (float)__hx_to_double(val);
+    uint8_t buf[4];
+    memcpy(buf, &f, 4);
+    HexaVal arr = hexa_array_new();
+    HexaVal* items = (HexaVal*)malloc(sizeof(HexaVal) * 4);
+    for (int i = 0; i < 4; i++) items[i] = hexa_int((int64_t)buf[i]);
+    HX_SET_ARR_ITEMS(arr, items);
+    HX_SET_ARR_CAP(arr, 4);
+    HX_SET_ARR_LEN(arr, 4);
+    return arr;
+}
+
+HexaVal hexa_bytes_to_f32_le(HexaVal arr, HexaVal offset) {
+    int64_t off = HX_IS_INT(offset) ? HX_INT(offset) : 0;
+    if (!HX_IS_ARRAY(arr)) return hexa_float(0.0);
+    int len = HX_ARR_LEN(arr);
+    if (off < 0 || off + 4 > len) return hexa_float(0.0);
+    HexaVal* items = HX_ARR_ITEMS(arr);
+    uint8_t buf[4];
+    for (int i = 0; i < 4; i++) {
+        HexaVal el = items[off + i];
+        int64_t v = 0;
+        if (HX_IS_INT(el)) v = HX_INT(el);
+        else if (HX_IS_FLOAT(el)) v = (int64_t)HX_FLOAT(el);
+        buf[i] = (uint8_t)(v & 0xFF);
+    }
+    float f;
+    memcpy(&f, buf, 4);
+    return hexa_float((double)f);
+}
+
+HexaVal hexa_f64_to_bytes_le(HexaVal val) {
+    double d = __hx_to_double(val);
+    uint8_t buf[8];
+    memcpy(buf, &d, 8);
+    HexaVal arr = hexa_array_new();
+    HexaVal* items = (HexaVal*)malloc(sizeof(HexaVal) * 8);
+    for (int i = 0; i < 8; i++) items[i] = hexa_int((int64_t)buf[i]);
+    HX_SET_ARR_ITEMS(arr, items);
+    HX_SET_ARR_CAP(arr, 8);
+    HX_SET_ARR_LEN(arr, 8);
+    return arr;
+}
+
+HexaVal hexa_bytes_to_f64_le(HexaVal arr, HexaVal offset) {
+    int64_t off = HX_IS_INT(offset) ? HX_INT(offset) : 0;
+    if (!HX_IS_ARRAY(arr)) return hexa_float(0.0);
+    int len = HX_ARR_LEN(arr);
+    if (off < 0 || off + 8 > len) return hexa_float(0.0);
+    HexaVal* items = HX_ARR_ITEMS(arr);
+    uint8_t buf[8];
+    for (int i = 0; i < 8; i++) {
+        HexaVal el = items[off + i];
+        int64_t v = 0;
+        if (HX_IS_INT(el)) v = HX_INT(el);
+        else if (HX_IS_FLOAT(el)) v = (int64_t)HX_FLOAT(el);
+        buf[i] = (uint8_t)(v & 0xFF);
+    }
+    double d;
+    memcpy(&d, buf, 8);
+    return hexa_float(d);
+}
+
+/* Variant for the interpreter dispatch (TAG_VALSTRUCT-wrapped items).
+ * Same semantics as hexa_bytes_to_f{32,64}_le but unwraps each Val
+ * to read its int_val. Mirrors the rt_write_bytes_v / rt_write_bytes
+ * split.
+ */
+HexaVal hexa_bytes_to_f32_le_v(HexaVal arr, HexaVal offset) {
+    int64_t off = HX_IS_INT(offset) ? HX_INT(offset) : 0;
+    if (!HX_IS_ARRAY(arr)) return hexa_float(0.0);
+    int len = HX_ARR_LEN(arr);
+    if (off < 0 || off + 4 > len) return hexa_float(0.0);
+    HexaVal* items = HX_ARR_ITEMS(arr);
+    uint8_t buf[4];
+    for (int i = 0; i < 4; i++) {
+        HexaVal el = items[off + i];
+        int64_t v = 0;
+        if (HX_IS_INT(el)) v = HX_INT(el);
+        else if (HX_IS_FLOAT(el)) v = (int64_t)HX_FLOAT(el);
+        else if (HX_TAG(el) == TAG_VALSTRUCT) {
+            HexaVal iv = hexa_valstruct_int(el);
+            if (HX_IS_INT(iv)) v = HX_INT(iv);
+            else if (HX_IS_FLOAT(iv)) v = (int64_t)HX_FLOAT(iv);
+        }
+        buf[i] = (uint8_t)(v & 0xFF);
+    }
+    float f;
+    memcpy(&f, buf, 4);
+    return hexa_float((double)f);
+}
+
+HexaVal hexa_bytes_to_f64_le_v(HexaVal arr, HexaVal offset) {
+    int64_t off = HX_IS_INT(offset) ? HX_INT(offset) : 0;
+    if (!HX_IS_ARRAY(arr)) return hexa_float(0.0);
+    int len = HX_ARR_LEN(arr);
+    if (off < 0 || off + 8 > len) return hexa_float(0.0);
+    HexaVal* items = HX_ARR_ITEMS(arr);
+    uint8_t buf[8];
+    for (int i = 0; i < 8; i++) {
+        HexaVal el = items[off + i];
+        int64_t v = 0;
+        if (HX_IS_INT(el)) v = HX_INT(el);
+        else if (HX_IS_FLOAT(el)) v = (int64_t)HX_FLOAT(el);
+        else if (HX_TAG(el) == TAG_VALSTRUCT) {
+            HexaVal iv = hexa_valstruct_int(el);
+            if (HX_IS_INT(iv)) v = HX_INT(iv);
+            else if (HX_IS_FLOAT(iv)) v = (int64_t)HX_FLOAT(iv);
+        }
+        buf[i] = (uint8_t)(v & 0xFF);
+    }
+    double d;
+    memcpy(&d, buf, 8);
+    return hexa_float(d);
+}
+
+/* Unprefixed aliases (FIX-2 unblock 2026-05-04) ---------------------
+ * The precompiled bootstrap transpiler self/native/hexa_v2 was built
+ * before FIX-2's codegen registrations existed, so it emits raw symbol
+ * references like `hexa_call1(f32_to_bytes_le, x)` instead of the
+ * prefixed `hexa_f32_to_bytes_le(x)` direct call. The hexa_call1 /
+ * hexa_call2 macros use _Generic to dispatch raw fn pointers, so as
+ * long as the unprefixed identifier resolves to a same-typed function,
+ * the call lowers correctly. These aliases provide that resolution
+ * without regenerating hexa_v2.
+ */
+static inline HexaVal f32_to_bytes_le(HexaVal val) { return hexa_f32_to_bytes_le(val); }
+static inline HexaVal f64_to_bytes_le(HexaVal val) { return hexa_f64_to_bytes_le(val); }
+static inline HexaVal bytes_to_f32_le(HexaVal arr, HexaVal off) { return hexa_bytes_to_f32_le(arr, off); }
+static inline HexaVal bytes_to_f64_le(HexaVal arr, HexaVal off) { return hexa_bytes_to_f64_le(arr, off); }
+
 /* @hot_kernel: f32/f64 struct pack/unpack (FFI marshaling) --------- */
 
 HexaVal hexa_struct_pack_f32(HexaVal* args, int nargs) {
