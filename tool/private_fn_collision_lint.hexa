@@ -1,0 +1,335 @@
+// tool/private_fn_collision_lint.hexa — duplicate non-pub fn names across modules
+//
+// PURPOSE
+//   self/module_loader.hexa flattens an import closure by *textual concatenation*.
+//   It strips the `pub` prefix from every top-level decl, then emits all bodies
+//   into a single combined source. The interpreter sees ONE global scope. Any
+//   two files defining a `fn` with the same name silently collapse —
+//   late-binding wins, the first definition is shadowed, and the symptom is
+//   "module X's helper now returns module Y's value".
+//
+//   This is a real bug. stdlib/linalg/dispatch.hexa::select_backend and
+//   stdlib/tensor/dispatch.hexa::select_backend (worktree-agent-aa1915a82e4720367,
+//   commit 9fb47758) collided when both modules were co-imported —
+//   linalg_backend_name started returning the tensor backend value. The B3
+//   agent worked around it by renaming to `tensor_select_backend`. This lint
+//   catches the next one before it ships.
+//
+// CHECK
+//   For every pair of *production* stdlib/self files (excluding tests and
+//   selftests), flag any non-pub `fn NAME(` defined in 2+ files. `pub fn` is
+//   exempt: the public API is intentionally namespaced by re-export and naming
+//   convention, and module-loader concat keeps `pub fn` names too — but those
+//   are tracked via different conventions and out of scope here. Test files
+//   (`test_*.hexa`, `*_test.hexa`, `*_selftest.hexa`, files under any
+//   `/test/` directory) are exempt: they are loaded individually, never
+//   co-imported with another test.
+//
+// USAGE
+//   hexa run tool/private_fn_collision_lint.hexa             — scan stdlib/ (warn, exit 0)
+//   hexa run tool/private_fn_collision_lint.hexa --strict    — exit 1 on any duplicate
+//   hexa run tool/private_fn_collision_lint.hexa --root <d>  — scan a different root
+//   hexa run tool/private_fn_collision_lint.hexa --selftest  — synthetic-fixture self-test
+//
+// EXIT
+//   0 — no violations (or --warn mode)
+//   1 — duplicates found in --strict mode, or selftest failed
+//   2 — bad usage / scan error
+//
+// REFERENCES
+//   /Users/ghost/core/hexa-lang/self/module_loader.hexa  (concat semantics)
+//   /Users/ghost/core/hexa-lang/tool/module_loader_collision_lint.hexa  (sibling lint)
+//   /Users/ghost/core/hexa-lang/stdlib/linalg/dispatch.hexa  (canonical pattern post-rename)
+
+// ─── helpers ───────────────────────────────────────────────────
+
+fn _starts_with(s: string, p: string) -> bool {
+    let pn = len(p)
+    if len(s) < pn { return false }
+    return s.substring(0, pn) == p
+}
+
+fn _basename(p: string) -> string {
+    let mut i = len(p) - 1
+    while i >= 0 {
+        if p.substring(i, i + 1) == "/" { return p.substring(i + 1, len(p)) }
+        i = i - 1
+    }
+    return p
+}
+
+fn _is_test_path(path: string) -> bool {
+    if path.index_of("/test/") >= 0 { return true }
+    if path.index_of("/tests/") >= 0 { return true }
+    let base = _basename(path)
+    if _starts_with(base, "test_") { return true }
+    let bn = len(base)
+    if bn >= 10 {
+        if base.substring(bn - 10, bn) == "_test.hexa" { return true }
+    }
+    if bn >= 14 {
+        if base.substring(bn - 14, bn) == "_selftest.hexa" { return true }
+    }
+    return false
+}
+
+// Extract function name from a line that starts with "fn ". Returns "" if
+// the line does not start with a non-pub fn declaration. PRECONDITION: caller
+// has anchored the line at column 0 (we get this from `grep -nE '^fn …'`).
+fn _extract_nonpub_fn_name(line: string) -> string {
+    if !_starts_with(line, "fn ") { return "" }
+    let n = len(line)
+    let mut i = 3
+    while i < n {
+        let c = line.substring(i, i + 1)
+        if c != " " && c != "\t" { break }
+        i = i + 1
+    }
+    let name_start = i
+    while i < n {
+        let c = line.substring(i, i + 1)
+        let is_alpha = (c >= "a" && c <= "z") || (c >= "A" && c <= "Z")
+        let is_digit = c >= "0" && c <= "9"
+        if !(is_alpha || is_digit || c == "_") { break }
+        i = i + 1
+    }
+    if i == name_start { return "" }
+    return line.substring(name_start, i)
+}
+
+// Single-pass batched grep over the entire root. Avoids per-file fork/exec
+// overhead and per-element walks. Returns parallel arrays (names, paths)
+// with test files filtered out.
+fn _collect_nonpub_fns_batch(root: string) -> array {
+    let cmd = "find '" + root + "' -name '*.hexa' -type f -print0 2>/dev/null"
+        + " | xargs -0 grep -nE '^fn [A-Za-z_][A-Za-z0-9_]*[[:space:]]*\\(' /dev/null 2>/dev/null"
+    let raw = to_string(exec(cmd))
+    let mut names = []
+    let mut paths = []
+    if len(raw) == 0 { return [names, paths] }
+    let n = len(raw)
+    let mut start = 0
+    let mut i = 0
+    while i <= n {
+        let at_end = i == n
+        let c = if at_end { "\n" } else { raw.substring(i, i + 1) }
+        if c == "\n" {
+            if i > start {
+                let line = raw.substring(start, i)
+                // grep -n format: "<path>:<lineno>:<body>"
+                let c1 = line.index_of(":")
+                if c1 > 0 {
+                    let after_path = line.substring(c1 + 1, len(line))
+                    let c2 = after_path.index_of(":")
+                    if c2 > 0 {
+                        let path = line.substring(0, c1)
+                        let body = after_path.substring(c2 + 1, len(after_path))
+                        if !_is_test_path(path) {
+                            let nm = _extract_nonpub_fn_name(body)
+                            if len(nm) > 0 {
+                                names.push(nm)
+                                paths.push(path)
+                            }
+                        }
+                    }
+                }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return [names, paths]
+}
+
+// ─── core scan ────────────────────────────────────────────────
+
+// Returns [violation_count, total_decl_count].
+fn scan_root(root: string) -> array {
+    let pair = _collect_nonpub_fns_batch(root)
+    let all_names = pair[0]
+    let all_paths = pair[1]
+    let an = len(all_names)
+    let total_decls = an
+
+    // Build a single blob `\nNAME\tPATH\n…` so we can scan dups in one pass
+    // by counting needle occurrences. Avoids the nested-array O(N²) walks
+    // that exploded in the docker interp on full stdlib.
+    let mut blob = "\n"
+    let mut bn = 0
+    while bn < an {
+        blob = blob + all_names[bn] + "\t" + all_paths[bn] + "\n"
+        bn = bn + 1
+    }
+
+    let mut violations = 0
+    // Dedup blob: `\nNAME\n` of names already reported.
+    let mut already_blob = "\n"
+    let mut q = 0
+    while q < an {
+        let nm = all_names[q]
+        let dedup_needle = "\n" + nm + "\n"
+        if already_blob.index_of(dedup_needle) < 0 {
+            // Find every (name, path) row for this name by repeatedly
+            // sliding through the blob looking for "\nNAME\t".
+            let key_left = "\n" + nm + "\t"
+            let mut owners_str = ""
+            let mut occ = 0
+            let mut work = blob
+            while true {
+                let idx = work.index_of(key_left)
+                if idx < 0 { break }
+                let after = work.substring(idx + len(key_left), len(work))
+                let nl = after.index_of("\n")
+                if nl < 0 { break }
+                let path = after.substring(0, nl)
+                owners_str = owners_str + path + "\n"
+                occ = occ + 1
+                work = after.substring(nl, len(after))
+            }
+            if occ >= 2 {
+                violations = violations + 1
+                eprintln("[pfc-lint] FAIL duplicate non-pub fn `" + nm + "` in " + to_string(occ) + " files:")
+                let osn = len(owners_str)
+                let mut s = 0
+                let mut t = 0
+                while t < osn {
+                    let cc = owners_str.substring(t, t + 1)
+                    if cc == "\n" {
+                        if t > s { eprintln("    " + owners_str.substring(s, t)) }
+                        s = t + 1
+                    }
+                    t = t + 1
+                }
+                eprintln("  remedy: rename one to a module-prefixed form (e.g. `linalg_select_backend`),")
+                eprintln("          or promote both to `pub fn` if the API is intentionally shared,")
+                eprintln("          or extract a single shared helper into a common module.")
+            }
+            already_blob = already_blob + nm + "\n"
+        }
+        q = q + 1
+    }
+
+    println("[pfc-lint] root: " + root)
+    println("[pfc-lint]   " + to_string(total_decls) + " non-pub fn declaration(s) (production)")
+    println("[pfc-lint]   " + to_string(violations) + " collision(s)")
+    return [violations, total_decls]
+}
+
+// ─── selftest ─────────────────────────────────────────────────
+
+fn _write_tmp(path: string, body: string) {
+    let tmp = path + ".tmp"
+    write_file(tmp, body)
+    exec("mv '" + tmp + "' '" + path + "'")
+}
+
+fn _selftest() -> int {
+    let tmpdir = to_string(exec("mktemp -d /tmp/pfc_lint_st_XXXXXX")).trim()
+    if len(tmpdir) == 0 {
+        eprintln("[pfc-lint selftest] FAIL tmpdir mktemp")
+        return 1
+    }
+
+    // Fixture A: two production modules each defining `fn select_backend()`.
+    // The exact pattern that bit linalg/tensor before the rename. MUST trigger.
+    let dir_a = tmpdir + "/A"
+    exec("mkdir -p '" + dir_a + "/linalg' '" + dir_a + "/tensor'")
+    _write_tmp(dir_a + "/linalg/dispatch.hexa",
+        "fn select_backend() -> string { return \"ref\" }\n"
+        + "pub fn linalg_backend_name() -> string { return select_backend() }\n")
+    _write_tmp(dir_a + "/tensor/dispatch.hexa",
+        "fn select_backend() -> string { return \"native\" }\n"
+        + "pub fn tensor_backend_name() -> string { return select_backend() }\n")
+    let pa = scan_root(dir_a)
+    if pa[0] != 1 {
+        eprintln("[pfc-lint selftest] FAIL A: violations=" + to_string(pa[0]) + " want 1 (select_backend dup)")
+        exec("rm -rf '" + tmpdir + "'")
+        return 1
+    }
+
+    // Fixture B: same name but both `pub fn` — public API is exempt. MUST NOT trigger.
+    let dir_b = tmpdir + "/B"
+    exec("mkdir -p '" + dir_b + "'")
+    _write_tmp(dir_b + "/a.hexa", "pub fn select_backend() -> string { return \"a\" }\n")
+    _write_tmp(dir_b + "/b.hexa", "pub fn select_backend() -> string { return \"b\" }\n")
+    let pb = scan_root(dir_b)
+    if pb[0] != 0 {
+        eprintln("[pfc-lint selftest] FAIL B: violations=" + to_string(pb[0]) + " want 0 (pub fn exempt)")
+        exec("rm -rf '" + tmpdir + "'")
+        return 1
+    }
+
+    // Fixture C: dup is in test files — exempt by path filter.
+    let dir_c = tmpdir + "/C"
+    exec("mkdir -p '" + dir_c + "/test'")
+    _write_tmp(dir_c + "/test_a.hexa", "fn check(x) -> bool { return x }\n")
+    _write_tmp(dir_c + "/test/inside.hexa", "fn check(x) -> bool { return x }\n")
+    _write_tmp(dir_c + "/b_test.hexa", "fn check(x) -> bool { return x }\n")
+    let pc = scan_root(dir_c)
+    if pc[0] != 0 {
+        eprintln("[pfc-lint selftest] FAIL C: violations=" + to_string(pc[0]) + " want 0 (tests exempt)")
+        exec("rm -rf '" + tmpdir + "'")
+        return 1
+    }
+
+    // Fixture D: clean — no dups. MUST NOT trigger.
+    let dir_d = tmpdir + "/D"
+    exec("mkdir -p '" + dir_d + "'")
+    _write_tmp(dir_d + "/a.hexa", "fn helper_a() -> int { return 1 }\n")
+    _write_tmp(dir_d + "/b.hexa", "fn helper_b() -> int { return 2 }\n")
+    let pd = scan_root(dir_d)
+    if pd[0] != 0 {
+        eprintln("[pfc-lint selftest] FAIL D: violations=" + to_string(pd[0]) + " want 0 (clean)")
+        exec("rm -rf '" + tmpdir + "'")
+        return 1
+    }
+
+    exec("rm -rf '" + tmpdir + "'")
+    println("[pfc-lint selftest] 4/4 fixtures PASS (A dup-detected / B pub-exempt / C tests-exempt / D clean)")
+    return 0
+}
+
+// ─── dispatch ─────────────────────────────────────────────────
+
+fn _hexa_lang_root() -> string {
+    let hl = env("HEXA_LANG")
+    if len(hl) > 0 { return hl }
+    let pwd = to_string(exec("pwd")).trim()
+    return pwd
+}
+
+fn main() -> int {
+    let argv = args()
+    let mut mode = "warn"
+    let mut root = ""
+    let mut i = 0
+    let mut want_selftest = false
+    while i < len(argv) {
+        let a = argv[i]
+        if a == "--selftest" || a == "selftest" {
+            want_selftest = true
+        } else if a == "--strict" {
+            mode = "strict"
+        } else if a == "--warn" {
+            mode = "warn"
+        } else if a == "--root" {
+            if i + 1 < len(argv) {
+                root = argv[i + 1]
+                i = i + 1
+            }
+        }
+        i = i + 1
+    }
+    if want_selftest { return _selftest() }
+    if root == "" {
+        let r = _hexa_lang_root()
+        root = r + "/stdlib"
+    }
+    let pair = scan_root(root)
+    if mode == "strict" {
+        if pair[0] > 0 { return 1 }
+    }
+    return 0
+}
+
+exit(main())
