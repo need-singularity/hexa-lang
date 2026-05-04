@@ -521,6 +521,173 @@ fn dispatch_remote(remote_path: str, query: str) -> void {
 // hxq detects 'hexa://harness/' prefix and short-circuits to the bash
 // handler before this resolver is ever invoked.
 
+// ─── sync scope (hexa://sync/<verb>?repo=<X>&target=<Y>[&freshness=<axis>])
+//
+// Migrated 2026-05-04 from bash dispatcher (~/.hx/bin/hexa-url-handler.sh
+// sync/*) case clause) to here. Per user directive "hexa only" + "프로젝트
+// 내부에 구현" — the dispatcher logic lives in hexa, the per-verb handlers
+// live under hive/sync/<verb>.hexa. Child-exec to git/ssh remains because
+// hexa stdlib has no native ssh/git primitives.
+//
+// Contract (mk2):
+//   format-grammar.004 — verb ∈ {pull,push,status,rsync}; unknown → exit 4.
+//                        repo not in `hive-resource list repos`         → exit 3.
+//                        target not in `hive-resource list` host pool   → exit 3.
+//   resource.015      — repo + target read via `hive-resource list` only;
+//                        never co-read of the spec file directly.
+//   closure.011       — freshness ∈ {gate,skip,strict,force}; default gate.
+//                        Already validated upstream by the resolver's
+//                        freshness machinery; we only forward.
+//   ai-native.025     — every dispatch writes audit jsonl row event=
+//                        sync-complete (the per-verb handler emits the
+//                        sentinel + writes the row).
+//   dispatch.001      — sync scope is canonical surface for cross-host
+//                        repo movement; raw git/ssh outside this trail
+//                        forbidden.
+fn _sync_repo_list() -> [str] {
+    // resource.015 — repo registry via `hive-resource list repos`. Output
+    // shape: "repo:<name>:<key=value>,..." one row per registered repo.
+    let raw = to_string(exec("/Users/ghost/.hx/bin/hive-resource list repos 2>/dev/null"))  // @allow-bare-exec
+    let lines = raw.split("\n")
+    let mut out = []
+    for ln in lines {
+        let t = ln.trim()
+        if !t.starts_with("repo:") { continue }
+        // Slug = field 2 between the first two colons.
+        let rest = t.substring(5, t.len())
+        let colon = rest.index_of(":")
+        let mut slug = rest
+        if colon >= 0 { slug = rest.substring(0, colon) }
+        if slug.len() > 0 { out = out + [slug] }
+    }
+    return out
+}
+
+fn _sync_host_list() -> [str] {
+    // resource.015 — host pool via `hive-resource list` (no `repos` arg).
+    // Reuses the same parser shape as freshness_target_hosts() but does
+    // NOT filter on reachability — membership is the question, not health.
+    let raw = to_string(exec("/Users/ghost/.hx/bin/hive-resource list 2>/dev/null"))  // @allow-bare-exec
+    let lines = raw.split("\n")
+    let mut out = []
+    for ln in lines {
+        let t = ln.trim()
+        if t.len() == 0 { continue }
+        if t.starts_with("#") { continue }
+        if t.starts_with("__HIVE_RESOURCE__") { continue }
+        let mut h = ""
+        let mut i = 0
+        while i < t.len() {
+            let ch = t.substring(i, i + 1)
+            if ch == " " || ch == "\t" { break }
+            h = h + ch
+            i = i + 1
+        }
+        if h.len() > 0 { out = out + [h] }
+    }
+    return out
+}
+
+fn _list_contains(items: [str], v: str) -> bool {
+    let mut i = 0
+    while i < items.len() {
+        if items[i] == v { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn dispatch_sync(res: str, query: str) -> void {
+    // res = "<verb>" (path tail of hexa://sync/<verb>).
+    let verb = res
+    if verb != "pull" && verb != "push" && verb != "status" && verb != "rsync" {
+        ai_err("SYNC-BAD-VERB",
+               "unknown sync verb '" + verb + "' (use: pull|push|status|rsync)",
+               "pick a verb from the format-grammar.004 whitelist",
+               "format-grammar.004")
+        exit(4)
+    }
+    let repo = get_param(query, "repo")
+    let target = get_param(query, "target")
+    let fresh_raw = get_param(query, "freshness")
+    let bad = validate_freshness(fresh_raw)
+    if bad.len() > 0 {
+        ai_err("FRESHNESS-BAD-VALUE",
+               "unknown freshness='" + bad + "' (use: gate|skip|strict|force)",
+               "drop ?freshness= for default 'gate', or pick from the whitelist",
+               "closure.011")
+        exit(3)
+    }
+    let freshness = freshness_default(fresh_raw)
+    if repo.len() == 0 || target.len() == 0 {
+        ai_err("SYNC-MISSING-PARAM",
+               "sync/" + verb + " requires ?repo=<X>&target=<Y>",
+               "example: hxq 'hexa://sync/" + verb + "?repo=hive&target=ubu'",
+               "format-grammar.004")
+        exit(3)
+    }
+    // Membership — repo (resource.015).
+    let repos = _sync_repo_list()
+    if repos.len() == 0 {
+        ai_err("SYNC-REGISTRY-EMPTY",
+               "hive-resource list repos returned empty — registry unreachable or regressed",
+               "verify: /Users/ghost/.hx/bin/hive-resource list repos",
+               "resource.015")
+        exit(1)
+    }
+    if !_list_contains(repos, repo) {
+        ai_err("SYNC-UNKNOWN-REPO",
+               "repo '" + repo + "' not in registered set",
+               "register it: hive resource add repo " + repo + " --canonical=mac --mirrors=fleet",
+               "resource.015 / format-grammar.004")
+        exit(3)
+    }
+    // Membership — target (resource.015). 'fleet' is a reserved alias.
+    if target != "fleet" {
+        let hosts = _sync_host_list()
+        if !_list_contains(hosts, target) {
+            ai_err("SYNC-UNKNOWN-TARGET",
+                   "target '" + target + "' not in host pool",
+                   "verify: /Users/ghost/.hx/bin/hive-resource list",
+                   "resource.015 / format-grammar.004")
+            exit(3)
+        }
+    }
+    // Dispatch to the per-verb handler under hive/sync/<verb>.hexa.
+    // The handler is responsible for emitting __HEXA_SYNC__ sentinel +
+    // writing the audit jsonl row (ai-native.025).
+    //
+    // We exec the handler with HEXA_RESOLVER_NO_REROUTE=1 so it runs on
+    // the bare Mac filesystem (host ssh/git/rsync reachable). $WS may be
+    // empty inside the resolver's docker landing per the URL-doc caveat
+    // — the absolute resolver path under $HOME/.hx/bin/hexa is the
+    // canonical entry point and gates the docker decision itself.
+    let hx_bin = HOME + "/.hx/bin/hexa"
+    let handler = HOME + "/core/hive/sync/" + verb + ".hexa"
+    let repo_sh = repo.replace("'", "'\\''")
+    let target_sh = target.replace("'", "'\\''")
+    let fresh_sh = freshness.replace("'", "'\\''")
+    let cmd = "HEXA_RESOLVER_NO_REROUTE=1 HEXA_SHIM_NO_DARWIN_LANDING=1 " +
+              hx_bin + " run " + handler +
+              " --repo=" + repo_sh +
+              " --target=" + target_sh +
+              " --freshness=" + fresh_sh +
+              " 2>&1; echo __SYNC_HANDLER_RC=$?"
+    let out = to_string(exec(cmd))  // @allow-bare-exec
+    // Re-emit handler stdout/stderr verbatim, strip and surface RC.
+    let rc_marker = "__SYNC_HANDLER_RC="
+    let rc_idx = out.last_index_of(rc_marker)
+    let mut rc_str = "0"
+    let mut body = out
+    if rc_idx >= 0 {
+        rc_str = out.substring(rc_idx + rc_marker.len(), out.len()).trim()
+        body = out.substring(0, rc_idx)
+    }
+    print(body)
+    let rc = to_int(rc_str)
+    if rc != 0 { exit(rc) }
+}
+
 fn main() {
     let argv = args()
     let mut url = ""
@@ -532,7 +699,7 @@ fn main() {
     if url.len() == 0 {
         ai_err("USAGE-EMPTY",
                "no hexa:// URL argument given",
-               "pass one of: gate/{drill,entry}  cmd/<name>  cmd/list[?fmt=text|json]  active  harness/<subcmd>  remote/<host>/...",
+               "pass one of: gate/{drill,entry}  cmd/<name>  cmd/list[?fmt=text|json]  active  harness/<subcmd>  remote/<host>/...  sync/{pull,push,status,rsync}",
                "gate/hexa_url.hexa")
         return
     }
@@ -562,12 +729,12 @@ fn main() {
         dispatch_harness(res, query)
     } else if sc == "remote" {
         dispatch_remote(res, query)
+    } else if sc == "sync" {
+        dispatch_sync(res, query)
     } else {
         ai_err("SCOPE-UNKNOWN",
                "unknown scope/resource: '" + sc + "/" + res + "'",
-               "use one of: gate/{drill,entry}  cmd/<name>  cmd/list[?fmt=text|json]  active  harness/<subcmd>  remote/<host>/...",
+               "use one of: gate/{drill,entry}  cmd/<name>  cmd/list[?fmt=text|json]  active  harness/<subcmd>  remote/<host>/...  sync/{pull,push,status,rsync}",
                "gate/hexa_url.hexa:main")
     }
 }
-
-main()
