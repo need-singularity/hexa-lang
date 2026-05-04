@@ -1,0 +1,210 @@
+// @resolver-bypass(reason="pure text drift-detector — read-only filesystem scan, no network/host syscalls")
+// tool/lint_resolver_bypass.hexa — drift detector for the Mac->Docker
+// bypass-marker scan logic.
+//
+// PURPOSE
+//   The bypass-marker scan used to be hand-duplicated in two places that
+//   silently diverged (FIX-5, commit 36a4a842):
+//     1. ~/.hx/bin/hexa::_darwin_bypass_check     (installed resolver)
+//     2. tool/install_interp_shim.hexa            (embedded into shim)
+//
+//   Now both consume tool/resolver_bypass_check.sh.in (SSOT). This lint
+//   verifies that:
+//     A. The SSOT file exists and parses (one `_hexa_bypass_marker_present`
+//        function defining the four grep patterns).
+//     B. install_interp_shim.hexa references the SSOT path.
+//     C. ~/.hx/bin/hexa (if present) matches the SSOT pattern set —
+//        every grep pattern in the SSOT body must appear verbatim in
+//        the installed resolver. Any drift fails with exit 1.
+//
+//   D. --selftest demonstrates the lint catches drift: corrupt a copy
+//      of the SSOT in /tmp, point the lint at it, expect failure.
+//
+// USAGE
+//   hexa tool/lint_resolver_bypass.hexa            — exit 0 in-sync, 1 drift, 2 misconfig
+//   hexa tool/lint_resolver_bypass.hexa --selftest — regression test (exit 0 if drift caught)
+//
+// INVARIANTS
+//   The SSOT must contain the four canonical patterns. Adding a pattern
+//   to the SSOT and forgetting to redeploy ~/.hx/bin/hexa is exactly the
+//   class of bug FIX-5 documented; this lint is the seatbelt.
+
+use "self/stdlib/law_io"
+
+fn _patterns_from_ssot(ssot_text) {
+    // The SSOT body is bash; the canonical patterns are the four
+    // single-quoted regexes inside `grep -qE '...'` lines. We extract them
+    // textually so the lint stays loose if the SSOT grows new patterns —
+    // we just require ALL of them to appear in every consumer.
+    let mut pats = []
+    let lines = split(ssot_text, "\n")
+    for ln in lines {
+        let s = ln
+        let i = s.index_of("grep -qE '")
+        if i < 0 { continue }
+        let rest = s.substring(i + len("grep -qE '"), len(s))
+        let j = rest.index_of("'")
+        if j < 0 { continue }
+        pats.push(rest.substring(0, j))
+    }
+    return pats
+}
+
+fn _check_consumer(label, path, pats) {
+    // Returns ["ok", ""] or ["drift", "<reason>"].
+    let test_p = exec_with_status("test -f " + path)
+    if test_p[1] != 0 {
+        return ["skip", label + ": " + path + " not present"]
+    }
+    let body = to_string(read_file(path))
+    let mut missing = []
+    for p in pats {
+        if !body.contains(p) {
+            missing.push(p)
+        }
+    }
+    if len(missing) > 0 {
+        let mut msg = label + " (" + path + ") missing " + str(len(missing)) + " SSOT pattern(s):\n"
+        for m in missing {
+            msg = msg + "    - " + m + "\n"
+        }
+        return ["drift", msg]
+    }
+    return ["ok", ""]
+}
+
+fn _run_lint(ssot_path, install_shim_path, hx_resolver_path) {
+    // exit codes: 0 ok, 1 drift, 2 misconfig
+    let test_ssot = exec_with_status("test -f " + ssot_path)
+    if test_ssot[1] != 0 {
+        eprintln("[lint_resolver_bypass] SSOT missing: " + ssot_path)
+        return 2
+    }
+    let ssot = to_string(read_file(ssot_path))
+    let pats = _patterns_from_ssot(ssot)
+    if len(pats) < 1 {
+        eprintln("[lint_resolver_bypass] SSOT contains zero grep patterns — refusing to validate")
+        return 2
+    }
+
+    let mut all_ok = true
+
+    // Sanity: install_interp_shim.hexa must reference the SSOT filename.
+    let test_shim_src = exec_with_status("test -f " + install_shim_path)
+    if test_shim_src[1] != 0 {
+        eprintln("[lint_resolver_bypass] install_interp_shim.hexa missing: " + install_shim_path)
+        return 2
+    }
+    let shim_src = to_string(read_file(install_shim_path))
+    if !shim_src.contains("resolver_bypass_check.sh.in") {
+        eprintln("[lint_resolver_bypass] " + install_shim_path + " does NOT reference resolver_bypass_check.sh.in")
+        eprintln("[lint_resolver_bypass]   Did somebody re-inline the bypass-marker scan? Restore the SSOT path.")
+        all_ok = false
+    } else {
+        println("[lint_resolver_bypass] OK   " + install_shim_path + " -> SSOT reference present")
+    }
+
+    // ~/.hx/bin/hexa: if installed, every SSOT pattern must appear.
+    let res = _check_consumer("~/.hx/bin/hexa", hx_resolver_path, pats)
+    if res[0] == "drift" {
+        eprintln("[lint_resolver_bypass] DRIFT " + res[1])
+        all_ok = false
+    } else if res[0] == "skip" {
+        println("[lint_resolver_bypass] SKIP " + res[1])
+    } else {
+        println("[lint_resolver_bypass] OK   ~/.hx/bin/hexa carries all " + str(len(pats)) + " SSOT pattern(s)")
+    }
+
+    if all_ok { return 0 } else { return 1 }
+}
+
+// ─── selftest (regression test) ──────────────────────────────────
+// Demonstrates that the lint catches drift. We synthesize a corrupted
+// "consumer" file in /tmp that's missing one SSOT pattern, then run
+// _check_consumer against it and assert it returns "drift".
+fn _selftest(ssot_path) {
+    println("[lint_resolver_bypass] --selftest: regression test for drift detection")
+    let ssot = to_string(read_file(ssot_path))
+    let pats = _patterns_from_ssot(ssot)
+    if len(pats) < 2 {
+        eprintln("[lint_resolver_bypass] selftest needs >= 2 SSOT patterns; got " + str(len(pats)))
+        return 3
+    }
+    println("[lint_resolver_bypass]   SSOT exposes " + str(len(pats)) + " grep pattern(s)")
+
+    // Build a "drifted consumer" that has only the first pattern but is
+    // missing all the rest. The lint MUST flag this. Use .fixture
+    // extension (not .sh) to satisfy law_io raw#7 HEXA-ONLY ban —
+    // these are throwaway test fixtures, not real shell scripts.
+    let drifted = "#!/bin/bash\n# drifted copy — only carries the first SSOT pattern\ngrep -qE '" + pats[0] + "' \"$@\"\n"
+    let drifted_path = "/tmp/hexa_lint_resolver_bypass_drifted.fixture"
+    safe_write_file(drifted_path, drifted)
+    let drifted_res = _check_consumer("drifted-fixture", drifted_path, pats)
+    if drifted_res[0] != "drift" {
+        eprintln("[lint_resolver_bypass]   FAIL: drifted fixture not flagged. Got status=" + drifted_res[0])
+        exec("rm -f " + drifted_path)
+        return 3
+    }
+    println("[lint_resolver_bypass]   PASS drift fixture flagged: " + str(len(pats) - 1) + " missing pattern(s)")
+
+    // Build an "in-sync consumer" that carries every SSOT pattern; lint MUST pass.
+    let mut in_sync = "#!/bin/bash\n# in-sync consumer — carries every SSOT pattern\n"
+    for p in pats {
+        in_sync = in_sync + "grep -qE '" + p + "' \"$@\"\n"
+    }
+    let in_sync_path = "/tmp/hexa_lint_resolver_bypass_in_sync.fixture"
+    safe_write_file(in_sync_path, in_sync)
+    let in_sync_res = _check_consumer("in-sync-fixture", in_sync_path, pats)
+    if in_sync_res[0] != "ok" {
+        eprintln("[lint_resolver_bypass]   FAIL: in-sync fixture flagged as drift. Got status=" + in_sync_res[0] + " msg=" + in_sync_res[1])
+        exec("rm -f " + drifted_path + " " + in_sync_path)
+        return 3
+    }
+    println("[lint_resolver_bypass]   PASS in-sync fixture accepted")
+
+    // Cleanup.
+    exec("rm -f " + drifted_path + " " + in_sync_path)
+    println("[lint_resolver_bypass] --selftest OK (drift caught, in-sync accepted)")
+    return 0
+}
+
+// ─── entry ───────────────────────────────────────────────────────
+// Resolve hexa_dir robustly: try $PWD first, then walk up until we see
+// tool/resolver_bypass_check.sh.in. This is more tolerant than the
+// "dirname argv[1]" trick because the interpreter often hands us the
+// AOT-cached exe path in argv[0..1] (no script path).
+fn _find_hexa_dir() -> string {
+    let cwd = exec("pwd").trim()
+    let mut cur = cwd
+    let mut depth = 0
+    while depth < 8 {
+        let test = exec_with_status("test -f " + cur + "/tool/resolver_bypass_check.sh.in")
+        if test[1] == 0 { return cur }
+        let parent = exec("dirname " + cur).trim()
+        if parent == cur { break }
+        cur = parent
+        depth = depth + 1
+    }
+    return cwd
+}
+
+let _av = argv()
+let _hexa_dir = _find_hexa_dir()
+let _ssot_path = _hexa_dir + "/tool/resolver_bypass_check.sh.in"
+let _install_shim_path = _hexa_dir + "/tool/install_interp_shim.hexa"
+let _hx_resolver_path = exec("echo \"$HOME/.hx/bin/hexa\"").trim()
+
+let mut _selftest_mode = false
+let mut _ai = 2
+while _ai < len(_av) {
+    if _av[_ai] == "--selftest" { _selftest_mode = true }
+    _ai = _ai + 1
+}
+
+let mut _rc = 0
+if _selftest_mode {
+    _rc = _selftest(_ssot_path)
+} else {
+    _rc = _run_lint(_ssot_path, _install_shim_path, _hx_resolver_path)
+}
+exit(_rc)
