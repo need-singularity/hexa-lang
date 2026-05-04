@@ -87,6 +87,188 @@ fn parse_url(u: str) -> [str] {
     return [us_scope, us_res, query]
 }
 
+// ─── freshness axis (closure.011) — orthogonal 5th axis ──────────────
+// Values: gate (default — probe + inline sync if stale)
+//         skip (no probe — opt-out for read-only fleet probes)
+//         strict (probe + hard-block + non-zero exit if stale)
+//         force (always sync regardless of probe)
+// Applies to all target=ubu1|ubu2|fleet invocations across all scopes
+// (not only sync/*). Precedence per closure.011:
+//   target → freshness → timeout → async → fmt
+//
+// validate_freshness returns "" if value is in whitelist (or empty, which
+// means default), else returns the offending value for the caller to
+// surface through ai_err.
+fn validate_freshness(v: str) -> str {
+    if v.len() == 0 { return "" }
+    if v == "gate" || v == "skip" || v == "strict" || v == "force" { return "" }
+    return v
+}
+
+fn freshness_default(v: str) -> str {
+    if v.len() == 0 { return "gate" }
+    return v
+}
+
+// Map a target string to the canonical fleet host(s) the freshness axis
+// must probe. Single host → [host]; "fleet" → reads `hive-resource list`.
+// resource.015 — host list comes from `hive-resource list` only.
+fn freshness_target_hosts(target: str) -> [str] {
+    if target == "ubu1" || target == "ubu2" { return [target] }
+    if target == "fleet" {
+        // hive-resource list emits "<host>  <reachable>  <load>  <mem>  <nexus>"
+        // Skip header lines (start with '#') and __HIVE_RESOURCE__ trailer.
+        let raw = to_string(exec("/Users/ghost/.hx/bin/hive-resource list 2>/dev/null"))  // @allow-bare-exec
+        let lines = raw.split("\n")
+        let mut out = []
+        for ln in lines {
+            let t = ln.trim()
+            if t.len() == 0 { continue }
+            if t.starts_with("#") { continue }
+            if t.starts_with("__HIVE_RESOURCE__") { continue }
+            // First whitespace-delimited token is the host name.
+            let mut h = ""
+            let mut i = 0
+            while i < t.len() {
+                let ch = t.substring(i, i + 1)
+                if ch == " " || ch == "\t" { break }
+                h = h + ch
+                i = i + 1
+            }
+            if h.len() > 0 { out = out + [h] }
+        }
+        return out
+    }
+    return []
+}
+
+// Run the drift probe for ONE host+repo via gate/remote_preflight.hexa.
+// Returns triple [verdict, local_sha, remote_sha] where verdict ∈
+// {fresh, stale, offline}. local_sha may be empty on offline path.
+fn freshness_probe(host: str, repo: str) -> [str] {
+    let hx = WS + "/hexa-lang/hexa"
+    let pre = GATE + "/remote_preflight.hexa"
+    // NO_REROUTE so the probe sees the real local filesystem (not the docker
+    // sandbox where /Users/ghost/core paths don't resolve). raw 200 / raw 82.
+    let cmd = "HEXA_RESOLVER_NO_REROUTE=1 HEXA_SHIM_NO_DARWIN_LANDING=1 " +
+              hx + " run " + pre +
+              " --drift-probe --host " + host.replace("'", "'\\''") +
+              " --repo " + repo.replace("'", "'\\''") +
+              " 2>/dev/null; echo __DRIFT_RC=$?"
+    let out = to_string(exec(cmd))  // @allow-bare-exec
+    // Parse "<verdict> local=<sha> remote=<sha>" line + __DRIFT_RC=N.
+    let mut verdict = "offline"
+    let mut local_sha = ""
+    let mut remote_sha = ""
+    let lines = out.split("\n")
+    for ln in lines {
+        let t = ln.trim()
+        if t.starts_with("fresh ") || t.starts_with("stale ") || t.starts_with("offline ") {
+            // Tokenize on space — first token is verdict.
+            let sp1 = t.index_of(" ")
+            verdict = t.substring(0, sp1)
+            // local=<sha> remote=<sha>
+            let l_idx = t.index_of("local=")
+            let r_idx = t.index_of("remote=")
+            if l_idx >= 0 {
+                let l_end = if r_idx > l_idx { r_idx } else { t.len() }
+                local_sha = t.substring(l_idx + 6, l_end).trim()
+            }
+            if r_idx >= 0 {
+                remote_sha = t.substring(r_idx + 7, t.len()).trim()
+            }
+        }
+    }
+    return [verdict, local_sha, remote_sha]
+}
+
+// Apply the freshness gate before remote dispatch. Caller passes the
+// resolved freshness value (post-default), the target, and the repo
+// the dispatch operates against. Returns true if dispatch should proceed,
+// false if the gate has blocked (already emitted sentinel + caller exits).
+//
+// Behavior per closure.011 + meta-enforcement.132:
+//   skip   → no probe; proceed.
+//   force  → no probe; trigger sync first; then proceed.
+//   gate   → probe; if stale, emit __HEXA_SYNC_STALE__ + inline sync; proceed.
+//   strict → probe; if stale, emit __HEXA_SYNC_STALE__ + return false (caller exits non-zero).
+//
+// The inline sync delegates to the bash sync handler (hexa://sync/pull)
+// rather than re-implementing git here — keeps audit trail uniform per
+// dispatch.001.
+fn freshness_gate_apply(freshness: str, target: str, repo: str) -> bool {
+    if freshness == "skip" { return true }
+    // Default repo: when caller didn't set ?repo=, derive from $WS.
+    // For the resolver routes this is the active repo at $WS (typically hive).
+    let mut active_repo = repo
+    if active_repo.len() == 0 {
+        // Fall back to git rev-parse on the local cwd.
+        let root = to_string(exec("git rev-parse --show-toplevel 2>/dev/null")).trim()  // @allow-bare-exec
+        if root.len() > 0 {
+            // Last path component.
+            let last = root.split("/")
+            active_repo = last[last.len() - 1]
+        }
+    }
+    if active_repo.len() == 0 { active_repo = "hive" }
+    let hosts = freshness_target_hosts(target)
+    if hosts.len() == 0 { return true }  // nothing to probe (e.g. mac)
+    let mut any_stale = false
+    let mut i = 0
+    while i < hosts.len() {
+        let h = hosts[i]
+        if freshness == "force" {
+            // Force sync regardless of probe — emit pre-sync sentinel.
+            eprintln("__HEXA_SYNC_STALE__ before=force required=force repo=" +
+                     active_repo + " target=" + h)
+            // Trigger inline sync via bash dispatcher.
+            let sync_cmd = HOME + "/.hx/bin/hexa-url-handler.sh 'hexa://sync/pull?repo=" +
+                           active_repo + "&target=" + h + "&freshness=force' 2>&1"
+            let _ = to_string(exec(sync_cmd))  // @allow-bare-exec
+            i = i + 1
+            continue
+        }
+        let res = freshness_probe(h, active_repo)
+        let verdict = res[0]
+        let local_sha = res[1]
+        let remote_sha = res[2]
+        if verdict == "fresh" { i = i + 1; continue }
+        if verdict == "offline" {
+            // Drift probe failed; meta-enforcement.132 forbids silent stale exec.
+            eprintln("__HEXA_SYNC_OFFLINE__ repo=" + active_repo + " target=" + h)
+            if freshness == "strict" {
+                ai_err("DRIFT-OFFLINE-STRICT",
+                       "drift probe offline (host=" + h + " repo=" + active_repo + ") and freshness=strict",
+                       "retry when ssh to " + h + " is available, or use freshness=gate to proceed with last-known-good",
+                       "gate/remote_preflight.hexa:drift_probe")
+                return false
+            }
+            // gate (default) — proceed against possibly stale remote, audit logged.
+            i = i + 1
+            continue
+        }
+        // verdict == "stale"
+        any_stale = true
+        eprintln("__HEXA_SYNC_STALE__ before=" + remote_sha + " required=" + local_sha +
+                 " repo=" + active_repo + " target=" + h)
+        if freshness == "strict" {
+            ai_err("DRIFT-STALE-STRICT",
+                   "remote " + h + " stale for repo " + active_repo + " (remote=" + remote_sha +
+                   " required=" + local_sha + ") under freshness=strict",
+                   "run: hxq 'hexa://sync/pull?repo=" + active_repo + "&target=" + h + "'  # then retry",
+                   "closure.011 + meta-enforcement.132")
+            return false
+        }
+        // gate (default) — inline sync via bash dispatcher.
+        let sync_cmd = HOME + "/.hx/bin/hexa-url-handler.sh 'hexa://sync/pull?repo=" +
+                       active_repo + "&target=" + h + "&freshness=force' 2>&1"
+        let _ = to_string(exec(sync_cmd))  // @allow-bare-exec
+        i = i + 1
+    }
+    // Quiet success path — no sentinel needed (no drift detected).
+    return true
+}
+
 // ─── Query → single param lookup (no multi-value, no escaping beyond urldecode) ──
 fn get_param(query: str, key: str) -> str {
     if query.len() == 0 { return "" }
@@ -282,6 +464,24 @@ fn dispatch_remote(remote_path: str, query: str) -> void {
     let mut inner_url = "hexa://" + inner
     if query.len() > 0 { inner_url = inner_url + "?" + query }
     let url_sh = inner_url.replace("'", "'\\''")
+    // Freshness axis (closure.011) — apply BEFORE TCP probe + ssh handshake.
+    // Default = gate (probe + inline sync if stale). Per the rule's
+    // precedence: target → freshness → timeout → async → fmt.
+    let fresh_raw = get_param(query, "freshness")
+    let bad = validate_freshness(fresh_raw)
+    if bad.len() > 0 {
+        ai_err("FRESHNESS-BAD-VALUE",
+               "unknown freshness='" + bad + "' (use: gate|skip|strict|force)",
+               "drop ?freshness= for default 'gate', or pick from the whitelist",
+               "closure.011")
+        exit(3)
+    }
+    let freshness = freshness_default(fresh_raw)
+    let repo_for_drift = get_param(query, "repo")
+    if !freshness_gate_apply(freshness, host, repo_for_drift) {
+        // Strict mode hit — sentinel already emitted, hard-block.
+        exit(1)
+    }
     // Fast preflight — abort early if the host is TCP-dead. Use exec_with_status
     // so we can key off the exit code (0 = reachable, 74 = all-unreachable on
     // Darwin heavy-compute path, 64 = generic unreachable).

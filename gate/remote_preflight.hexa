@@ -26,6 +26,10 @@
 //   hexa run gate/remote_preflight.hexa [--hosts ubu,ubu2] [--port 22]
 //                                       [--timeout-ms 300] [--ttl-s 30]
 //                                       [--no-cache] [--json-only]
+//   hexa run gate/remote_preflight.hexa --drift-probe --host ubu1 --repo hive
+//                                       [--repo-path /home/summer/core/hive]
+//                                       [--timeout-ms 80] [--ttl-s 30]
+//                                       [--no-cache]
 //
 // Falls back to env when flags absent:
 //   HEXA_REMOTE_HOSTS=ubu,ubu2  HEXA_REMOTE_PORT=22
@@ -34,6 +38,10 @@
 // Integration:
 //   • gate/hexa_url.hexa :: dispatch_remote — calls this before ssh,
 //     shortcircuits to ai_err on all-unreachable.
+//   • gate/hexa_url.hexa :: freshness axis (closure.011) — calls this
+//     with --drift-probe to compare local HEAD against remote HEAD before
+//     dispatching to target=ubu1|ubu2|fleet. Result feeds the freshness
+//     gate decision (gate=inline-sync; strict=hard-block; skip=bypass).
 //   • nexus drill resolver (out-of-tree in ~/core/nexus/cli/run.hexa) —
 //     intended to call this before `hexa_remote` dispatch. That patch
 //     lives with nexus; this repo owns the primitive.
@@ -303,6 +311,185 @@ fn emit_error_compat(hosts: [str], exit_code: i64) -> void {
     eprintln(j)
 }
 
+// ─── drift probe — ssh git rev-parse HEAD vs local, 80ms hard cap ──────
+// Closure.011 (freshness axis) infrastructure. Compares local HEAD to the
+// remote target host's HEAD for the same repo. Result drives freshness
+// gate decision in gate/hexa_url.hexa.
+//
+// Cache file: /tmp/hexa_drift_cache_<host>_<repo>.txt
+//   line 1: <unix_ts>
+//   line 2: <local_sha>
+//   line 3: <remote_sha>
+//   line 4: <verdict: fresh|stale|offline|race>
+// TTL 30 s — back-to-back invocations on the same host+repo cost ~0 s.
+//
+// On timeout (remote unreachable / ssh slow): fall through to last-known-good
+// cache. If cache also empty/stale: emit "offline" verdict — caller decides
+// whether that gates exec (freshness=strict) or proceeds (freshness=gate).
+//
+// Uses ssh ControlMaster reuse if the caller has a multiplexed connection
+// (ssh_config Host stanza with ControlPath); otherwise plain ssh.
+fn _drift_cache_path(host: str, repo: str) -> str {
+    return "/tmp/hexa_drift_cache_" + host + "_" + repo + ".txt"
+}
+
+fn drift_cache_read(host: str, repo: str, ttl_s: i64) -> [str] {
+    // Returns [ts, local_sha, remote_sha, verdict] on hit, [] on miss/stale.
+    let p = _drift_cache_path(host, repo)
+    if !file_exists(p) { return [] }
+    let mut raw = ""
+    try { raw = read_file(p) } catch e { return [] }
+    let lines = raw.split("\n")
+    if lines.len() < 4 { return [] }
+    let mut ts: i64 = 0
+    try { ts = to_int(lines[0].trim()) } catch e { return [] }
+    let now = _now_s()
+    if now - ts > ttl_s { return [] }
+    return [lines[0].trim(), lines[1].trim(), lines[2].trim(), lines[3].trim()]
+}
+
+fn drift_cache_write(host: str, repo: str, local_sha: str, remote_sha: str, verdict: str) -> void {
+    let p = _drift_cache_path(host, repo)
+    let now = _now_s()
+    let blob = to_string(now) + "\n" + local_sha + "\n" + remote_sha + "\n" + verdict + "\n"
+    let quoted = sh_q(blob)
+    exec_with_status("printf '%s' " + quoted + " > " + sh_q(p))
+}
+
+// Resolve local repo path → local HEAD sha. Empty string on failure.
+fn local_head_sha(local_repo_path: str) -> str {
+    let cmd = "git -C " + sh_q(local_repo_path) + " rev-parse HEAD 2>/dev/null"
+    return sh_out(cmd).trim()
+}
+
+// SSH the remote target with an 80ms hard cap (timeout / gtimeout) and
+// extract `git -C <repo-path> rev-parse HEAD`. Empty string on timeout
+// or any failure (caller falls through to cache).
+fn remote_head_sha(host: str, remote_repo_path: str, timeout_ms: i64) -> str {
+    let has_to = sh_out("command -v timeout >/dev/null 2>&1 && echo y || echo n").trim()
+    let has_gto = sh_out("command -v gtimeout >/dev/null 2>&1 && echo y || echo n").trim()
+    let mut to_bin = ""
+    if has_to == "y" { to_bin = "timeout" }
+    else if has_gto == "y" { to_bin = "gtimeout" }
+    // Fractional seconds e.g. 80ms → "0.080".
+    let secs = if timeout_ms < 1000 {
+        let ms_str = to_string(timeout_ms)
+        let pad = if ms_str.len() == 1 { "00" + ms_str }
+                  else if ms_str.len() == 2 { "0" + ms_str }
+                  else { ms_str }
+        let whole = if pad.len() <= 3 { "0" } else { pad.substring(0, pad.len() - 3) }
+        let frac = pad.substring(pad.len() - 3, pad.len())
+        whole + "." + frac
+    } else {
+        to_string(timeout_ms / 1000)
+    }
+    // ControlMaster reuse: if caller has a multiplexed session it gets used
+    // automatically. ConnectTimeout=1 caps fresh-handshake cost cheaply.
+    let ssh_cmd = "ssh -o BatchMode=yes -o ConnectTimeout=1 " + sh_q(host) +
+                  " 'git -C " + remote_repo_path.replace("'", "'\\''") +
+                  " rev-parse HEAD 2>/dev/null'"
+    let wrapped = if to_bin.len() > 0 {
+        to_bin + " " + secs + " " + ssh_cmd + " 2>/dev/null"
+    } else {
+        ssh_cmd + " 2>/dev/null"
+    }
+    return sh_out(wrapped).trim()
+}
+
+// Default remote repo path mirrors the mac canonical layout for the
+// fleet hosts ($HOME/core/<repo>) — matches arch.002 mirror discipline.
+fn _default_remote_repo_path(host: str, repo: str) -> str {
+    // Heuristic — fleet hosts (ubu1/ubu2) use /home/summer/core/<repo>.
+    // Mac uses /Users/ghost/core/<repo>. host-specific override available
+    // via --repo-path flag.
+    if host == "ubu1" || host == "ubu2" || host == "ubu" {
+        return "/home/summer/core/" + repo
+    }
+    return env("HOME") + "/core/" + repo
+}
+
+fn _default_local_repo_path(repo: str) -> str {
+    return env("HOME") + "/core/" + repo
+}
+
+// Drift probe entry point. Returns exit code:
+//   0 = fresh (local==remote)
+//   1 = stale (local!=remote — caller decides via freshness axis)
+//   2 = offline (probe failed AND cache empty/stale)
+//
+// Stdout: "<verdict> local=<sha> remote=<sha>" — single line, parseable.
+// Stderr: NEXUS_REMOTE_DRIFT JSON line for log ingest parity.
+fn drift_probe(host: str, repo: str, local_path: str, remote_path: str,
+               timeout_ms: i64, ttl_s: i64, use_cache: bool) -> i64 {
+    let local_sha = local_head_sha(local_path)
+    if local_sha.len() == 0 {
+        ai_err("DRIFT-NO-LOCAL",
+               "local repo '" + repo + "' at '" + local_path + "' has no HEAD",
+               "ensure local clone exists at $HOME/core/" + repo + " (or pass --repo-path)",
+               "gate/remote_preflight.hexa:drift_probe")
+        eprintln("NEXUS_REMOTE_DRIFT {\"verdict\":\"offline\",\"host\":\"" + host +
+                 "\",\"repo\":\"" + repo + "\",\"reason\":\"local_no_head\"}")
+        println("offline local= remote=")
+        return 2
+    }
+    // Cache hit fast-path.
+    if use_cache {
+        let cached = drift_cache_read(host, repo, ttl_s)
+        if cached.len() == 4 {
+            let verdict = cached[3]
+            // Probe-after-stale race detection (ai-native.025): if cached
+            // local sha differs from current local sha, evict cache and
+            // re-probe — staleness signal would be wrong otherwise.
+            if cached[1] == local_sha {
+                println(verdict + " local=" + cached[1] + " remote=" + cached[2])
+                eprintln("NEXUS_REMOTE_DRIFT {\"verdict\":\"" + verdict +
+                         "\",\"host\":\"" + host + "\",\"repo\":\"" + repo +
+                         "\",\"local\":\"" + cached[1] + "\",\"remote\":\"" + cached[2] +
+                         "\",\"cache\":\"hit\"}")
+                if verdict == "fresh" { return 0 }
+                if verdict == "stale" { return 1 }
+                return 2
+            }
+        }
+    }
+    let remote_sha = remote_head_sha(host, remote_path, timeout_ms)
+    if remote_sha.len() == 0 {
+        // Probe failed (timeout, ssh down, git absent on remote).
+        // Fall through to last-known-good cache regardless of TTL.
+        if use_cache && file_exists(_drift_cache_path(host, repo)) {
+            let raw = read_file(_drift_cache_path(host, repo))
+            let lines = raw.split("\n")
+            if lines.len() >= 4 {
+                let prev_local = lines[1].trim()
+                let prev_remote = lines[2].trim()
+                eprintln("NEXUS_REMOTE_DRIFT {\"verdict\":\"offline\",\"host\":\"" + host +
+                         "\",\"repo\":\"" + repo + "\",\"local\":\"" + local_sha +
+                         "\",\"remote\":\"" + prev_remote + "\",\"cache\":\"stale-fallback\"}")
+                // Compare local_sha to last-known remote — if equal, claim
+                // fresh (cache fallback); otherwise offline (caller decides).
+                if local_sha == prev_remote {
+                    println("fresh local=" + local_sha + " remote=" + prev_remote)
+                    return 0
+                }
+                println("offline local=" + local_sha + " remote=" + prev_remote)
+                return 2
+            }
+        }
+        eprintln("NEXUS_REMOTE_DRIFT {\"verdict\":\"offline\",\"host\":\"" + host +
+                 "\",\"repo\":\"" + repo + "\",\"reason\":\"probe_timeout_no_cache\"}")
+        println("offline local=" + local_sha + " remote=")
+        return 2
+    }
+    let verdict = if local_sha == remote_sha { "fresh" } else { "stale" }
+    if use_cache { drift_cache_write(host, repo, local_sha, remote_sha, verdict) }
+    eprintln("NEXUS_REMOTE_DRIFT {\"verdict\":\"" + verdict + "\",\"host\":\"" + host +
+             "\",\"repo\":\"" + repo + "\",\"local\":\"" + local_sha +
+             "\",\"remote\":\"" + remote_sha + "\",\"cache\":\"miss\"}")
+    println(verdict + " local=" + local_sha + " remote=" + remote_sha)
+    if verdict == "fresh" { return 0 }
+    return 1
+}
+
 // ─── main ───────────────────────────────────────────────────────────────
 fn main() -> i64 {
     let argv = args()
@@ -316,6 +503,33 @@ fn main() -> i64 {
                          if env("HEXA_REMOTE_PREFLIGHT_TTL_S").len() > 0 { env("HEXA_REMOTE_PREFLIGHT_TTL_S") } else { "30" })
     let no_cache = has_flag(argv, "--no-cache")
     let json_only = has_flag(argv, "--json-only")
+
+    // ── drift-probe mode (closure.011) ─────────────────────────────────
+    // Distinct entry point — does NOT do TCP fan-out; does ssh git rev-parse
+    // against ONE host+repo and returns fresh/stale/offline verdict.
+    if has_flag(argv, "--drift-probe") {
+        let host = get_flag(argv, "--host", "")
+        let repo = get_flag(argv, "--repo", "")
+        if host.len() == 0 || repo.len() == 0 {
+            ai_err("DRIFT-MISSING-FLAG",
+                   "--drift-probe requires --host=<h> --repo=<r>",
+                   "hexa run gate/remote_preflight.hexa --drift-probe --host ubu1 --repo hive",
+                   "gate/remote_preflight.hexa")
+            return 64
+        }
+        let local_path = get_flag(argv, "--local-path", _default_local_repo_path(repo))
+        let remote_path = get_flag(argv, "--repo-path", _default_remote_repo_path(host, repo))
+        // 80 ms hard cap per task spec; override via --timeout-ms.
+        let drift_tmo_s = get_flag(argv, "--timeout-ms", "80")
+        let drift_ttl_s = get_flag(argv, "--ttl-s",
+                                   if env("HEXA_REMOTE_PREFLIGHT_TTL_S").len() > 0 { env("HEXA_REMOTE_PREFLIGHT_TTL_S") } else { "30" })
+        let mut drift_tmo: i64 = 80
+        try { drift_tmo = to_int(drift_tmo_s) } catch e { drift_tmo = 80 }
+        let mut drift_ttl: i64 = 30
+        try { drift_ttl = to_int(drift_ttl_s) } catch e { drift_ttl = 30 }
+        return drift_probe(host, repo, local_path, remote_path,
+                           drift_tmo, drift_ttl, !no_cache)
+    }
 
     let hosts = split_hosts(hosts_csv)
     if hosts.len() == 0 {
