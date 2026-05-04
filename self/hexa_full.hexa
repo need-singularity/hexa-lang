@@ -1659,8 +1659,25 @@ fn parse_stmt() {
                 let str_tok = p_advance()
                 path = str_tok.value
             }
+            // 2026-05-04 (feat/import-alias-runtime-fix): accept optional
+            // `as <ident>` alias suffix. The alias is stored in node.value
+            // for the runtime loader to register `<ident>::<fnname>` dispatch
+            // routing. Previously the bare `as` token after the path string
+            // produced a parse error in the direct-interp path; in the CLI
+            // (preprocessed) path it was silently stripped along with the
+            // import directive, so call sites of the form `alias::helper()`
+            // dispatched into val_enum() (silent void). Reported by orpheus
+            // puzzle/sweep agents.
+            let mut alias = ""
+            if p_peek_kind() == "As" {
+                p_advance() // consume 'as'
+                if p_peek_kind() == "Ident" {
+                    let alias_tok = p_advance()
+                    alias = alias_tok.value
+                }
+            }
             return #{
-                "kind": "ImportStmt", "name": path, "value": "", "op": "",
+                "kind": "ImportStmt", "name": path, "value": alias, "op": "",
                 "left": "", "right": "", "cond": "", "then_body": "", "else_body": "",
                 "params": "", "body": "", "args": "", "fields": "", "items": "",
                 "variants": "", "arms": "", "iter_expr": "", "ret_type": "",
@@ -2094,8 +2111,18 @@ fn parse_use_decl() {
     // Form (b): string-literal path → ImportStmt shape for runtime loader.
     if p_peek_kind() == "StringLit" {
         let str_tok = p_advance()
+        // 2026-05-04 (feat/import-alias-runtime-fix): optional `as <ident>`
+        // alias suffix (parity with `import "..." as <ident>` form).
+        let mut alias_b = ""
+        if p_peek_kind() == "As" {
+            p_advance() // consume 'as'
+            if p_peek_kind() == "Ident" {
+                let alias_tok_b = p_advance()
+                alias_b = alias_tok_b.value
+            }
+        }
         return #{
-            "kind": "ImportStmt", "name": str_tok.value, "value": "", "op": "",
+            "kind": "ImportStmt", "name": str_tok.value, "value": alias_b, "op": "",
             "left": "", "right": "", "cond": "", "then_body": "", "else_body": "",
             "params": "", "body": "", "args": "", "fields": "", "items": "",
             "variants": "", "arms": "", "iter_expr": "", "ret_type": "",
@@ -2109,8 +2136,18 @@ fn parse_use_decl() {
         p_advance()
         path.push(p_expect_ident())
     }
+    // 2026-05-04 (feat/import-alias-runtime-fix): optional `as <ident>` for
+    // `use a::b::c as alias` (Rust-style). Stored in node.value.
+    let mut alias_a = ""
+    if p_peek_kind() == "As" {
+        p_advance() // consume 'as'
+        if p_peek_kind() == "Ident" {
+            let alias_tok_a = p_advance()
+            alias_a = alias_tok_a.value
+        }
+    }
     return #{
-        "kind": "UseStmt", "name": "", "value": "", "op": "",
+        "kind": "UseStmt", "name": "", "value": alias_a, "op": "",
         "left": "", "right": "", "cond": "", "then_body": "", "else_body": "",
         "params": "", "body": "", "args": "", "fields": "", "items": path,
         "variants": "", "arms": "", "iter_expr": "", "ret_type": "",
@@ -5315,6 +5352,16 @@ pub let mut __use_loaded_paths = []
 // to resolve caller-relative paths (`use "voice_routes"` from serving/*.hexa
 // must look in serving/, not cwd).
 pub let mut __use_script_dir = ""
+// 2026-05-04 (feat/import-alias-runtime-fix) — `import "x" as alias` registry.
+// Each entry: [alias, [fn_name_1, fn_name_2, ...]].
+// `__use_load_module_from_path` records this when called with an alias arg;
+// `eval_call`'s EnumPath branch consults it to route `alias::fn` calls to
+// the bare-name fn registered in env_fns (which is what the loader did).
+// Without this, `alias::fn(...)` parses as EnumPath{name=alias, value=fn}
+// and falls through to val_enum() — a silent void at the call site.
+// Reported by orpheus puzzle/sweep agents (orpheus.blk.3) where selftests
+// had to inline algorithms because cross-file imports silently failed.
+pub let mut __use_alias_fns = []
 // ── O(1) fn_lookup cache (perf) ─────────────────────────
 // Parallel to env_fns: 64 buckets, each a list of [name, env_fns_index].
 // find_fn scans only the name's bucket and picks the entry with the
@@ -7392,14 +7439,58 @@ fn eval_expr_inner(node) {
         call_arg_top = _ca_base
         let callee = node.left
         // Enum variant constructor call: Name::Variant(args...)
+        //
+        // 2026-05-04 (feat/import-alias-runtime-fix): EnumPath now also covers
+        // `alias::fn(args)` for `import "x.hexa" as alias`. Resolution order:
+        //   1. Aliased import dispatch (__use_alias_lookup_fn) — wins over
+        //      the enum constructor when the prefix is a registered import
+        //      alias. Routes to the bare fn registered in env_fns by the
+        //      runtime loader.
+        //   2. Real enum constructor — when the prefix matches a registered
+        //      enum (enum_decls_has_variant). Same legacy behaviour for
+        //      `Color::Red(...)` etc.
+        //   3. Flatten-preprocessor fallback — when neither alias nor enum
+        //      matches but the bare fn name (`callee.value`) IS registered,
+        //      treat as call to that fn. This covers the `module_loader.hexa`
+        //      flow where `import "x.hexa" as a` is stripped at the textual
+        //      preprocess step (no runtime ImportStmt exec) and the call
+        //      site `a::helper()` arrives at runtime with no alias context.
+        //   4. Explicit error — emit "[hexa] symbol 'X::Y' not found (import
+        //      alias may be unregistered)" instead of returning silent void.
+        //      Issue 3 in the orpheus repro: previously this fell through to
+        //      val_enum() and the call-site coerced the void-tagged value
+        //      back through println, hiding the real bug.
         if type_of(callee) != "string" && callee.kind == "EnumPath" {
-            if len(call_args) == 0 {
-                return val_enum(callee.name, callee.value, "")
+            // 1. Aliased import dispatch.
+            let _alias_hit = __use_alias_lookup_fn(callee.name, callee.value)
+            if _alias_hit != "" {
+                return call_user_fn(_alias_hit, call_args)
             }
-            if len(call_args) == 1 {
-                return val_enum(callee.name, callee.value, call_args[0])
+            // 2. Real enum constructor.
+            if enum_decls_has_variant(callee.name, callee.value) {
+                if len(call_args) == 0 {
+                    return val_enum(callee.name, callee.value, "")
+                }
+                if len(call_args) == 1 {
+                    return val_enum(callee.name, callee.value, call_args[0])
+                }
+                return val_enum(callee.name, callee.value, val_array(call_args))
             }
-            return val_enum(callee.name, callee.value, val_array(call_args))
+            // 3. Flatten-preprocessor fallback — bare fn with the same name
+            //    as the EnumPath value is resolvable.
+            let _bare_info = find_fn(callee.value)
+            if _bare_info != "" {
+                return call_user_fn(callee.value, call_args)
+            }
+            // 4. Explicit error (Issue 3). Fall through to val_enum only when
+            //    the prefix MIGHT be an enum that happens to lack this variant
+            //    (preserves legacy implicit-enum behaviour for genuine enums);
+            //    when the prefix is unknown, emit the diagnostic + void.
+            //    enum_decls is checked by name only above; if we reach here
+            //    the prefix is neither a known enum nor a known alias, so the
+            //    most actionable message names the alias possibility.
+            println("[hexa] symbol '" + callee.name + "::" + callee.value + "' not found (import alias may be unregistered)")
+            return val_void()
         }
         if type_of(callee) != "string" && callee.kind == "Ident" {
             let fname = callee.name
@@ -8819,7 +8910,13 @@ fn exec_stmt_at(stmts, idx) {
         if _use_path == "" { return val_void() }
         let _resolved = __use_resolve_module_path(_use_path)
         if _resolved == "" { return val_void() }
-        __use_load_module_from_path(_resolved)
+        // 2026-05-04 (feat/import-alias-runtime-fix): forward optional `as
+        // <alias>` qualifier (parser stores alias in node.value for both
+        // ImportStmt and the string-form UseStmt). Empty alias = no-op
+        // (legacy behaviour: bare-name dispatch only).
+        let _alias_q = node.value
+        if type_of(_alias_q) != "string" { _alias_q = "" }
+        __use_load_module_from_path_with_alias(_resolved, _alias_q)
         return val_void()
     }
 
@@ -9212,7 +9309,12 @@ fn __use_register_module_fns(mod_ast) {
     // Mirrors interpret()'s FIX-9-1 pre-registration pass (lines ~17056–17086).
     // Pushes every top-level fn-like decl into env_fns + fn_cache + env so that
     // subsequent `find_fn` / `call_user_fn` calls from the caller resolve.
+    //
+    // 2026-05-04 (feat/import-alias-runtime-fix): also returns the list of fn
+    // names that were registered, so `__use_load_module_from_path` can wire
+    // them into __use_alias_fns when called with an `as alias` qualifier.
     let mut _mi = 0
+    let mut _fn_names = []
     while _mi < len(mod_ast) {
         let _mn = mod_ast[_mi]
         if type_of(_mn) == "struct" || type_of(_mn) == "map" {
@@ -9226,6 +9328,7 @@ fn __use_register_module_fns(mod_ast) {
                     if _mn.value != "" {
                         fn_attrs_set(_mn.name, _mn.value)
                     }
+                    _fn_names.push(_mn.name)
                 }
                 if _mk == "ExternFnDecl" {
                     let _ec = _mn.value
@@ -9234,19 +9337,132 @@ fn __use_register_module_fns(mod_ast) {
                     extern_fns.push([_mn.name, _ec, _mn.ret_type, _el])
                     extern_fn_cache_add(_mn.name, len(extern_fns) - 1)
                     env_define(_mn.name, val_str("__extern_" + _mn.name))
+                    _fn_names.push(_mn.name)
                 }
             }
         }
         _mi = _mi + 1
     }
+    return _fn_names
+}
+
+// 2026-05-04 (feat/import-alias-runtime-fix) — alias registry helpers.
+//
+// `__use_alias_register` records that `alias::<fn>` should dispatch to bare
+// fn `<fn>` for every name in `fn_names`. Called by the runtime loader when
+// the source carried `import "..." as <alias>`.
+//
+// `__use_alias_lookup_fn` returns the bare fn name string if `alias::fname`
+// is registered, or "" on miss. Called by eval_call's EnumPath branch to
+// route aliased calls to the user fn instead of falling through to val_enum.
+//
+// Idempotent: re-registering the same alias merges fn_names (dedup by name).
+fn __use_alias_register(alias, fn_names) {
+    if alias == "" { return false }
+    if type_of(fn_names) != "array" { return false }
+    // Find existing entry and merge.
+    let mut _ai = 0
+    while _ai < len(__use_alias_fns) {
+        let _ae = __use_alias_fns[_ai]
+        if _ae[0] == alias {
+            let mut _existing = _ae[1]
+            let mut _ni = 0
+            while _ni < len(fn_names) {
+                let _nm = fn_names[_ni]
+                let mut _seen = false
+                let mut _ei = 0
+                while _ei < len(_existing) {
+                    if _existing[_ei] == _nm { _seen = true }
+                    _ei = _ei + 1
+                }
+                if !_seen { _existing.push(_nm) }
+                _ni = _ni + 1
+            }
+            __use_alias_fns[_ai] = [alias, _existing]
+            return true
+        }
+        _ai = _ai + 1
+    }
+    __use_alias_fns.push([alias, fn_names])
+    return true
+}
+
+fn __use_alias_lookup_fn(alias, fname) {
+    if alias == "" { return "" }
+    let mut _ai = 0
+    while _ai < len(__use_alias_fns) {
+        let _ae = __use_alias_fns[_ai]
+        if _ae[0] == alias {
+            let _names = _ae[1]
+            let mut _ni = 0
+            while _ni < len(_names) {
+                if _names[_ni] == fname { return fname }
+                _ni = _ni + 1
+            }
+            // Alias is registered but fname is not — caller should emit the
+            // explicit "symbol not found" error (Issue 3 in import-alias fix).
+            return ""
+        }
+        _ai = _ai + 1
+    }
+    return ""
+}
+
+fn __use_alias_is_registered(alias) {
+    if alias == "" { return false }
+    let mut _ai = 0
+    while _ai < len(__use_alias_fns) {
+        if __use_alias_fns[_ai][0] == alias { return true }
+        _ai = _ai + 1
+    }
+    return false
 }
 
 fn __use_load_module_from_path(resolved_path) {
-    // Dedup — prevent circular imports + double load.
+    return __use_load_module_from_path_with_alias(resolved_path, "")
+}
+
+fn __use_load_module_from_path_with_alias(resolved_path, alias) {
+    // Dedup — prevent circular imports + double load. Even on dedup hit we
+    // still register the alias if one was supplied (so re-imports under a
+    // different alias still get a working dispatch entry).
     let mut _ui = 0
+    let mut _already_loaded = false
     while _ui < len(__use_loaded_paths) {
-        if __use_loaded_paths[_ui] == resolved_path { return true }
+        if __use_loaded_paths[_ui] == resolved_path { _already_loaded = true }
         _ui = _ui + 1
+    }
+    if _already_loaded {
+        // Re-derive fn names from already-registered env_fns by re-parsing the
+        // module head (cheap; the source is already on disk and tokenize+parse
+        // are idempotent). Skip body exec on dedup hit.
+        if alias != "" {
+            let _saved_tokens_d = p_tokens
+            let _saved_pos_d = p_pos
+            let _saved_errors_d = p_errors
+            let _src_d = read_file(resolved_path)
+            let _toks_d = tokenize(_src_d)
+            let _mod_ast_d = parse(_toks_d)
+            p_tokens = _saved_tokens_d
+            p_pos = _saved_pos_d
+            p_errors = _saved_errors_d
+            let mut _names_d = []
+            let mut _di = 0
+            while _di < len(_mod_ast_d) {
+                let _dn = _mod_ast_d[_di]
+                if type_of(_dn) == "struct" || type_of(_dn) == "map" {
+                    let _dk = _dn.kind
+                    if type_of(_dk) == "string" {
+                        if _dk == "FnDecl" || _dk == "AsyncFnDecl" || _dk == "PureFnDecl" || _dk == "ExternFnDecl" {
+                            _names_d.push(_dn.name)
+                        }
+                    }
+                }
+                _di = _di + 1
+            }
+            __use_alias_register(alias, _names_d)
+        }
+        return true
     }
     __use_loaded_paths.push(resolved_path)
 
@@ -9267,7 +9483,10 @@ fn __use_load_module_from_path(resolved_path) {
     p_pos = _saved_pos
     p_errors = _saved_errors
 
-    __use_register_module_fns(_mod_ast)
+    let _registered_names = __use_register_module_fns(_mod_ast)
+    if alias != "" {
+        __use_alias_register(alias, _registered_names)
+    }
     // Also execute module's top-level stmts so globals/consts initialise.
     // eval_body respects return_flag/throw_flag; if the module throws on
     // top-level, that propagates to the caller — same as a preprocessed run.
@@ -18301,6 +18520,9 @@ fn interpret(ast) {
     // 2026-04-20 use-loader fix — reset per-run cache so module bodies
     // re-exec on fresh interpret() (CLM train loops re-use the interpreter).
     __use_loaded_paths = []
+    // 2026-05-04 (feat/import-alias-runtime-fix) — reset alias registry per
+    // run so loop-reused interpreters do not leak alias entries across runs.
+    __use_alias_fns = []
     return_flag = false
     return_val = val_void()
     break_flag = false
