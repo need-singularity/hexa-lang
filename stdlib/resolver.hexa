@@ -1,0 +1,141 @@
+// stdlib/resolver.hexa — programmatic introspection of the Mac→Docker resolver
+//
+// @module(slug="resolver", desc="introspect the hexa resolver routing state (darwin host vs hexa-exec container) without env-grovelling")
+// @usage(import stdlib/resolver; if resolver_in_container() { ... })
+//
+// ── module governance metadata ──────────────────────────────────────────
+// @version 1.0.0
+// @capabilities [resolver_in_container, resolver_should_bypass, resolver_uname, resolver_is_darwin_host, resolver_scrub_env_prefix, resolver_route_label]
+// @stability stable
+// @since 2026-05-04
+// @maintainer hexa-lang-core
+// @priority P1
+//
+// PROBLEM
+//   The resolver at ~/.hx/bin/hexa (raw 44 hard-landing) auto-routes any
+//   *.hexa script under a Darwin host into the persistent `hexa-exec`
+//   Linux container. Tools that produce host-bound output (Mach-O dylib
+//   from cc -O2 -dynamiclib, codesign, chflags, launchctl, sandbox-exec,
+//   plutil) MUST carry a `@resolver-bypass(reason="...")` header so the
+//   resolver short-circuits and exec's REAL_HEXA on the bare Mac instead.
+//
+//   When in-container code spawns a NEW hexa subprocess that needs the
+//   host (e.g. tool/jit_selftest.hexa C10 fix), the child inherits
+//   HEXA_RESOLVER_IN_CONTAINER=1 + LD_PRELOAD=/opt/hexa/native_gate.so
+//   from the parent and silently lands in Linux again — defeating the
+//   point. Until C10 the workaround was an inline `env -i ...` scrub
+//   string and an env-grovel `[ -f /.dockerenv ]` shell test.
+//
+// THIS MODULE
+//   Replaces the env-grovelling with three documented helpers:
+//
+//     resolver_in_container() -> bool
+//         True iff we are executing inside the hexa-exec Linux container
+//         (probes /.dockerenv + HEXA_RESOLVER_IN_CONTAINER + uname).
+//
+//     resolver_should_bypass() -> bool
+//         True iff the running argv would (or did) trigger a bypass — i.e.
+//         user is on a Darwin host AND any of the bypass markers / env
+//         overrides applies. Useful for tools that want to assert their
+//         own bypass marker is honored.
+//
+//     resolver_scrub_env_prefix() -> string
+//         Returns the `env -i PATH=... HOME=... ` prefix that strips
+//         resolver-routing env vars before nesting another hexa exec().
+//         Mirrors the canonical C10 fix in tool/jit_selftest.hexa.
+//
+// SEE ALSO
+//   tool/docs/resolver_bypass.md          — routing rule (1-page doc)
+//   tool/install_interp_shim.hexa         — interp-layer mirror of the rule
+//   stdlib/test/test_resolver.hexa        — verifies bypass mechanism
+
+// True iff we are running inside the hexa-exec Linux container.
+// Probe order: explicit env flag → /.dockerenv → uname Linux + LD_PRELOAD.
+fn resolver_in_container() -> bool {
+    if env("HEXA_RESOLVER_IN_CONTAINER") == "1" { return true }
+    if env("HEXA_IN_CONTAINER") == "1" { return true }
+    let dock = exec("test -f /.dockerenv && echo 1 || echo 0").trim()
+    if dock == "1" { return true }
+    return false
+}
+
+// uname -s ("Darwin" / "Linux" / "" on probe failure). Cheap, cached form
+// would require state — keep stateless for selftest determinism.
+fn resolver_uname() -> string {
+    return exec("uname -s 2>/dev/null").trim()
+}
+
+// True iff host kernel reports "Darwin" — the only platform where the
+// resolver's docker hard-landing applies. Linux callers are always pass-
+// through.
+fn resolver_is_darwin_host() -> bool {
+    return resolver_uname() == "Darwin"
+}
+
+// True iff a bypass would (or did) take effect for the current process.
+//
+// Cases:
+//   - inside the container → bypass already happened (or wasn't needed)
+//   - HEXA_LOCAL=1                 → operator-forced bare-Mac route
+//   - HEXA_RESOLVER_NO_REROUTE=1   → recursion guard active (bypass tier)
+//   - Darwin host with no override → caller's argv must have the marker
+//                                    for this to be true; we conservatively
+//                                    return false (cannot know argv here)
+//   - non-Darwin host              → no resolver routing applies → false
+fn resolver_should_bypass() -> bool {
+    if env("HEXA_RESOLVER_NO_REROUTE") == "1" { return true }
+    if env("HEXA_LOCAL") == "1" { return true }
+    if resolver_in_container() {
+        // Already in container — no further bypass needed at THIS layer.
+        // Returning false matches user intent: "should I scrub env before
+        // nesting another exec?". Inside the container the answer is
+        // yes-only-if-target-is-host, which is a separate question handled
+        // by resolver_scrub_env_prefix below.
+        return false
+    }
+    // Darwin host without overrides: real answer depends on the script's
+    // own header marker, which we cannot inspect from here. Be conservative.
+    return false
+}
+
+// Returns a shell-prefix string suitable for prepending to an `exec(...)`
+// command line that nests another `hexa` invocation. The prefix scrubs the
+// resolver-routing env vars so the child does not silently re-enter the
+// container (or honor a stale marker).
+//
+// Mirror of the C10 root-cause fix in tool/jit_selftest.hexa:
+//
+//     let env_clean = "env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=" + ...
+//     exec(env_clean + hexa_real + " run " + ...)
+//
+// Use case: a parent script with `@resolver-bypass(...)` runs on bare Mac,
+// spawns a helper hexa exec(); the child argv may lack the marker (e.g. it
+// is a pre-flattened tmp file written by module_loader), so without env
+// scrub the child re-routes to docker.
+fn resolver_scrub_env_prefix() -> string {
+    let h = exec("printf '%s' \"$HOME\"").trim()
+    let path = "/usr/local/bin:/usr/bin:/bin"
+    return "env -i PATH=" + path + " HOME=" + h + " "
+}
+
+// Compact human-readable label for the current routing state. Format
+// matches the resolver's stderr `hexa-resolver: route=<X>` log so logs
+// produced by user code can be grep-correlated with resolver decisions.
+//
+// Possible returns:
+//   "container"        — in hexa-exec
+//   "darwin-bypass"    — Darwin host with HEXA_RESOLVER_NO_REROUTE or HEXA_LOCAL
+//   "darwin-native"    — Darwin host without any bypass signal (would land docker)
+//   "linux-host"       — non-Darwin, non-container (resolver not engaged)
+//   "unknown"          — uname probe failed
+fn resolver_route_label() -> string {
+    if resolver_in_container() { return "container" }
+    let u = resolver_uname()
+    if u == "" { return "unknown" }
+    if u == "Darwin" {
+        if env("HEXA_LOCAL") == "1" { return "darwin-bypass" }
+        if env("HEXA_RESOLVER_NO_REROUTE") == "1" { return "darwin-bypass" }
+        return "darwin-native"
+    }
+    return "linux-host"
+}

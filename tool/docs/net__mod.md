@@ -1,0 +1,30 @@
+# `net/mod`
+
+_net_
+
+**Source:** [`stdlib/net/mod.hexa`](../../stdlib/net/mod.hexa)  
+
+## Overview
+
+TCP/HTTP 모듈 재-수출 허브.
+
+이 파일은 stdlib/net/ 하위 모듈을 한 번에 가져오기 위한 편의용이다.
+하위 모듈은 각자 독립적으로 import 가능하다:
+
+    import "../stdlib/net/socket.hexa"
+    import "../stdlib/net/http_request.hexa"
+    import "../stdlib/net/http_response.hexa"
+    import "../stdlib/net/http_server.hexa"
+
+또는 본 mod.hexa 한 개로 전부 로드:
+
+    import "../stdlib/net/mod.hexa"
+
+주의: 본 모듈은 self/serve/http_server.hexa 의 사용자용 패키징 사본이다.
+컴파일러 내부가 아닌 응용 코드에서 사용한다.
+
+_No public functions detected._
+
+---
+
+← [Back to stdlib index](README.md)

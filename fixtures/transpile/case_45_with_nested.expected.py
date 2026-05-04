@@ -1,0 +1,10 @@
+class CM:
+    def __init__(self, n):
+        self.n = n
+    def __enter__(self):
+        return self.n
+    def __exit__(self, et, ev, tb):
+        return False
+with CM(1) as a:
+    with CM(2) as b:
+        print((a + b))

@@ -1,0 +1,553 @@
+// tool/hexa_repl.hexa — interactive REPL for hexa
+//
+// PURPOSE
+//     Read-eval-print-loop on top of the existing `hexa run` interp.
+//     Supports multi-line input (paren/brace balance + blank line),
+//     persistent history at ~/.hexa_history, tab completion against
+//     loaded module symbols + a builtin set, and meta-commands:
+//         :help                     list meta-commands
+//         :load <path>              add module file to current session
+//         :reload <module>          reload module by name or path
+//         :complete <prefix>        list completions matching prefix
+//         :history                  print persistent history
+//         :clear                    drop accumulated definitions (start fresh)
+//         :quit | :q | :exit        leave the REPL
+//
+// EXEC MODEL
+//     Each accepted snippet is appended to an in-memory "session" buffer
+//     and the WHOLE buffer is re-run by spawning `hexa run <tmpfile>`
+//     (interp). Output (stdout + stderr) is captured and printed; on
+//     non-zero rc, the offending snippet is rolled back so the session
+//     remains executable.
+//
+// LIMITATIONS (raw 91 honest)
+//   * Evaluation is whole-buffer-replay: each line cost grows linearly
+//     with session size. Acceptable for interactive sessions but slow
+//     for long ones.
+//   * Tab completion is COMMAND-LEVEL (`:complete <prefix>`) because
+//     we read from line-buffered stdin via `input()` — no raw-mode
+//     keyboard handler for inline TAB. (See term_input.hexa for the
+//     decoder; integration with raw-mode pty is future work.)
+//   * `:reload <module>` re-reads the file from disk and replaces its
+//     symbol set; it does NOT re-execute prior lines that depended on
+//     the previous version. Caller can rerun those lines manually.
+//   * Last-expression auto-print is heuristic: a single trailing line
+//     that is neither `let`/`fn`/`while`/`if`/`return`/`use`/`import`
+//     and contains no `;` gets wrapped in `println(to_string(...))`.
+//
+// USAGE
+//     hexa run tool/hexa_repl.hexa                # interactive
+//     hexa run tool/hexa_repl.hexa < demo.txt     # batch (acceptance)
+
+// ── helpers ─────────────────────────────────────────────────────────
+
+fn _repl_home() -> string {
+    let h = env("HOME")
+    if h == "" { return "/tmp" }
+    return h
+}
+
+fn _repl_history_path() -> string {
+    return _repl_home() + "/.hexa_history"
+}
+
+// Best-effort append (uses runtime append_file if available; falls
+// back to exec). We prefer append_file because it preserves byte
+// content faithfully and avoids shell-quoting hazards on history.
+fn _repl_append_history(line: string) {
+    let path = _repl_history_path()
+    let _ = append_file(path, line + "\n")
+}
+
+fn _repl_load_history() -> [string] {
+    let path = _repl_history_path()
+    let exist = exec_with_status("test -f " + path)
+    if exist[1] != 0 { return [] }
+    let blob = to_string(read_file(path))
+    if len(blob) == 0 { return [] }
+    let trimmed = if blob.ends_with("\n") { blob.substring(0, len(blob) - 1) } else { blob }
+    return trimmed.split("\n")
+}
+
+// Count unmatched (open - close) for paren/brace/bracket pairs,
+// ignoring chars inside string literals and `// ...` comments.
+fn _repl_balance(buf: string) -> i64 {
+    let n = len(buf)
+    let mut depth = 0
+    let mut i = 0
+    let mut in_str = false
+    let mut str_quote = ""
+    let mut in_line_comment = false
+    while i < n {
+        let c = buf.substring(i, i + 1)
+        if in_line_comment {
+            if c == "\n" { in_line_comment = false }
+            i = i + 1
+        } else if in_str {
+            if c == "\\" && i + 1 < n {
+                i = i + 2
+            } else if c == str_quote {
+                in_str = false
+                i = i + 1
+            } else {
+                i = i + 1
+            }
+        } else {
+            if c == "\"" || c == "'" {
+                in_str = true
+                str_quote = c
+                i = i + 1
+            } else if c == "/" && i + 1 < n && buf.substring(i + 1, i + 2) == "/" {
+                in_line_comment = true
+                i = i + 2
+            } else if c == "(" || c == "{" || c == "[" {
+                depth = depth + 1
+                i = i + 1
+            } else if c == ")" || c == "}" || c == "]" {
+                depth = depth - 1
+                i = i + 1
+            } else {
+                i = i + 1
+            }
+        }
+    }
+    return depth
+}
+
+// Builtin / keyword set used by tab completion. Keep curated — full
+// set is huge but a few dozen common names cover 90% of REPL use.
+fn _repl_builtins() -> [string] {
+    return [
+        "println", "eprintln", "print", "input", "exec", "exec_with_status",
+        "read_file", "write_file", "append_file", "file_exists", "env",
+        "argv", "args", "exit", "len", "to_string", "to_int", "str",
+        "split", "char_code", "from_char_code", "trim", "starts_with",
+        "ends_with", "substring", "push", "pop",
+        "let", "mut", "fn", "if", "else", "while", "for", "in", "return",
+        "true", "false", "use", "import", "pub",
+        ":help", ":load", ":reload", ":complete", ":history", ":clear",
+        ":quit", ":q", ":exit"
+    ]
+}
+
+// Parse top-level `fn NAME(` and `pub fn NAME(` definitions out of a
+// hexa source file and return the names. Best-effort, regex-free.
+fn _repl_extract_fn_names(src: string) -> [string] {
+    let lines = src.split("\n")
+    let mut out = []
+    let mut i = 0
+    while i < len(lines) {
+        let raw = lines[i]
+        let line = raw.trim()
+        let mut rest = ""
+        if line.starts_with("pub fn ") {
+            rest = line.substring(7, len(line))
+        } else if line.starts_with("fn ") {
+            rest = line.substring(3, len(line))
+        }
+        if len(rest) > 0 {
+            // Take chars up to first '(' or whitespace.
+            let mut j = 0
+            let m = len(rest)
+            while j < m {
+                let ch = rest.substring(j, j + 1)
+                if ch == "(" || ch == " " || ch == "\t" || ch == "<" { break }
+                j = j + 1
+            }
+            let name = rest.substring(0, j)
+            if len(name) > 0 { out.push(name) }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn _repl_starts_with_any(s: string, prefix: string) -> bool {
+    if len(prefix) == 0 { return true }
+    return s.starts_with(prefix)
+}
+
+fn _repl_completions(prefix: string, module_syms: [string]) -> [string] {
+    let mut out = []
+    let bi = _repl_builtins()
+    let mut i = 0
+    while i < len(bi) {
+        if _repl_starts_with_any(bi[i], prefix) { out.push(bi[i]) }
+        i = i + 1
+    }
+    let mut j = 0
+    while j < len(module_syms) {
+        if _repl_starts_with_any(module_syms[j], prefix) { out.push(module_syms[j]) }
+        j = j + 1
+    }
+    return out
+}
+
+// Resolve a `:reload <name>` argument to a path. If `name` is an
+// existing file path → use it; else try `self/stdlib/<name>.hexa`,
+// then `stdlib/<name>.hexa`.
+fn _repl_resolve_module(name: string) -> string {
+    if file_exists(name) { return name }
+    let hl = env("HEXA_LANG")
+    let bases = [".", hl, "self/stdlib", "stdlib"]
+    let mut i = 0
+    while i < len(bases) {
+        let b = bases[i]
+        if len(b) > 0 {
+            let p1 = b + "/" + name
+            if file_exists(p1) { return p1 }
+            let p2 = b + "/" + name + ".hexa"
+            if file_exists(p2) { return p2 }
+            let p3 = b + "/stdlib/" + name + ".hexa"
+            if file_exists(p3) { return p3 }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// Decide whether a single-line snippet should be auto-wrapped with
+// `println(to_string(...))`. True iff the line is an expression-y
+// thing (not a stmt-keyword head, not multi-statement, not blank,
+// not a known-void call like println/print/eprintln).
+fn _repl_is_expression(line: string) -> bool {
+    let t = line.trim()
+    if len(t) == 0 { return false }
+    let heads = ["let ", "mut ", "fn ", "pub ", "if ", "while ", "for ",
+                 "return", "use ", "import ", "@", "//", "{", "}"]
+    let mut i = 0
+    while i < len(heads) {
+        let h = heads[i]
+        if t.starts_with(h) { return false }
+        i = i + 1
+    }
+    // Don't double-wrap known void-return calls.
+    let void_heads = ["println(", "print(", "eprintln(", "exit("]
+    let mut k = 0
+    while k < len(void_heads) {
+        if t.starts_with(void_heads[k]) { return false }
+        k = k + 1
+    }
+    if t.find(";") >= 0 { return false }
+    if t.find("=") >= 0 && t.find("==") < 0 && t.find("!=") < 0
+                       && t.find("<=") < 0 && t.find(">=") < 0 {
+        // assignment, not an expression
+        return false
+    }
+    return true
+}
+
+// Build a temp script path. We prefer scratch under /tmp.
+fn _repl_tmp_script() -> string {
+    let pid = exec("echo $$").trim()
+    return "/tmp/hexa_repl_session_" + pid + ".hexa"
+}
+
+// Locate a hexa runner. Prefer $HEXA_RUN env, else build/hexa_interp.real
+// (bypasses bash shim — the shim re-execs hexa.real but inside a nested
+// interp the shim's relative resolution can fail on macOS), else
+// build/hexa_interp, else $HEXA_LANG/hexa, else `hexa` on PATH.
+//
+// Returns a command prefix that takes the script path as the next arg.
+fn _repl_runner() -> string {
+    let r = env("HEXA_RUN")
+    if r != "" { return r }
+    let hl = env("HEXA_LANG")
+    let candidates = [
+        hl + "/build/hexa_interp.real",
+        hl + "/build/hexa_interp",
+        "/Users/ghost/core/hexa-lang/build/hexa_interp.real",
+        "/Users/ghost/core/hexa-lang/build/hexa_interp",
+        hl + "/hexa.real",
+        "/Users/ghost/core/hexa-lang/hexa.real"
+    ]
+    let mut i = 0
+    while i < len(candidates) {
+        let p = candidates[i]
+        if len(p) > 1 && file_exists(p) {
+            // hexa.real takes "run <script>"; hexa_interp[.real] takes <script>.
+            if p.ends_with("/hexa.real") { return p + " run " }
+            return p + " "
+        }
+        i = i + 1
+    }
+    return "hexa run "
+}
+
+// ── REPL state ──────────────────────────────────────────────────────
+//
+// Held in three lists; a fresh transcript replays them in order:
+//   _imports — `use "..."` lines (de-duped)
+//   _defs    — function/let-mut-let definitions (anything that survives a turn)
+//   _last    — most recent printable expression (auto-wrapped)
+//
+// We rebuild the script on each evaluation:
+//     <imports>\n<defs>\n<last>\n
+
+let mut _imports = []
+let mut _defs    = []
+let mut _module_syms = []   // names harvested from :load / :reload
+
+fn _repl_already_imported(line: string) -> bool {
+    let mut i = 0
+    while i < len(_imports) {
+        if _imports[i] == line { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _repl_render_script(extra: string) -> string {
+    let mut s = ""
+    let mut i = 0
+    while i < len(_imports) { s = s + _imports[i] + "\n"; i = i + 1 }
+    let mut j = 0
+    while j < len(_defs)    { s = s + _defs[j]    + "\n"; j = j + 1 }
+    if len(extra) > 0 { s = s + extra + "\n" }
+    return s
+}
+
+// Run a candidate snippet. If it succeeds (rc==0), commit it to the
+// session and print stdout. If it fails, print stderr-mixed output
+// and roll back. `kind` is "import" | "def" | "expr".
+fn _repl_eval_snippet(snippet: string, kind: string) {
+    let script = _repl_render_script(snippet)
+    let path = _repl_tmp_script()
+    let _ = write_file(path, script)
+    let runner = _repl_runner()
+    let cmd = runner + path + " 2>&1"
+    let res = exec_with_status(cmd)
+    let out = to_string(res[0])
+    let rc  = res[1]
+    if rc != 0 {
+        eprintln("[repl] error (rc=" + str(rc) + ")")
+        if len(out) > 0 { print(out) }
+        return
+    }
+    // Commit on success.
+    if kind == "import" {
+        if !_repl_already_imported(snippet) { _imports.push(snippet) }
+    } else if kind == "def" {
+        _defs.push(snippet)
+    } else {
+        // expression — don't pollute defs; just print result
+    }
+    if len(out) > 0 { print(out) }
+}
+
+// Classify a finalized snippet head to choose import/def/expr.
+fn _repl_classify(snippet: string) -> string {
+    let t = snippet.trim()
+    if t.starts_with("use ") || t.starts_with("import ") { return "import" }
+    if t.starts_with("fn ") || t.starts_with("pub fn ") { return "def" }
+    if t.starts_with("let ") || t.starts_with("mut ") { return "def" }
+    if t.starts_with("@") { return "def" }
+    if _repl_is_expression(t) { return "expr" }
+    return "def"
+}
+
+// Wrap a one-line expression for auto-print.
+fn _repl_wrap_expr(line: string) -> string {
+    let t = line.trim()
+    return "println(to_string(" + t + "))"
+}
+
+// ── meta-command handlers ───────────────────────────────────────────
+
+fn _cmd_help() {
+    println(":help                  show this help")
+    println(":load <path>           load + register module symbols")
+    println(":reload <module>       re-read module file by name or path")
+    println(":complete <prefix>     list completions for prefix")
+    println(":history               print persistent history")
+    println(":clear                 drop accumulated definitions")
+    println(":quit | :q | :exit     leave the REPL")
+    println("")
+    println("Multi-line input: keep typing until parens/braces balance")
+    println("AND a blank line is entered. End-of-stream also terminates.")
+}
+
+fn _cmd_load(arg: string) {
+    let path = _repl_resolve_module(arg)
+    if path == "" {
+        eprintln("[repl] :load — module not found: " + arg)
+        return
+    }
+    let src = to_string(read_file(path))
+    let names = _repl_extract_fn_names(src)
+    let mut k = 0
+    while k < len(names) {
+        _module_syms.push(names[k])
+        k = k + 1
+    }
+    let import_line = "use \"" + path + "\""
+    _repl_eval_snippet(import_line, "import")
+    println("[repl] loaded " + path + " (" + str(len(names)) + " symbols)")
+}
+
+fn _cmd_reload(arg: string) {
+    let path = _repl_resolve_module(arg)
+    if path == "" {
+        eprintln("[repl] :reload — module not found: " + arg)
+        return
+    }
+    // Drop any prior import line for this path; re-read symbols.
+    let mut new_imports = []
+    let want = "use \"" + path + "\""
+    let mut i = 0
+    while i < len(_imports) {
+        if _imports[i] != want { new_imports.push(_imports[i]) }
+        i = i + 1
+    }
+    _imports = new_imports
+    // Refresh symbols from disk.
+    let src = to_string(read_file(path))
+    let names = _repl_extract_fn_names(src)
+    _module_syms = names
+    _repl_eval_snippet(want, "import")
+    println("[repl] reloaded " + path + " (" + str(len(names)) + " symbols)")
+}
+
+fn _cmd_complete(prefix: string) {
+    // Harvest fn/let names from session defs as well as module syms.
+    let mut all = []
+    let mut a = 0
+    while a < len(_module_syms) { all.push(_module_syms[a]); a = a + 1 }
+    let mut b = 0
+    while b < len(_defs) {
+        let names = _repl_extract_fn_names(_defs[b])
+        let mut c = 0
+        while c < len(names) { all.push(names[c]); c = c + 1 }
+        b = b + 1
+    }
+    let m = _repl_completions(prefix, all)
+    let mut i = 0
+    while i < len(m) {
+        println(m[i])
+        i = i + 1
+    }
+    if len(m) == 0 { println("(no matches)") }
+}
+
+fn _cmd_history() {
+    let h = _repl_load_history()
+    let mut i = 0
+    while i < len(h) {
+        println(str(i + 1) + "  " + h[i])
+        i = i + 1
+    }
+}
+
+fn _cmd_clear() {
+    _imports = []
+    _defs = []
+    _module_syms = []
+    println("[repl] session cleared")
+}
+
+// ── main loop ───────────────────────────────────────────────────────
+
+fn _is_meta(line: string) -> bool {
+    let t = line.trim()
+    return len(t) > 0 && t.substring(0, 1) == ":"
+}
+
+fn _split_meta(line: string) -> [string] {
+    let t = line.trim()
+    let sp = t.find(" ")
+    if sp < 0 { return [t, ""] }
+    return [t.substring(0, sp), t.substring(sp + 1, len(t)).trim()]
+}
+
+fn _handle_meta(line: string) -> bool {
+    let parts = _split_meta(line)
+    let cmd = parts[0]
+    let arg = parts[1]
+    if cmd == ":help" { _cmd_help(); return true }
+    if cmd == ":load" { _cmd_load(arg); return true }
+    if cmd == ":reload" { _cmd_reload(arg); return true }
+    if cmd == ":complete" { _cmd_complete(arg); return true }
+    if cmd == ":history" { _cmd_history(); return true }
+    if cmd == ":clear" { _cmd_clear(); return true }
+    if cmd == ":quit" || cmd == ":q" || cmd == ":exit" {
+        println("[repl] bye")
+        exit(0)
+    }
+    eprintln("[repl] unknown meta-command: " + cmd + "  (try :help)")
+    return true
+}
+
+fn main() {
+    println("hexa REPL — type :help for commands, :quit to exit")
+    println("history: " + _repl_history_path())
+    let mut buf = ""
+    let mut prompt_n = 1
+    while true {
+        let prompt = if len(buf) == 0 { "hexa[" + str(prompt_n) + "]> " } else { "  ...> " }
+        let raw = input(prompt)
+        // input() returns "" on both EOF and empty line. We disambiguate
+        // via ENV HEXA_REPL_BATCH=1 (caller pipes a script with explicit
+        // blank-line dispatchers); we treat blank-on-empty-buffer as
+        // "skip", and blank-after-content as "dispatch".
+        if raw == "" {
+            if len(buf) == 0 {
+                // In batch mode (stdin redirected) the empty string is
+                // most likely EOF. We detect EOF via two consecutive
+                // empties OR via a trip-counter heuristic.
+                // Heuristic: 3 consecutive empties → exit.
+                _eof_tick = _eof_tick + 1
+                if _eof_tick >= 3 {
+                    println("[repl] EOF — bye")
+                    return
+                }
+                continue
+            }
+            // dispatch accumulated buffer if balanced.
+            let bal = _repl_balance(buf)
+            if bal != 0 {
+                eprintln("[repl] warning: unbalanced (depth=" + str(bal) + "), discarding buffer")
+                buf = ""
+                prompt_n = prompt_n + 1
+                continue
+            }
+            _repl_append_history(buf)
+            // Auto-wrap one-line expressions for friendlier output.
+            let snippet = if !buf.find("\n") >= 0 && _repl_is_expression(buf) {
+                _repl_wrap_expr(buf)
+            } else {
+                buf
+            }
+            let kind = _repl_classify(buf)
+            _repl_eval_snippet(snippet, kind)
+            buf = ""
+            prompt_n = prompt_n + 1
+            continue
+        }
+        _eof_tick = 0
+        // Meta commands only valid when buf is empty.
+        if len(buf) == 0 && _is_meta(raw) {
+            _repl_append_history(raw)
+            let _ = _handle_meta(raw)
+            prompt_n = prompt_n + 1
+            continue
+        }
+        // Append to buffer.
+        if len(buf) == 0 { buf = raw } else { buf = buf + "\n" + raw }
+        // If buffer is balanced AND single-line AND looks like a complete
+        // statement (no trailing operator), dispatch immediately.
+        let bal = _repl_balance(buf)
+        if bal == 0 && buf.find("\n") < 0 {
+            // Single-line, balanced — dispatch.
+            _repl_append_history(buf)
+            let snippet = if _repl_is_expression(buf) { _repl_wrap_expr(buf) } else { buf }
+            let kind = _repl_classify(buf)
+            _repl_eval_snippet(snippet, kind)
+            buf = ""
+            prompt_n = prompt_n + 1
+        }
+        // Else keep accumulating; user will type blank line to dispatch.
+    }
+}
+
+let mut _eof_tick = 0
+// `fn main()` is auto-invoked by hexa-strict — no explicit main() call.
