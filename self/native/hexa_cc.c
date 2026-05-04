@@ -5183,6 +5183,64 @@ HexaVal parse_args(void) {
 }
 
 
+/* G-AMBIG (2026-05-04): disambiguate `Foo<T>{...}` (generic struct
+ * literal — only consumer of expression-position type-args) from
+ * `L < n_layers` (comparison). Pure forward token scan; commit to
+ * type-args only when the matching `>` is followed by `{` or `(`.
+ * Mirrors p_lookahead_generic_args() in self/parser.hexa. Uses raw
+ * strcmp on the kind field to avoid pulling in new sl_* slots. */
+static int p_lookahead_generic_args_c(void) {
+    if (!hexa_truthy(hexa_eq(p_peek_kind(), __hexa_parser_sl_90))) return 0;
+    int depth = 1;
+    int i;
+    for (i = 1; i < 64; i++) {
+        HexaVal t = p_peek_ahead(hexa_int(i));
+        HexaVal kk = hexa_map_get(t, "kind");
+        if (!HX_IS_STR(kk)) return 0;
+        const char *s = HX_STR(kk);
+        if (!s) return 0;
+        if (strcmp(s, "Eof") == 0) return 0;
+        if (strcmp(s, "Newline") == 0) return 0;
+        if (strcmp(s, "Semicolon") == 0) return 0;
+        if (strcmp(s, "LBrace") == 0) return 0;
+        if (strcmp(s, "RBrace") == 0) return 0;
+        if (strcmp(s, "Lt") == 0) { depth++; continue; }
+        if (strcmp(s, "Gt") == 0) {
+            depth--;
+            if (depth == 0) {
+                HexaVal nxt = p_peek_ahead(hexa_int(i + 1));
+                HexaVal nk = hexa_map_get(nxt, "kind");
+                if (!HX_IS_STR(nk) || !HX_STR(nk)) return 0;
+                const char *ns = HX_STR(nk);
+                if (strcmp(ns, "LBrace") == 0) return 1;
+                if (strcmp(ns, "LParen") == 0) return 1;
+                return 0;
+            }
+            continue;
+        }
+        if (strcmp(s, "GtEq") == 0) return 0;
+        if (strcmp(s, "Shr") == 0 || strcmp(s, "ShrAssign") == 0) return 0;
+        /* Tokens that can appear inside a type expression. */
+        if (strcmp(s, "Ident") == 0) continue;
+        if (strcmp(s, "ColonColon") == 0) continue;
+        if (strcmp(s, "Comma") == 0) continue;
+        if (strcmp(s, "Colon") == 0) continue;
+        if (strcmp(s, "Question") == 0) continue;
+        if (strcmp(s, "LBracket") == 0) continue;
+        if (strcmp(s, "RBracket") == 0) continue;
+        if (strcmp(s, "LParen") == 0) continue;
+        if (strcmp(s, "RParen") == 0) continue;
+        if (strcmp(s, "Amp") == 0) continue;
+        if (strcmp(s, "Star") == 0) continue;
+        if (strcmp(s, "IntLit") == 0) continue;
+        if (strcmp(s, "BitOr") == 0) continue;
+        if (strcmp(s, "Pipe") == 0) continue;
+        /* Anything else (operators, =, ==, +, -, etc.) → not generics. */
+        return 0;
+    }
+    return 0;
+}
+
 HexaVal parse_primary(void) {
     HexaVal chars = hexa_void();
     HexaVal first_ch = hexa_void();
@@ -5225,7 +5283,10 @@ HexaVal parse_primary(void) {
             if (hexa_truthy(hexa_cmp_gt(hexa_int(hexa_len(chars)), hexa_int(0)))) {
                 first_ch = hexa_index_get(chars, hexa_int(0));
                 if (hexa_truthy(hexa_bool(hexa_truthy(hexa_bool((HX_IS_STR(first_ch) && HX_STR(first_ch) && isalpha((unsigned char)HX_STR(first_ch)[0])) || (HX_TAG(first_ch)==TAG_CHAR && isalpha((unsigned char)HX_INT(first_ch))))) && hexa_truthy(hexa_eq(hexa_to_string(first_ch), rt_str_to_upper(hexa_to_string(first_ch))))))) {
-                    type_args = parse_type_params();
+                    /* G-AMBIG: only commit to generic-args if lookahead confirms `>` `{` or `>` `(`. */
+                    if (p_lookahead_generic_args_c()) {
+                        type_args = parse_type_params();
+                    }
                 }
             }
         }
