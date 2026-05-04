@@ -7308,7 +7308,14 @@ HexaVal hexa_softmax(HexaVal a) {
     return out;
 }
 
-// matmul(A, B, m, k, n): row-major C[m*n] = A[m*k] @ B[k*n], naive O(mkn).
+// matmul(A, B, M, N, K): row-major C[M*N] = A[M*K] @ B[K*N], naive O(M*N*K).
+// Positional arg order is cblas-style (M, N, K) — output rows, output cols,
+// contraction dim — verified empirically (B3, commit 9fb47758): the call
+// `matmul([1..6],[1..6], 2, 2, 3)` yields the 2×2 product `[22,28,49,64]`
+// (A treated as 2×3, B as 3×2). Internal locals `m/k/n` below are kept for
+// historical reasons; the load-bearing convention is the (M, N, K) caller
+// order documented here. See stdlib/linalg/ffi.hexa for the caller-side
+// mirror of this contract.
 HexaVal hexa_matmul(HexaVal a, HexaVal b, HexaVal mv, HexaVal kv, HexaVal nv) {
     HexaVal out = hexa_array_new();
     if (!HX_IS_ARRAY(a) || !HX_IS_ARRAY(b)) return out;
