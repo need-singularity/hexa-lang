@@ -687,7 +687,7 @@ static inline HexaVal __hexa_call1_fp1(HexaVal (*fp)(HexaVal), HexaVal a1) {
     HexaVal: hexa_call1_hv, \
     HexaVal (*)(HexaVal): __hexa_call1_fp1, \
     default: hexa_call1_hv)((f), (a1))
-static inline HexaVal hexa_call2(HexaVal f, HexaVal a1, HexaVal a2) {
+static inline HexaVal hexa_call2_hv(HexaVal f, HexaVal a1, HexaVal a2) {
     if (HX_IS_CLOSURE(f)) {
         HexaVal (*fp)(HexaVal, HexaVal, HexaVal) = (HexaVal(*)(HexaVal, HexaVal, HexaVal))HX_CLO_PTR(f);
         return fp(hexa_closure_env(f), a1, a2);
@@ -698,6 +698,18 @@ static inline HexaVal hexa_call2(HexaVal f, HexaVal a1, HexaVal a2) {
     }
     return hexa_void();
 }
+// Raw C function-pointer overload (FIX-2 unblock 2026-05-04): mirrors the
+// hexa_call1 _Generic pattern so codegen emitting `hexa_call2(bytes_to_f32_le,
+// arr, off)` from a precompiled hexa_v2 (which doesn't know the symbol is a
+// builtin) resolves to the direct C function call. Without this, the call
+// goes through hexa_call2_hv expecting a HexaVal first arg and fails to link.
+static inline HexaVal __hexa_call2_fp2(HexaVal (*fp)(HexaVal, HexaVal), HexaVal a1, HexaVal a2) {
+    return fp(a1, a2);
+}
+#define hexa_call2(f, a1, a2) _Generic((f), \
+    HexaVal: hexa_call2_hv, \
+    HexaVal (*)(HexaVal, HexaVal): __hexa_call2_fp2, \
+    default: hexa_call2_hv)((f), (a1), (a2))
 static inline HexaVal hexa_call3(HexaVal f, HexaVal a1, HexaVal a2, HexaVal a3) {
     if (HX_IS_CLOSURE(f)) {
         HexaVal (*fp)(HexaVal, HexaVal, HexaVal, HexaVal) = (HexaVal(*)(HexaVal, HexaVal, HexaVal, HexaVal))HX_CLO_PTR(f);
