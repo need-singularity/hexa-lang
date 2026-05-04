@@ -3213,6 +3213,65 @@ HexaVal p_is_contextual_kw_kind(HexaVal k) {
 }
 
 
+// FIX-6 (BG-HX2, 2026-05-04): hard-keyword check for parameter / let-binding
+// name positions. Mirrors parser.hexa SSOT — silent no-op repro
+// (commit 08e2d9aa: `fn foo(fn) { ... }` → exit 0, empty stdout) traced to
+// p_expect_ident's lenient generic-error branch leaving the keyword token in
+// place. See parser.hexa for the full rationale.
+HexaVal p_is_strict_reserved_kw_kind(HexaVal k) {
+    __hexa_fn_arena_enter();
+    if (hexa_truthy(hexa_eq(k, hexa_str("Fn")))) { return __hexa_fn_arena_return(hexa_bool(1)); }
+    if (hexa_truthy(hexa_eq(k, hexa_str("Let")))) { return __hexa_fn_arena_return(hexa_bool(1)); }
+    if (hexa_truthy(hexa_eq(k, hexa_str("If")))) { return __hexa_fn_arena_return(hexa_bool(1)); }
+    if (hexa_truthy(hexa_eq(k, hexa_str("Else")))) { return __hexa_fn_arena_return(hexa_bool(1)); }
+    if (hexa_truthy(hexa_eq(k, hexa_str("While")))) { return __hexa_fn_arena_return(hexa_bool(1)); }
+    if (hexa_truthy(hexa_eq(k, hexa_str("For")))) { return __hexa_fn_arena_return(hexa_bool(1)); }
+    if (hexa_truthy(hexa_eq(k, hexa_str("Return")))) { return __hexa_fn_arena_return(hexa_bool(1)); }
+    if (hexa_truthy(hexa_eq(k, hexa_str("Pub")))) { return __hexa_fn_arena_return(hexa_bool(1)); }
+    if (hexa_truthy(hexa_eq(k, hexa_str("Struct")))) { return __hexa_fn_arena_return(hexa_bool(1)); }
+    if (hexa_truthy(hexa_eq(k, hexa_str("Enum")))) { return __hexa_fn_arena_return(hexa_bool(1)); }
+    if (hexa_truthy(hexa_eq(k, hexa_str("Match")))) { return __hexa_fn_arena_return(hexa_bool(1)); }
+    if (hexa_truthy(hexa_eq(k, hexa_str("Use")))) { return __hexa_fn_arena_return(hexa_bool(1)); }
+    if (hexa_truthy(hexa_eq(k, hexa_str("As")))) { return __hexa_fn_arena_return(hexa_bool(1)); }
+    if (hexa_truthy(hexa_eq(k, hexa_str("Trait")))) { return __hexa_fn_arena_return(hexa_bool(1)); }
+    if (hexa_truthy(hexa_eq(k, hexa_str("Impl")))) { return __hexa_fn_arena_return(hexa_bool(1)); }
+    if (hexa_truthy(hexa_eq(k, hexa_str("Loop")))) { return __hexa_fn_arena_return(hexa_bool(1)); }
+    if (hexa_truthy(hexa_eq(k, hexa_str("Break")))) { return __hexa_fn_arena_return(hexa_bool(1)); }
+    if (hexa_truthy(hexa_eq(k, hexa_str("Continue")))) { return __hexa_fn_arena_return(hexa_bool(1)); }
+    if (hexa_truthy(hexa_eq(k, hexa_str("Const")))) { return __hexa_fn_arena_return(hexa_bool(1)); }
+    if (hexa_truthy(hexa_eq(k, hexa_str("Static")))) { return __hexa_fn_arena_return(hexa_bool(1)); }
+    if (hexa_truthy(hexa_eq(k, hexa_str("Mut")))) { return __hexa_fn_arena_return(hexa_bool(1)); }
+    if (hexa_truthy(hexa_eq(k, hexa_str("Async")))) { return __hexa_fn_arena_return(hexa_bool(1)); }
+    if (hexa_truthy(hexa_eq(k, hexa_str("Await")))) { return __hexa_fn_arena_return(hexa_bool(1)); }
+    return __hexa_fn_arena_return(hexa_bool(0));
+    return __hexa_fn_arena_return(hexa_void());
+}
+
+// Returns 1 if a strict-reserved kw was seen and consumed (caller falls back
+// to "" name); 0 otherwise (caller calls p_expect_ident as usual).
+HexaVal p_check_strict_reserved(HexaVal ctx) {
+    __hexa_fn_arena_enter();
+    HexaVal tok = p_peek();
+    HexaVal kind = hexa_map_get(tok, "kind");
+    if (!hexa_truthy(p_is_strict_reserved_kw_kind(kind))) {
+        return __hexa_fn_arena_return(hexa_bool(0));
+    }
+    HexaVal val = hexa_map_get(tok, "value");
+    HexaVal msg = hexa_add(hexa_add(hexa_add(hexa_add(
+        hexa_str("FIX-6: reserved keyword '"), val),
+        hexa_str("' cannot be used as ")), ctx),
+        hexa_str(" — rename the binding"));
+    if (hexa_truthy(hexa_cmp_ge(hexa_int(hexa_len(p_errors)), p_max_errors))) {
+        hexa_throw(__hexa_parser_sl_68);
+    }
+    p_record_error(hexa_map_get(tok, "line"), hexa_map_get(tok, "col"), msg);
+    p_emit_parse_error(tok, msg);
+    p_pos = hexa_add(p_pos, hexa_int(1));
+    return __hexa_fn_arena_return(hexa_bool(1));
+    return __hexa_fn_arena_return(hexa_void());
+}
+
+
 HexaVal p_guard_is_stmt_here(void) {
     __hexa_fn_arena_enter();
     HexaVal i = hexa_add(p_pos, hexa_int(1));
@@ -3981,7 +4040,13 @@ HexaVal parse_let(void) {
         expr = parse_expr();
         return __hexa_fn_arena_return(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_new(), "kind", __hexa_parser_sl_194), "name", __hexa_parser_sl_1), "value", __hexa_parser_sl_1), "op", __hexa_parser_sl_1), "left", expr), "right", __hexa_parser_sl_1), "cond", __hexa_parser_sl_1), "then_body", __hexa_parser_sl_1), "else_body", __hexa_parser_sl_1), "params", patterns), "body", __hexa_parser_sl_1), "args", __hexa_parser_sl_1), "fields", __hexa_parser_sl_1), "items", __hexa_parser_sl_1), "variants", __hexa_parser_sl_1), "arms", __hexa_parser_sl_1), "iter_expr", __hexa_parser_sl_1), "ret_type", __hexa_parser_sl_1), "target", __hexa_parser_sl_1), "trait_name", __hexa_parser_sl_1), "methods", __hexa_parser_sl_1));
     }
-    HexaVal name = p_expect_ident();
+    /* FIX-6 (BG-HX2): reject reserved keywords as let-binding name. */
+    HexaVal name;
+    if (hexa_truthy(p_check_strict_reserved(hexa_str("let-binding name")))) {
+        name = __hexa_parser_sl_1;
+    } else {
+        name = p_expect_ident();
+    }
     HexaVal typ = __hexa_parser_sl_1;
     if (hexa_truthy(hexa_eq(p_peek_kind(), __hexa_parser_sl_111))) {
         p_advance();
@@ -4390,7 +4455,13 @@ HexaVal parse_params(void) {
     if (hexa_truthy(hexa_eq(p_peek_kind(), __hexa_parser_sl_191))) {
         p_advance();
     }
-    HexaVal name = p_expect_ident();
+    /* FIX-6 (BG-HX2): reject reserved keywords as param name. */
+    HexaVal name;
+    if (hexa_truthy(p_check_strict_reserved(hexa_str("parameter name")))) {
+        name = __hexa_parser_sl_1;
+    } else {
+        name = p_expect_ident();
+    }
     HexaVal typ = __hexa_parser_sl_1;
     if (hexa_truthy(hexa_eq(p_peek_kind(), __hexa_parser_sl_111))) {
         p_advance();
@@ -4402,7 +4473,13 @@ HexaVal parse_params(void) {
         if (hexa_truthy(hexa_eq(p_peek_kind(), __hexa_parser_sl_191))) {
             p_advance();
         }
-        HexaVal pname = p_expect_ident();
+        /* FIX-6 (BG-HX2): reject reserved keywords as param name. */
+        HexaVal pname;
+        if (hexa_truthy(p_check_strict_reserved(hexa_str("parameter name")))) {
+            pname = __hexa_parser_sl_1;
+        } else {
+            pname = p_expect_ident();
+        }
         HexaVal ptyp = __hexa_parser_sl_1;
         if (hexa_truthy(hexa_eq(p_peek_kind(), __hexa_parser_sl_111))) {
             p_advance();
@@ -20158,6 +20235,16 @@ int main(int argc, char** argv) {
     HexaVal src = rt_read_file(hexa_str(argv[1]));
     HexaVal tokens = tokenize(src);
     HexaVal ast = parse(tokens);
+    /* FIX-6 (BG-HX2, 2026-05-04): silent-no-op upstream guard.
+     * Previously hexa-cc returned 0 even when the parser collected
+     * diagnostics — the silent-no-op path that masked the `fn(fn)`
+     * repro. Surface a non-zero exit so CI / hexa run see the
+     * failure instead of an empty .c artefact. */
+    if (hexa_truthy(p_has_errors())) {
+        fprintf(stderr, "hexa-cc: %lld parse error(s) — refusing to write %s\n",
+                (long long)hexa_len(p_errors), argv[2]);
+        return 2;
+    }
     HexaVal c_code = codegen_c2_full(ast);
     rt_write_file(hexa_str(argv[2]), c_code);
     printf("OK: %s\n", argv[2]);
