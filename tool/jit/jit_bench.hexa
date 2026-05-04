@@ -1,0 +1,169 @@
+// tool/jit/jit_bench.hexa — F-JIT acceptance benchmark + selftest
+//
+// @resolver-bypass(reason="JIT pipeline is mac-local: cc -O2 -dynamiclib produces a Mach-O .dylib that won't load inside the Linux hexa-exec container. Docker landing must be skipped.")
+//
+// Runs the same hot-path tight integer loop two ways:
+//   (a) interpreter — original source with @jit ignored
+//   (b) JIT — same source compiled by tool/jit/jit_compile.hexa to a .dylib
+//       and called through @link extern fn
+// Prints both wall-clock times and the speed-up ratio. Exits non-zero if
+// the ratio is below the 10× acceptance floor.
+
+let _argv = args()
+let mut runs = 1
+let mut k = 2
+while k < len(_argv) {
+    if _argv[k] == "--runs" && k + 1 < len(_argv) {
+        runs = to_int(_argv[k + 1])
+        k = k + 2
+    } else {
+        k = k + 1
+    }
+}
+
+fn locate_project_root() {
+    let mut cur = exec("pwd").trim()
+    let mut steps = 0
+    while steps < 30 {
+        if file_exists(cur + "/hexa.toml") { return cur }
+        if cur == "/" || cur == "" { return "" }
+        cur = exec("dirname '" + cur + "'").trim()
+        steps = steps + 1
+    }
+    return ""
+}
+let project_dir = locate_project_root()
+if project_dir == "" {
+    println("[jit-bench] ERR: cannot locate hexa.toml from cwd")
+    exit(2)
+}
+let build_dir = project_dir + "/build"
+exec("mkdir -p " + build_dir)
+
+let hexa_real = "/Users/ghost/core/hexa-lang/hexa.real"
+
+// ---------- write source under test ----------
+// 1M iterations of a 5-op integer pipeline + one inner squared term —
+// tight enough that interpreter dispatch dominates the runtime.
+let bench_src_path = build_dir + "/jit_bench_src.hexa"
+let bench_src = "@jit\n" +
+    "fn tight(n: Int) -> Int {\n" +
+    "    let mut sum = 0\n" +
+    "    let mut i = 0\n" +
+    "    while i < n {\n" +
+    "        sum = sum + i * 2 + 3 + (i * i) % 7\n" +
+    "        i = i + 1\n" +
+    "    }\n" +
+    "    return sum\n" +
+    "}\n" +
+    "println(\"START\")\n" +
+    "let r = tight(1000000)\n" +
+    "println(\"END r=\" + to_string(r))\n"
+
+write_file(bench_src_path, bench_src)
+
+// ---------- compile JIT runner ----------
+let runner_path = build_dir + "/jit_bench_runner.hexa"
+let jit_compile = project_dir + "/tool/jit/jit_compile.hexa"
+// Scrub env so AOT-cached parents that inherited LD_PRELOAD /
+// HEXA_RESOLVER_IN_CONTAINER=1 from the hexa Docker landing shim still
+// drop us back onto the Darwin host (cc -O2 -dynamiclib only works there).
+let env_clean = "env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=" + exec("echo $HOME").trim() + " "
+let cc_log = exec(env_clean + hexa_real + " run " + jit_compile + " " + bench_src_path + " -o " + runner_path + " 2>&1")
+if !file_exists(runner_path) {
+    println("[jit-bench] FATAL: jit_compile failed:")
+    println(cc_log)
+    exit(3)
+}
+
+// ---------- timing helper ----------
+fn now_secs() {
+    return exec("date +%s.%N").trim()
+}
+fn elapsed(t0, t1) {
+    return exec("awk 'BEGIN{printf \"%.3f\", " + t1 + " - " + t0 + "}'").trim()
+}
+
+// run a command N times, return min elapsed seconds
+fn time_cmd(label, cmd, n_runs) {
+    let mut min_s = ""
+    let mut last_out = ""
+    let mut i = 0
+    while i < n_runs {
+        let t0 = now_secs()
+        last_out = exec(cmd + " 2>&1")
+        let t1 = now_secs()
+        let dt = elapsed(t0, t1)
+        if min_s == "" {
+            min_s = dt
+        } else {
+            let cmp = exec("awk 'BEGIN{print (" + dt + " < " + min_s + ") ? 1 : 0}'").trim()
+            if cmp == "1" { min_s = dt }
+        }
+        i = i + 1
+    }
+    return [min_s, last_out]
+}
+
+// ---------- run interpreter (no AOT) ----------
+// HEXA_CACHE=0 forces the source to dispatch through the interpreter
+// (otherwise `hexa run` quietly hands off to the AOT cache fast-path,
+// which would defeat the purpose of the comparison). HEXA_LOCAL_NO_CAP=1
+// keeps us on Darwin host (no Docker landing).
+let interp_cmd = env_clean + "HEXA_LOCAL_NO_CAP=1 HEXA_CACHE=0 " + hexa_real + " run " + bench_src_path
+let jit_cmd = env_clean + "HEXA_LOCAL_NO_CAP=1 HEXA_CACHE=0 " + hexa_real + " run " + runner_path
+
+println("[jit-bench] interpreter runs=" + to_string(runs) + " ...")
+let interp_r = time_cmd("interp", interp_cmd, runs)
+let interp_t = interp_r[0]
+let interp_out = interp_r[1]
+
+println("[jit-bench] JIT runs=" + to_string(runs) + " ...")
+let jit_r = time_cmd("jit", jit_cmd, runs)
+let jit_t = jit_r[0]
+let jit_out = jit_r[1]
+
+// ---------- correctness ----------
+fn last_line(s) {
+    let ls = s.split("\n")
+    let mut k = len(ls) - 1
+    while k >= 0 {
+        if ls[k].trim() != "" { return ls[k].trim() }
+        k = k - 1
+    }
+    return ""
+}
+let interp_ans = last_line(interp_out)
+let jit_ans = last_line(jit_out)
+let mut correctness = "PASS"
+if interp_ans != jit_ans {
+    correctness = "MISMATCH (interp=" + interp_ans + " jit=" + jit_ans + ")"
+}
+
+let ratio = exec("awk 'BEGIN{if(" + jit_t + "==0){print \"inf\"} else {printf \"%.2f\", " + interp_t + "/" + jit_t + "}}'").trim()
+
+println("")
+println("===========================================")
+println("  F-JIT Benchmark Results")
+println("===========================================")
+println("  source        : " + bench_src_path)
+println("  runner (JIT)  : " + runner_path)
+println("  runs/branch   : " + to_string(runs))
+println("  iterations    : 1,000,000")
+println("  interpreter   : " + interp_t + "s   ans=" + interp_ans)
+println("  JIT           : " + jit_t + "s   ans=" + jit_ans)
+println("  correctness   : " + correctness)
+println("  speed-up      : " + ratio + "x")
+println("===========================================")
+
+let pass_int = exec("awk 'BEGIN{print (" + ratio + " >= 10.0) ? 1 : 0}'").trim()
+if correctness != "PASS" {
+    println("[jit-bench] FAIL: correctness mismatch")
+    exit(4)
+}
+if pass_int != "1" {
+    println("[jit-bench] FAIL: speed-up " + ratio + "x < 10x acceptance floor")
+    exit(5)
+}
+println("[jit-bench] PASS (speed-up " + ratio + "x >= 10x)")
+exit(0)

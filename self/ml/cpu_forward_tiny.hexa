@@ -1,0 +1,300 @@
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/cpu_forward_tiny.hexa — Pure-hexa CPU forward pass (flat buf)
+//
+//  F-MULTIARCH-1 acceptance: end-to-end forward on the "tiny" shape
+//  from self/ml/model_registry.hexa, runnable on the host that drives
+//  the matrix (developer Mac, no GPU). Establishes the CPU row of the
+//  4 arch × 2 shape matrix without depending on libhxblas / libhxcuda /
+//  libhxmetal.
+//
+//  Buffer model: flat f32 buffers via alloc_raw + write_f32 / deref_f32.
+//  This mirrors the CPU reference path in self/ml/hxblas_dispatch.hexa
+//  (`hx_sgemm_cpu_ref`) and is dramatically lighter than the immutable
+//  array-of-arrays path: nested-array `+ [...]` copy growth in the
+//  hexa interpreter pushes the 4 GiB hexa-runner container over its
+//  cap on even modest shapes.
+//
+//  What this covers (per layer, single-head abridged):
+//    1. RMSNorm (pre-attn)
+//    2. Q/K/V projections (single head — the GQA ratio is preserved
+//       in the registry but we collapse to one head here so the
+//       kernel stays under ~250 LoC; the same code path exercises
+//       matmul + RoPE + softmax + residual + RMSNorm + SwiGLU)
+//    3. RoPE on Q and K with the registry's rope_base
+//    4. Causal scaled dot-product attention
+//    5. Output projection + residual
+//    6. RMSNorm (pre-mlp) + SwiGLU MLP + residual
+//  Final:
+//    7. Final RMSNorm + LM head projection → logits[seq, vocab]
+//
+//  Determinism: weights/inputs come from `det_weight(i, j, salt)` —
+//  no RNG — so the smoke checksum is host-independent.
+// ═══════════════════════════════════════════════════════════════
+
+use "self/ml/model_registry"
+
+// ── Flat buffer helpers (4 bytes per f32) ───────────────────────
+
+fn buf_alloc(n) {
+    let b = alloc_raw(n * 4)
+    let mut i = 0
+    while i < n { write_f32(b, i * 4, 0.0); i = i + 1 }
+    return b
+}
+
+fn bget(b, i) { return deref_f32(b, i * 4) }
+fn bset(b, i, v) { write_f32(b, i * 4, v); return 0 }
+
+// 2-D index: row-major rows × cols, element [r,c] at flat index r*cols+c
+fn mget(b, cols, r, c) { return deref_f32(b, (r * cols + c) * 4) }
+fn mset(b, cols, r, c, v) { write_f32(b, (r * cols + c) * 4, v); return 0 }
+
+// Deterministic pseudo-weight: integer hash → small float in [-0.1, +0.1].
+fn det_weight(i, j, salt) {
+    let k = ((i + 1) * 1315423911 + (j + 1) * 2654435761 + (salt + 1) * 7919) % 100003
+    let f = (k - 50000) * 0.000004
+    return f
+}
+
+fn fill_w_buf(rows, cols, salt) {
+    let b = buf_alloc(rows * cols)
+    let mut i = 0
+    while i < rows {
+        let mut j = 0
+        while j < cols {
+            mset(b, cols, i, j, det_weight(i, j, salt))
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return b
+}
+
+// ── Math kernels (flat-buffer in/out) ───────────────────────────
+
+// C[M,N] = A[M,K] @ B[K,N]
+fn matmul_buf(A, B, C, M, K, N) {
+    let mut i = 0
+    while i < M {
+        let mut j = 0
+        while j < N {
+            let mut s = 0.0
+            let mut k = 0
+            while k < K {
+                s = s + mget(A, K, i, k) * mget(B, N, k, j)
+                k = k + 1
+            }
+            mset(C, N, i, j, s)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// In-place RMSNorm (no learnable scale; eps = 1e-6)
+fn rmsnorm_buf(X, M, D) {
+    let eps = 0.000001
+    let mut i = 0
+    while i < M {
+        let mut ss = 0.0
+        let mut j = 0
+        while j < D { let v = mget(X, D, i, j); ss = ss + v * v; j = j + 1 }
+        let inv = 1.0 / sqrt(ss / D + eps)
+        j = 0
+        while j < D { mset(X, D, i, j, mget(X, D, i, j) * inv); j = j + 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+fn silu(x) { return x / (1.0 + exp(0.0 - x)) }
+
+// SwiGLU MLP: out[M,D] = (silu(X @ Wg) elem* (X @ Wu)) @ Wd
+fn swiglu_mlp_buf(X, Wg, Wu, Wd, M, D, FF, OUT) {
+    let G = buf_alloc(M * FF)
+    let U = buf_alloc(M * FF)
+    matmul_buf(X, Wg, G, M, D, FF)
+    matmul_buf(X, Wu, U, M, D, FF)
+    let H = buf_alloc(M * FF)
+    let mut i = 0
+    while i < M {
+        let mut j = 0
+        while j < FF {
+            let v = silu(mget(G, FF, i, j)) * mget(U, FF, i, j)
+            mset(H, FF, i, j, v)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    matmul_buf(H, Wd, OUT, M, FF, D)
+    return 0
+}
+
+// In-place RoPE on a (M, head_dim) buffer.
+fn rope_apply_buf(X, M, head_dim, rope_base) {
+    let mut pos = 0
+    while pos < M {
+        let mut k = 0
+        while k < head_dim {
+            if (k % 2) == 0 {
+                let pair = k / 2
+                let exponent = (2.0 * pair) / head_dim
+                let freq = 1.0 / pow(rope_base, exponent)
+                let theta = pos * freq
+                let c = cos(theta)
+                let s = sin(theta)
+                let x0 = mget(X, head_dim, pos, k)
+                let x1 = mget(X, head_dim, pos, k + 1)
+                mset(X, head_dim, pos, k,     x0 * c - x1 * s)
+                mset(X, head_dim, pos, k + 1, x0 * s + x1 * c)
+            }
+            k = k + 1
+        }
+        pos = pos + 1
+    }
+    return 0
+}
+
+// Causal softmax in-place on a (seq × seq) buffer.
+fn causal_softmax_buf(S, seq) {
+    let mut i = 0
+    while i < seq {
+        let mut mx = mget(S, seq, i, 0)
+        let mut j = 1
+        while j <= i {
+            let v = mget(S, seq, i, j); if v > mx { mx = v }; j = j + 1
+        }
+        let mut sum = 0.0
+        j = 0
+        while j <= i {
+            let e = exp(mget(S, seq, i, j) - mx)
+            mset(S, seq, i, j, e); sum = sum + e; j = j + 1
+        }
+        let inv = 1.0 / sum
+        j = 0
+        while j <= i { mset(S, seq, i, j, mget(S, seq, i, j) * inv); j = j + 1 }
+        j = i + 1
+        while j < seq { mset(S, seq, i, j, 0.0); j = j + 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+// In-place A += B over a flat M*D buffer.
+fn add_inplace_buf(A, B, M, D) {
+    let n = M * D
+    let mut i = 0
+    while i < n { bset(A, i, bget(A, i) + bget(B, i)); i = i + 1 }
+    return 0
+}
+
+// Single-head attention block. Writes O[seq, d_model].
+fn attention_block_buf(H, Wq, Wk, Wv, Wo, O, seq, d_model, head_dim, rope_base) {
+    let Q = buf_alloc(seq * head_dim)
+    let K = buf_alloc(seq * head_dim)
+    let V = buf_alloc(seq * head_dim)
+    matmul_buf(H, Wq, Q, seq, d_model, head_dim)
+    matmul_buf(H, Wk, K, seq, d_model, head_dim)
+    matmul_buf(H, Wv, V, seq, d_model, head_dim)
+    rope_apply_buf(Q, seq, head_dim, rope_base)
+    rope_apply_buf(K, seq, head_dim, rope_base)
+    let scale = 1.0 / sqrt(head_dim * 1.0)
+    let S = buf_alloc(seq * seq)
+    let mut i = 0
+    while i < seq {
+        let mut j = 0
+        while j < seq {
+            let mut s = 0.0
+            let mut k = 0
+            while k < head_dim { s = s + mget(Q, head_dim, i, k) * mget(K, head_dim, j, k); k = k + 1 }
+            mset(S, seq, i, j, s * scale)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    causal_softmax_buf(S, seq)
+    let CTX = buf_alloc(seq * head_dim)
+    matmul_buf(S, V, CTX, seq, seq, head_dim)
+    matmul_buf(CTX, Wo, O, seq, head_dim, d_model)
+    return 0
+}
+
+// ── End-to-end forward ──────────────────────────────────────────
+// Returns [first_logit_row_first_n, csum, id, L, D, V]. First row of
+// logits (vocab-wide) is summarised as a 4-element prefix to avoid
+// returning the entire flat buffer back through hexa-array marshalling.
+pub fn cpu_forward_tiny(seq) {
+    let s = shape_lookup("tiny")
+    let D  = s.d_model
+    let HD = s.head_dim
+    let FF = s.d_ff
+    let V  = s.vocab
+    let L  = s.layers
+    let RB = s.rope_base
+
+    // Input embedding (seq × D)
+    let H = fill_w_buf(seq, D, 0)
+    let TMP_ATTN = buf_alloc(seq * D)
+    let TMP_MLP  = buf_alloc(seq * D)
+    let H1 = buf_alloc(seq * D)
+
+    let mut layer = 0
+    while layer < L {
+        // --- pre-attn norm: copy H → H1 then norm in-place ---
+        let mut t = 0
+        while t < seq * D { bset(H1, t, bget(H, t)); t = t + 1 }
+        rmsnorm_buf(H1, seq, D)
+
+        let Wq = fill_w_buf(D, HD, 100 + layer * 10 + 1)
+        let Wk = fill_w_buf(D, HD, 100 + layer * 10 + 2)
+        let Wv = fill_w_buf(D, HD, 100 + layer * 10 + 3)
+        let Wo = fill_w_buf(HD, D, 100 + layer * 10 + 4)
+        attention_block_buf(H1, Wq, Wk, Wv, Wo, TMP_ATTN, seq, D, HD, RB)
+        add_inplace_buf(H, TMP_ATTN, seq, D)
+
+        // --- pre-mlp norm: copy H → H1 then norm in-place ---
+        t = 0
+        while t < seq * D { bset(H1, t, bget(H, t)); t = t + 1 }
+        rmsnorm_buf(H1, seq, D)
+
+        let Wg = fill_w_buf(D, FF, 200 + layer * 10 + 1)
+        let Wu = fill_w_buf(D, FF, 200 + layer * 10 + 2)
+        let Wd = fill_w_buf(FF, D, 200 + layer * 10 + 3)
+        swiglu_mlp_buf(H1, Wg, Wu, Wd, seq, D, FF, TMP_MLP)
+        add_inplace_buf(H, TMP_MLP, seq, D)
+
+        layer = layer + 1
+    }
+
+    // Final norm
+    let mut t = 0
+    while t < seq * D { bset(H1, t, bget(H, t)); t = t + 1 }
+    rmsnorm_buf(H1, seq, D)
+
+    // LM head: logits[seq, V] = H1 @ WL (D × V)
+    let WL = fill_w_buf(D, V, 9999)
+    let logits = buf_alloc(seq * V)
+    matmul_buf(H1, WL, logits, seq, D, V)
+
+    // Checksum: sum of |logits[i, 0]|
+    let mut csum = 0.0
+    let mut i = 0
+    while i < seq {
+        let v = mget(logits, V, i, 0)
+        if v < 0.0 { csum = csum - v } else { csum = csum + v }
+        i = i + 1
+    }
+
+    // Materialise just logits[0, 0..min(4,V)] as a small array so the
+    // smoke test can introspect a sample row without returning the
+    // whole buffer.
+    let mut take = 4
+    let v_lt_take = V < take
+    if v_lt_take { take = V }
+    let mut sample = []
+    let mut q = 0
+    while q < take { sample = sample + [mget(logits, V, 0, q)]; q = q + 1 }
+
+    return [sample, csum, s.id, L, D, V]
+}

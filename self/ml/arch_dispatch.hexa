@@ -1,0 +1,217 @@
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/arch_dispatch.hexa — Multi-arch backend dispatch
+//
+//  F-MULTIARCH-1: extends the existing single-target Live execution
+//  path (Linux+NVIDIA / Qwen14B-shape — see self/ml/qwen14b.hexa,
+//  self/ml/hxblas_dispatch.hexa, self/ml/device.hexa) to a 4-backend
+//  capability lattice:
+//
+//    ARCH_CPU     — always present, pure-hexa scalar reference
+//                   (self/ml/hxblas_dispatch.hexa cpu_fallback path)
+//    ARCH_CUDA    — Linux + NVIDIA, libhxcuda.so + libhxqwen14b.so
+//    ARCH_MPS     — macOS Apple Silicon, libhxmetal.dylib (Metal MPS)
+//    ARCH_ROCM    — Linux + AMD, libhipblas.so / rocBLAS (PENDING-HW)
+//
+//  Capability detection is RUNTIME ONLY. There is no compile-time
+//  cross-arch gating in this layer — callers ask `arch_select(pref)`
+//  and receive a backend descriptor. Probes are best-effort and OS-
+//  filtered so a Mac process never invokes Linux-only library probes
+//  and vice versa.
+//
+//  Override path (operator escape hatch):
+//    HEXA_ARCH=cpu|cuda|mps|rocm — pin a backend regardless of probes.
+//    HEXA_ARCH=auto              — default, run capability cascade.
+//
+//  Probe order under "auto":
+//    macOS (uname -s = Darwin)  → MPS  → CPU
+//    Linux                      → CUDA → ROCm → CPU
+//    other                      → CPU
+//
+//  This file extends, not replaces, hxblas_dispatch.hexa. That file
+//  owns sgemm/softmax routing inside the dylib path; this file owns
+//  the broader question of "which backend should the model loader
+//  bind to in the first place".
+// ═══════════════════════════════════════════════════════════════
+
+// ── Arch constants ──────────────────────────────────────────────
+let ARCH_CPU  = 0
+let ARCH_CUDA = 1
+let ARCH_MPS  = 2
+let ARCH_ROCM = 3
+
+// ── Backend descriptor ──────────────────────────────────────────
+struct ArchBackend {
+    kind: int,          // ARCH_CPU | ARCH_CUDA | ARCH_MPS | ARCH_ROCM
+    name: string,       // "cpu" | "cuda" | "mps" | "rocm"
+    os: string,         // "darwin" | "linux" | "other"
+    dylib_hint: string, // canonical library name probe
+    has_fp16: bool,
+    has_bf16: bool,
+    notes: string
+}
+
+fn arch_backend_cpu(os) {
+    ArchBackend {
+        kind: ARCH_CPU,
+        name: "cpu",
+        os: os,
+        dylib_hint: "libhxblas",
+        has_fp16: false,
+        has_bf16: false,
+        notes: "scalar reference; hxblas via Accelerate (Mac) or OpenBLAS (Linux)"
+    }
+}
+
+fn arch_backend_cuda() {
+    ArchBackend {
+        kind: ARCH_CUDA,
+        name: "cuda",
+        os: "linux",
+        dylib_hint: "libhxcuda.so",
+        has_fp16: true,
+        has_bf16: true,
+        notes: "Linux + NVIDIA Tensor Core path (existing Live execution target)"
+    }
+}
+
+fn arch_backend_mps() {
+    ArchBackend {
+        kind: ARCH_MPS,
+        name: "mps",
+        os: "darwin",
+        dylib_hint: "libhxmetal.dylib",
+        has_fp16: true,
+        has_bf16: false,
+        notes: "Apple Silicon Metal Performance Shaders via hxmetal"
+    }
+}
+
+fn arch_backend_rocm() {
+    ArchBackend {
+        kind: ARCH_ROCM,
+        name: "rocm",
+        os: "linux",
+        dylib_hint: "libhipblas.so",
+        has_fp16: true,
+        has_bf16: true,
+        notes: "AMD ROCm/HIP — bindings PENDING-HARDWARE (no test machine)"
+    }
+}
+
+// ── OS probe (cheap, cached) ────────────────────────────────────
+let mut G_ARCH_OS = ""
+
+fn arch_os() {
+    if G_ARCH_OS != "" { return G_ARCH_OS }
+    // file probe: /System/Library/CoreServices is mac-specific,
+    // /proc/version is linux-specific. Avoids depending on
+    // exec("uname") so probe works in sandboxed contexts.
+    if file_exists("/System/Library/CoreServices/SystemVersion.plist") {
+        G_ARCH_OS = "darwin"
+        return G_ARCH_OS
+    }
+    if file_exists("/proc/version") {
+        G_ARCH_OS = "linux"
+        return G_ARCH_OS
+    }
+    G_ARCH_OS = "other"
+    return G_ARCH_OS
+}
+
+// ── Capability probes ───────────────────────────────────────────
+
+fn has_cuda() {
+    if arch_os() != "linux" { return false }
+    if file_exists("/usr/local/cuda/lib64/libcudart.so") { return true }
+    if file_exists("/usr/lib/x86_64-linux-gnu/libcudart.so") { return true }
+    if file_exists("/usr/bin/nvidia-smi") { return true }
+    return false
+}
+
+fn has_mps() {
+    if arch_os() != "darwin" { return false }
+    // Apple Silicon presence: Metal framework path is universal but
+    // libhxmetal.dylib presence is the proxy for "we built the FFI".
+    // Operator can opt in even without a built dylib via HEXA_ARCH=mps;
+    // the bind step will then return an error which the caller surfaces.
+    if file_exists("/System/Library/Frameworks/Metal.framework/Metal") { return true }
+    return false
+}
+
+fn has_rocm() {
+    if arch_os() != "linux" { return false }
+    if file_exists("/opt/rocm/lib/libhipblas.so") { return true }
+    if file_exists("/opt/rocm/bin/rocminfo") { return true }
+    if file_exists("/usr/bin/rocm-smi") { return true }
+    return false
+}
+
+// ── Auto-select cascade ─────────────────────────────────────────
+
+fn arch_auto() {
+    let os = arch_os()
+    if os == "darwin" {
+        if has_mps() { return arch_backend_mps() }
+        return arch_backend_cpu(os)
+    }
+    if os == "linux" {
+        if has_cuda() { return arch_backend_cuda() }
+        if has_rocm() { return arch_backend_rocm() }
+        return arch_backend_cpu(os)
+    }
+    return arch_backend_cpu(os)
+}
+
+// ── Operator-facing entry ───────────────────────────────────────
+// preference: "auto" | "cpu" | "cuda" | "mps" | "rocm"
+// Honours HEXA_ARCH env override before consulting `preference`.
+pub fn arch_select(preference) {
+    let env_pref = env_var("HEXA_ARCH")
+    let pref = preference
+    if env_pref != "" { pref = env_pref }
+
+    if pref == "cpu"  { return arch_backend_cpu(arch_os()) }
+    if pref == "cuda" {
+        if has_cuda() { return arch_backend_cuda() }
+        println("[arch_dispatch] cuda requested but libcudart not found — falling back to cpu")
+        return arch_backend_cpu(arch_os())
+    }
+    if pref == "mps" {
+        if has_mps() { return arch_backend_mps() }
+        println("[arch_dispatch] mps requested but Metal framework not found — falling back to cpu")
+        return arch_backend_cpu(arch_os())
+    }
+    if pref == "rocm" {
+        if has_rocm() { return arch_backend_rocm() }
+        println("[arch_dispatch] rocm requested but ROCm not found — falling back to cpu")
+        return arch_backend_cpu(arch_os())
+    }
+    // "auto" or unrecognised → cascade
+    return arch_auto()
+}
+
+// ── Capability lattice (probe report, no binding) ───────────────
+// Returns a 4-element array of [kind, available_bool] tuples so a
+// dispatcher can rank backends without committing to one.
+pub fn arch_probe_all() {
+    return [
+        [ARCH_CPU,  true],
+        [ARCH_CUDA, has_cuda()],
+        [ARCH_MPS,  has_mps()],
+        [ARCH_ROCM, has_rocm()]
+    ]
+}
+
+pub fn arch_name(kind: int) -> string {
+    if kind == ARCH_CPU  { return "cpu"  }
+    if kind == ARCH_CUDA { return "cuda" }
+    if kind == ARCH_MPS  { return "mps"  }
+    if kind == ARCH_ROCM { return "rocm" }
+    return "unknown"
+}
+
+pub fn arch_describe(b: ArchBackend) -> string {
+    return b.name + "[os=" + b.os + ",dylib=" + b.dylib_hint + "]"
+}
+
+println("[arch_dispatch] module loaded — 4-arch dispatch (cpu|cuda|mps|rocm) ready")

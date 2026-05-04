@@ -138,6 +138,113 @@ fn main() -> void {
     let f = uint64_to_unit_float(u)
     chk_in_range_float("per_shot_float", f, 0.0, 1.0)
 
+    // ── 13. chunked file I/O — interp-safe ceiling regression ──────────
+    //
+    // Build a 256 KiB synthetic file (4× the recommended 64 KiB chunk),
+    // then process it via bytes_iter_file_chunked / bytes_fold_file_chunked
+    // / bytes_copy_file_chunked / bytes_count_byte_in_file. The combined
+    // peak holds at most one chunk of int-array storage at a time — proves
+    // the chunking primitives let producers get past the boxed-byte
+    // ceiling that had safetensors capped at 32 KiB and sqlite at 1000-row
+    // batches.
+    chk_eq_int("chunk_default", bytes_interp_chunk_default(), 65536)
+
+    // 256 KiB payload — small enough to build in the test (one big alloc
+    // is acceptable here because we want to verify the chunked READERS
+    // can subsequently process it without blowing up further).
+    let n = 256 * 1024
+    let mut payload = []
+    let mut bi = 0
+    while bi < n {
+        payload.push(bi & 0xFF)
+        bi = bi + 1
+    }
+    let src_path = "/tmp/test_bytes_chunked_src.bin"
+    let dst_path = "/tmp/test_bytes_chunked_dst.bin"
+    write_bytes(src_path, payload)
+    chk_eq_int("file_size_after_write", file_size(src_path), n)
+
+    // 13a. iter_file_chunked: walk in 64 KiB chunks, count seen.
+    let mut iter_seen = 0
+    let mut iter_calls = 0
+    let iter_total = bytes_iter_file_chunked(src_path, 65536, fn(_off, c) {
+        iter_seen = iter_seen + len(c)
+        iter_calls = iter_calls + 1
+    })
+    chk_eq_int("iter_total_returned", iter_total, n)
+    chk_eq_int("iter_total_seen", iter_seen, n)
+    // 256 KiB / 64 KiB = 4 chunks exactly.
+    chk_eq_int("iter_chunk_count", iter_calls, 4)
+
+    // 13b. fold_file_chunked: byte-sum (sum of i&0xFF for i in 0..n).
+    // Closed-form: 256-cycle of 0..255 repeats 1024 times → 1024*32640.
+    let want_sum = 1024 * (255 * 256 / 2)  // = 1024 * 32640 = 33423360
+    let got_sum = bytes_fold_file_chunked(src_path, 65536, 0, fn(acc, _o, c) {
+        let mut s = acc
+        let mut i = 0
+        let m = len(c)
+        while i < m {
+            s = s + (c[i] & 0xFF)
+            i = i + 1
+        }
+        return s
+    })
+    chk_eq_int("fold_byte_sum", got_sum, want_sum)
+
+    // 13c. count_byte_in_file: byte 0x00 appears once per 256-cycle = 1024×.
+    chk_eq_int("count_zero_bytes",
+               bytes_count_byte_in_file(src_path, 0, 65536), 1024)
+    chk_eq_int("count_byte_42_default_chunk",
+               bytes_count_byte_in_file(src_path, 42, 0), 1024)
+    chk_eq_int("count_byte_out_of_range", bytes_count_byte_in_file(src_path, 256, 65536), 0)
+    chk_eq_int("count_byte_negative", bytes_count_byte_in_file(src_path, -1, 65536), 0)
+
+    // 13d. copy_file_chunked: byte-identical copy via append, bounded RSS.
+    let copied = bytes_copy_file_chunked(src_path, dst_path, 65536)
+    chk_eq_int("copy_returned_bytes", copied, n)
+    chk_eq_int("copy_dst_size", file_size(dst_path), n)
+    // Verify byte-identity by spot-checking 4 chunks at known offsets.
+    let probe_offsets = [0, 65536, 131072, 196608]
+    let mut pi = 0
+    while pi < 4 {
+        let off = probe_offsets[pi]
+        let s_chunk = read_bytes_at(src_path, off, 64)
+        let d_chunk = read_bytes_at(dst_path, off, 64)
+        let mut ok = len(s_chunk) == 64 && len(d_chunk) == 64
+        let mut k = 0
+        while ok && k < 64 {
+            if (s_chunk[k] & 0xFF) != (d_chunk[k] & 0xFF) { ok = false }
+            k = k + 1
+        }
+        if ok {
+            chk_eq_int("copy_probe@" + to_string(off), 1, 1)
+        } else {
+            chk_eq_int("copy_probe@" + to_string(off), 0, 1)
+        }
+        pi = pi + 1
+    }
+
+    // 13e. edge cases: missing file, zero chunk_size, empty file.
+    chk_eq_int("iter_missing_file",
+               bytes_iter_file_chunked("/tmp/this/does/not/exist.bin",
+                                       65536, fn(_o, _c) {}),
+               0)
+    chk_eq_int("iter_zero_chunk",
+               bytes_iter_file_chunked(src_path, 0, fn(_o, _c) {}), 0)
+    chk_eq_int("copy_zero_chunk", bytes_copy_file_chunked(src_path, dst_path, 0), 0)
+    chk_eq_int("fold_missing_init",
+               bytes_fold_file_chunked("/tmp/missing-xyz.bin", 65536, 42,
+                                       fn(a, _o, _c) { return a + 1 }),
+               42)
+
+    let empty_path = "/tmp/test_bytes_chunked_empty.bin"
+    write_bytes(empty_path, [])
+    chk_eq_int("iter_empty_file",
+               bytes_iter_file_chunked(empty_path, 65536, fn(_o, _c) {}), 0)
+
+    // Cleanup.
+    exec("rm -f " + src_path + " " + dst_path + " " + empty_path)
+
     let total = pass_count + fail_count
     println("")
     println("  pass=" + to_string(pass_count) + "  fail=" + to_string(fail_count))
