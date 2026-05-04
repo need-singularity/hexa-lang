@@ -1,0 +1,242 @@
+// ═══════════════════════════════════════════════════════════════════════════
+//  stdlib/test/test_resolver.hexa
+//  @resolver-bypass(reason="selftest writes a host-only marker to /tmp and verifies the resolver kept it on bare Mac vs container — the test IS the bypass mechanism, so it must run on the host where it was invoked")
+//
+//  Selftest for stdlib/resolver — verifies the @resolver-bypass mechanism
+//  promoted from C10 ad-hoc workaround (commit 9a01aa2a) to a documented,
+//  reusable carve-out (this commit, 2026-05-04).
+//
+//  Coverage:
+//    1. resolver_uname / resolver_is_darwin_host return non-empty values
+//       and agree with `uname -s`.
+//    2. resolver_in_container() agrees with /.dockerenv probe.
+//    3. resolver_route_label() returns one of the documented enum values
+//       and is consistent with resolver_in_container().
+//    4. resolver_scrub_env_prefix() emits an `env -i ... HOME=...` prefix
+//       that, when prepended to a child shell command, strips
+//       HEXA_RESOLVER_IN_CONTAINER from the child env (regression test
+//       for the C10 root cause).
+//    5. Bypass-mechanism end-to-end: write a tiny scratch .hexa with the
+//       @resolver-bypass marker, exec it via ~/.hx/bin/hexa, capture the
+//       resolver's stderr `hexa-resolver: route=...` log, assert
+//       route=darwin-bypass when running on Darwin (or skip with SKIP if
+//       resolver unavailable / non-Darwin).
+//
+//  Run:
+//      hexa run stdlib/test/test_resolver.hexa
+//
+//  Exit semantics:
+//      * all asserts pass → "PASS: resolver stdlib selftest N/N"
+//      * any assert fails → FAIL lines + exit 1
+// ═══════════════════════════════════════════════════════════════════════════
+
+use "stdlib/resolver"
+
+let mut pass_count = 0
+let mut fail_count = 0
+let mut skip_count = 0
+
+fn chk_eq_str(tag, got, want) {
+    if got == want {
+        println("  PASS " + tag + " == \"" + want + "\"")
+        pass_count = pass_count + 1
+    } else {
+        println("  FAIL " + tag + " got=\"" + got + "\" want=\"" + want + "\"")
+        fail_count = fail_count + 1
+    }
+}
+
+fn chk_eq_bool(tag, got, want) {
+    if got == want {
+        println("  PASS " + tag)
+        pass_count = pass_count + 1
+    } else {
+        let g = if got { "true" } else { "false" }
+        let w = if want { "true" } else { "false" }
+        println("  FAIL " + tag + " got=" + g + " want=" + w)
+        fail_count = fail_count + 1
+    }
+}
+
+fn chk_true(tag, got) {
+    chk_eq_bool(tag, got, true)
+}
+
+fn chk_contains(tag, haystack, needle) {
+    let idx = haystack.index_of(needle)
+    if idx >= 0 {
+        println("  PASS " + tag + " contains \"" + needle + "\"")
+        pass_count = pass_count + 1
+    } else {
+        println("  FAIL " + tag + " missing \"" + needle + "\" in: " + haystack)
+        fail_count = fail_count + 1
+    }
+}
+
+fn note_skip(tag, why) {
+    println("  SKIP " + tag + " (" + why + ")")
+    skip_count = skip_count + 1
+}
+
+fn _have_path(p) -> bool {
+    let r = exec("test -e " + p + " && echo 1 || echo 0").trim()
+    return r == "1"
+}
+
+fn main() -> void {
+    println("── stdlib/resolver selftest ──")
+
+    // ── 1. uname / darwin-host helpers ──────────────────────────────────
+    let u = resolver_uname()
+    let raw_uname = exec("uname -s 2>/dev/null").trim()
+    chk_eq_str("uname_matches_shell", u, raw_uname)
+    chk_true("uname_nonempty", u != "")
+    let is_darwin = resolver_is_darwin_host()
+    chk_eq_bool("is_darwin_host_consistent", is_darwin, u == "Darwin")
+
+    // ── 2. in_container probe agrees with /.dockerenv ───────────────────
+    let in_ct = resolver_in_container()
+    let dockerenv = exec("test -f /.dockerenv && echo 1 || echo 0").trim() == "1"
+    let env_flag = env("HEXA_RESOLVER_IN_CONTAINER") == "1"
+    let env_flag2 = env("HEXA_IN_CONTAINER") == "1"
+    let want_in = dockerenv || env_flag || env_flag2
+    chk_eq_bool("in_container_consistent", in_ct, want_in)
+
+    // ── 3. route_label returns a documented enum value ──────────────────
+    let label = resolver_route_label()
+    let valid_labels = ["container", "darwin-bypass", "darwin-native", "linux-host", "unknown"]
+    let mut label_ok = false
+    let mut li = 0
+    while li < len(valid_labels) {
+        if label == valid_labels[li] { label_ok = true }
+        li = li + 1
+    }
+    chk_true("route_label_in_enum", label_ok)
+    if in_ct {
+        chk_eq_str("route_label_matches_container", label, "container")
+    }
+    if !in_ct && u != "Darwin" && u != "" {
+        chk_eq_str("route_label_matches_linux_host", label, "linux-host")
+    }
+
+    // ── 4. scrub_env_prefix strips routing env from child ───────────────
+    // Prepend the prefix to a child shell that prints HEXA_RESOLVER_IN_CONTAINER.
+    // Even if WE are not currently in-container, we set the var explicitly
+    // for this test and assert the prefix wipes it.
+    let prefix = resolver_scrub_env_prefix()
+    chk_contains("prefix_has_env_i", prefix, "env -i")
+    chk_contains("prefix_has_path", prefix, "PATH=")
+    chk_contains("prefix_has_home", prefix, "HOME=")
+    // Set the var in the parent shell, then run a child via the prefix and
+    // verify it sees an empty value (env -i wiped it).
+    let probe_cmd = "HEXA_RESOLVER_IN_CONTAINER=1 " + prefix + "sh -c 'printf \"%s\" \"${HEXA_RESOLVER_IN_CONTAINER:-EMPTY}\"'"
+    let probe_out = exec(probe_cmd).trim()
+    chk_eq_str("scrub_strips_routing_env", probe_out, "EMPTY")
+
+    // Same for HEXA_IN_CONTAINER.
+    let probe_cmd2 = "HEXA_IN_CONTAINER=1 " + prefix + "sh -c 'printf \"%s\" \"${HEXA_IN_CONTAINER:-EMPTY}\"'"
+    let probe_out2 = exec(probe_cmd2).trim()
+    chk_eq_str("scrub_strips_in_container_env", probe_out2, "EMPTY")
+
+    // And LD_PRELOAD (the C10 native_gate.so contagion vector).
+    let probe_cmd3 = "LD_PRELOAD=/opt/hexa/native_gate.so " + prefix + "sh -c 'printf \"%s\" \"${LD_PRELOAD:-EMPTY}\"'"
+    let probe_out3 = exec(probe_cmd3).trim()
+    chk_eq_str("scrub_strips_ld_preload", probe_out3, "EMPTY")
+
+    // ── 5. End-to-end bypass mechanism on Darwin ────────────────────────
+    // Write a scratch .hexa with @resolver-bypass header that touches a
+    // host-only marker file (/tmp/hexa_resolver_selftest_marker.<pid>).
+    // Exec via ~/.hx/bin/hexa and assert the resolver's stderr emits
+    // route=darwin-bypass. The marker file proves the script ran (on
+    // whichever side the resolver chose).
+    if !is_darwin {
+        note_skip("e2e_bypass_resolver_log", "non-Darwin host (resolver routing not engaged)")
+    } else if !_have_path("/Users/ghost/.hx/bin/hexa") {
+        note_skip("e2e_bypass_resolver_log", "/Users/ghost/.hx/bin/hexa not present")
+    } else {
+        let pid = exec("echo $$").trim()
+        let marker = "/tmp/hexa_resolver_selftest_marker." + pid
+        exec("rm -f " + marker)
+        let scratch = "/tmp/hexa_resolver_selftest_." + pid + ".hexa"
+        let body = "// @resolver-bypass(reason=\"stdlib/test/test_resolver e2e fixture — must NOT land in docker; touches host-only /tmp marker as proof-of-bypass\")\n" +
+                   "exec(\"touch " + marker + "\")\n" +
+                   "let u = exec(\"uname -s\").trim()\n" +
+                   "println(\"e2e_uname=\" + u)\n"
+        write_file(scratch, body)
+
+        // Capture both stdout and stderr — the resolver's `hexa-resolver:`
+        // log goes to stderr; the script's println goes to stdout. Wrap in
+        // `sh -c '...' 2>&1` so the redirection applies to the outer shell;
+        // a bare `cmd 2>&1` under popen merges only the leaf process's fd 2,
+        // missing log lines from inherited stderr (resolver's own >&2 echo).
+        //
+        // We must `unset HEXA_RESOLVER_NO_REROUTE` before the inner hexa
+        // call: when this selftest itself was launched via ~/.hx/bin/hexa
+        // (full resolver round-trip), the parent resolver set
+        // HEXA_RESOLVER_NO_REROUTE=1 before exec'ing $REAL_HEXA — that
+        // var is inherited and would short-circuit the inner resolver's
+        // marker-check path WITHOUT printing the route= log line. The
+        // unset forces the inner invocation to run the full _darwin_bypass_check
+        // and emit its `route=darwin-bypass` decision to stderr.
+        let cmd = "unset HEXA_RESOLVER_NO_REROUTE HEXA_RESOLVER_IN_CONTAINER; sh -c '/Users/ghost/.hx/bin/hexa run " + scratch + "' 2>&1"
+        let combined = exec(cmd)
+
+        // Marker must exist (script ran somewhere).
+        let marker_exists = _have_path(marker)
+        chk_true("e2e_script_ran", marker_exists)
+
+        // The script's output should contain its own uname line. On a
+        // bypass route the uname is Darwin (host); on a docker-routed
+        // run it would be Linux. The marker test above proves the route
+        // produced the host-side side effect either way (since the bind
+        // mount makes /tmp visible inside the container too, this is
+        // weaker than it looks — that's why we also check the resolver
+        // log next).
+        chk_contains("e2e_uname_emitted", combined, "e2e_uname=")
+
+        // Strongest assertion: resolver log line confirms route=darwin-bypass.
+        // Tolerant match — any resolver log starting with
+        // "hexa-resolver: route=darwin-bypass" counts.
+        chk_contains("e2e_resolver_route_log", combined, "route=darwin-bypass")
+
+        // Negative control: write a SECOND fixture WITHOUT the bypass
+        // marker. Skip if HEXA_DOCKER_NAME container is unavailable —
+        // we don't want to spin up docker just for a selftest. The
+        // docker-side path is documented, not asserted.
+        let docker_up = exec("docker inspect -f '{{.State.Running}}' hexa-exec 2>/dev/null").trim() == "true"
+        if docker_up {
+            let scratch2 = "/tmp/hexa_resolver_selftest_nobypass." + pid + ".hexa"
+            let marker2 = "/tmp/hexa_resolver_selftest_marker_nobypass." + pid
+            exec("rm -f " + marker2)
+            let body2 = "// no resolver-bypass marker — should land in docker\n" +
+                        "exec(\"touch " + marker2 + "\")\n" +
+                        "let u = exec(\"uname -s\").trim()\n" +
+                        "println(\"e2e_nobypass_uname=\" + u)\n"
+            write_file(scratch2, body2)
+            let cmd2 = "unset HEXA_RESOLVER_NO_REROUTE HEXA_RESOLVER_IN_CONTAINER; sh -c '/Users/ghost/.hx/bin/hexa run " + scratch2 + "' 2>&1"
+            let combined2 = exec(cmd2)
+            // Negative case must NOT log darwin-bypass for this argv.
+            // (The marker check carve-out still allows other bypass tiers,
+            // so this is a soft assertion: if we see darwin-bypass here
+            // then the marker check is incorrectly catching us; if we see
+            // route=docker we are good. Either way the marker file exists.)
+            let bypass_idx = combined2.index_of("route=darwin-bypass")
+            chk_eq_bool("e2e_nobypass_no_bypass_route", bypass_idx < 0, true)
+            exec("rm -f " + scratch2 + " " + marker2)
+        } else {
+            note_skip("e2e_negative_docker_route", "hexa-exec container not running")
+        }
+
+        exec("rm -f " + scratch + " " + marker)
+    }
+
+    let total = pass_count + fail_count
+    println("")
+    println("  pass=" + to_string(pass_count) + "  fail=" + to_string(fail_count) + "  skip=" + to_string(skip_count))
+    if fail_count == 0 {
+        println("PASS: resolver stdlib selftest " + to_string(pass_count) + "/" + to_string(total))
+        return
+    }
+    println("FAIL: resolver stdlib selftest " + to_string(pass_count) + "/" + to_string(total))
+    exit(1)
+}
