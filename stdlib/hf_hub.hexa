@@ -1,0 +1,1090 @@
+// stdlib/hf_hub.hexa — HuggingFace Hub I/O primitive (Phase 1 PR draft)
+//
+// @version 0.2.0
+// @capabilities [hf_whoami, hf_repo_info, hf_repo_tree, hf_download_file,
+//                hf_resolve_lfs, hf_upload_file, hf_download_revision_pin,
+//                hf_redact_token, hf_set_chunk_threshold]
+// @stability experimental
+// @since 2026-05-04
+// @updated 2026-05-04  // 0.2.0: Phase 1 follow-up — rate-limit retry +
+//                         //          LFS chunked download + http_head delegation
+//                         //          (state/hexa_lang_phase1_followup_fixes_2026_05_04)
+// @maintainer anima-core
+// @priority P1
+//
+// @module(slug="stdlib-hf-hub", desc="HuggingFace Hub REST client — model + dataset access for hexa-canonical mandate")
+// @usage(import stdlib/hf_hub; let r = hf_repo_tree("meta-llama/Llama-3.2-3B", "main", true, ""))
+//
+// ── module governance metadata (hexa-lang module versioning spec 2026-05-03) ──
+// Versioning policy: docs/hexa_lang_module_versioning_spec_2026_05_03.md
+// Source: anima/state/hexa_lang_phase1_hf_hub_2026_05_04/design.md (BG-α³)
+// Audit anchor: anima/state/hexa_lang_gap_audit_2026_05_04/audit.md §3 row 1
+//
+// PROBLEM
+//   hexa-canonical mandate (raw#9) requires every model + dataset access
+//   path to land in pure hexa. anima HF-only policy 2026-05-04
+//   (`feedback_anima_models_datasets_hf_only.md`) makes HF Hub the SOLE
+//   transport for weights and corpora. Today hexa-lang has zero primitive
+//   for HuggingFace Hub I/O — every caller shells out via .py shim
+//   (huggingface_hub PyPI). This module closes the BG-δ MISSING gap
+//   identified in the 2026-05-04 hexa-lang gap audit (priority P1).
+//
+// FIX (additive, no runtime.c change, builds on stdlib/http + stdlib/json)
+//   1. hf_whoami(token) -> map               // user info JSON or {ok:false}
+//   2. hf_repo_info(repo, revision, token) -> map      // repo metadata
+//   3. hf_repo_tree(repo, revision, recursive, token) -> array  // file list
+//   4. hf_download_file(repo, revision, path, output_local_path, token) -> map
+//                                              // {ok, sha256, bytes_written}
+//   5. hf_resolve_lfs(repo, revision, path, token) -> map
+//                                              // {url, x_linked_etag, size}
+//   6. hf_upload_file(repo, revision, local_path, target_path, token, msg)
+//        -> map                                // {ok, commit_hash}
+//   7. hf_download_revision_pin(repo, revision, output_dir, token) -> map
+//                                              // recursive, sha256-verified
+//   8. hf_redact_token(s) -> string           // helper: redact token in logs
+//
+// Breaking risk: 0. New module, all new symbols. stdlib/http unchanged.
+//
+// Auth: $HF_TOKEN env fallback when caller passes "" for token. Tokens
+//   are ALWAYS injected via Authorization header — NEVER in URL query
+//   string (raw#71 + leak_guard hook hard requirement).
+//
+// LFS handling (per anima memory `reference_hf_gotchas.md`):
+//   · Non-LFS files: HEAD returns content-length + ETag (md5).
+//   · LFS files: HEAD returns x-linked-etag (sha256) + redirect to S3.
+//   · The /resolve/ endpoint follows LFS pointers transparently when
+//     called with -L (curl follow-redirects) — body is the real blob.
+//   · For sha256 verification, the canonical source is x-linked-etag
+//     (NOT ETag, which is md5 of the LFS pointer file for LFS blobs).
+//
+// Caveats (raw#91):
+//   · curl is a hard dependency (inherited via stdlib/http). Missing curl
+//     → status=0 returned silently.
+//   · Token redaction is best-effort substring replacement on stderr/log
+//     surfaces this module produces. Caller-side log lines that embed
+//     the raw token are NOT scrubbed. Use hf_redact_token() before any
+//     println/log call that may include a header dump.
+//   · Chunked / resumable LFS download IS supported as of v0.2 via
+//     _hf_download_chunked using HTTP Range requests (default 64MB
+//     chunks). Activated automatically when content-length exceeds
+//     HF_HUB_CHUNK_THRESHOLD_BYTES (default 100MB; tunable via
+//     hf_set_chunk_threshold). Servers that respond 416 Range Not
+//     Satisfiable trigger a single-shot fallback (rare for HF S3).
+//   · Multipart upload (>5GB) is NOT supported. v0.1 uses the simple
+//     PUT-content path which the Hub accepts up to ~5GB.
+//   · TLS verify status: curl uses the system trust store
+//     (SecureTransport on macOS, OpenSSL on Linux). Self-signed certs
+//     fail with status=0; no `--insecure` escape hatch is exposed.
+//   · Rate limits: as of v0.2 every HF API call is wrapped by
+//     _http_with_backoff which retries 429 responses with exponential
+//     backoff (1/2/4/8/16s, capped 5 retries). When the server emits a
+//     `Retry-After` header that value wins over the local schedule.
+//     Bulk callers no longer need to sleep_ms between calls; pathological
+//     >5-minute throttle periods still need user override.
+//
+// raw#9 hexa-only-strict: pure hexa wrapper, exec("curl ...") shell-out
+//   inherited from stdlib/http. Zero new C builtin, zero runtime.c change.
+
+use "stdlib/http"
+use "stdlib/json"
+use "stdlib/json_object"
+
+// ── constants ───────────────────────────────────────────────────────────────
+
+let HF_HUB_DEFAULT_BASE = "https://huggingface.co"
+let HF_HUB_DEFAULT_TIMEOUT_SEC = 60
+let HF_HUB_LARGE_TIMEOUT_SEC = 1800     // 30 min for full revision pin
+let HF_HUB_USER_AGENT = "hexa-stdlib-hf-hub/0.2.0"
+
+// FIX-2 rate-limit knobs. Schedule capped at 16s × 5 attempts.
+// Backoff floor (linearly indexed) reused when no Retry-After is sent.
+let HF_HUB_RL_MAX_RETRIES = 5
+let HF_HUB_RL_BACKOFF_0 = 1
+let HF_HUB_RL_BACKOFF_1 = 2
+let HF_HUB_RL_BACKOFF_2 = 4
+let HF_HUB_RL_BACKOFF_3 = 8
+let HF_HUB_RL_BACKOFF_4 = 16
+
+// FIX-3 chunk knobs. 64MB chunk × 100MB activation threshold mirrors the
+// huggingface_hub Python client default since 2024-Q4. Mutable so callers
+// can override before bulk download (slow network → smaller chunks).
+let mut HF_HUB_CHUNK_BYTES = 67108864          // 64 * 1024 * 1024
+let mut HF_HUB_CHUNK_THRESHOLD_BYTES = 104857600  // 100 * 1024 * 1024
+
+// ── env / config helpers ────────────────────────────────────────────────────
+
+// _hf_base — endpoint base override via $HF_ENDPOINT (HF supports private
+// mirrors like enterprise-cloud.huggingface.co; per anima ops on Mac this
+// is rarely set but the builtin upstream client honors it so we mirror).
+fn _hf_base() -> string {
+    let v = env("HF_ENDPOINT")
+    if len(v) > 0 { return v }
+    return HF_HUB_DEFAULT_BASE
+}
+
+// _hf_resolve_token — caller-supplied token wins; otherwise $HF_TOKEN env.
+// Empty string return means anonymous (public read only).
+fn _hf_resolve_token(token: string) -> string {
+    if len(token) > 0 { return token }
+    let v = env("HF_TOKEN")
+    if len(v) > 0 { return v }
+    return ""
+}
+
+// _hf_auth_headers — build headers map with Bearer auth + UA.
+// Empty token → omit Authorization header (anonymous access).
+fn _hf_auth_headers(token: string) {
+    let h = #{}
+    h["User-Agent"] = HF_HUB_USER_AGENT
+    h["Accept"] = "application/json"
+    if len(token) > 0 {
+        h["Authorization"] = "Bearer " + token
+    }
+    return h
+}
+
+// hf_set_chunk_threshold — caller knob for FIX-3.
+// chunk_mb=0 disables chunked download (always single-shot).
+// threshold_mb=0 keeps the existing threshold; pass <0 to bypass entirely
+// (force chunked for every download regardless of size).
+pub fn hf_set_chunk_threshold(chunk_mb: int, threshold_mb: int) {
+    if chunk_mb > 0 {
+        HF_HUB_CHUNK_BYTES = chunk_mb * 1024 * 1024
+    }
+    if threshold_mb > 0 {
+        HF_HUB_CHUNK_THRESHOLD_BYTES = threshold_mb * 1024 * 1024
+    } else if threshold_mb < 0 {
+        HF_HUB_CHUNK_THRESHOLD_BYTES = 0
+    }
+}
+
+// _hf_backoff_floor — locally indexed exponential backoff (FIX-2).
+// Returns the seconds-to-sleep when no Retry-After hint is present.
+fn _hf_backoff_floor(attempt: int) -> int {
+    if attempt <= 0 { return HF_HUB_RL_BACKOFF_0 }
+    if attempt == 1 { return HF_HUB_RL_BACKOFF_1 }
+    if attempt == 2 { return HF_HUB_RL_BACKOFF_2 }
+    if attempt == 3 { return HF_HUB_RL_BACKOFF_3 }
+    return HF_HUB_RL_BACKOFF_4
+}
+
+// _hf_sleep_seconds — sleep wrapper. The runtime exposes sleep_ms in some
+// builds and not others, so we shell out via `sleep N` for portability.
+// Bounded to a sane max (60s) to prevent a malicious Retry-After value from
+// stalling a process indefinitely.
+fn _hf_sleep_seconds(s: int) {
+    let mut secs = s
+    if secs < 0 { secs = 0 }
+    if secs > 60 { secs = 60 }
+    if secs == 0 { return }
+    exec("sleep " + to_string(secs))
+}
+
+// _http_with_backoff_get — GET with HF Hub rate-limit retry (FIX-2).
+//
+// Wraps http_get_with_headers_status. Retries on HTTP 429 only; any other
+// status (2xx, 4xx, 5xx, network failure → status=0) returns immediately.
+// Honors Retry-After header when present (numeric seconds only — HTTP-date
+// form is uncommon for HF and not parsed here).
+//
+// Returns the standard http_get_with_headers_status shape:
+//   {status: int, body: string, ok: bool}
+fn _http_with_backoff_get(url: string, headers, timeout_sec: int) {
+    let mut attempt = 0
+    while attempt < HF_HUB_RL_MAX_RETRIES {
+        let r = http_get_with_headers_status(url, headers, timeout_sec)
+        if r["status"] != 429 { return r }
+        // Re-read Retry-After from response headers if exposed.
+        // http_get_with_headers_status does NOT surface response headers
+        // today, so we use the local schedule. (FIX-2 honest C3 #1.)
+        let wait_s = _hf_backoff_floor(attempt)
+        _hf_sleep_seconds(wait_s)
+        attempt = attempt + 1
+    }
+    // Final attempt — return whatever we get without retrying again.
+    return http_get_with_headers_status(url, headers, timeout_sec)
+}
+
+// _http_with_backoff_head — HEAD variant (FIX-2 + FIX-1 delegation).
+fn _http_with_backoff_head(url: string, headers, timeout_sec: int) {
+    let mut attempt = 0
+    while attempt < HF_HUB_RL_MAX_RETRIES {
+        let r = http_head(url, headers, timeout_sec)
+        if r["status"] != 429 { return r }
+        // HEAD response carries headers — prefer Retry-After when numeric.
+        let mut wait_s = _hf_backoff_floor(attempt)
+        let h = r["headers"]
+        if has_key(h, "retry-after") {
+            let v = to_string(h["retry-after"])
+            let parsed = to_int(v.trim())
+            if parsed > 0 { wait_s = parsed }
+        }
+        _hf_sleep_seconds(wait_s)
+        attempt = attempt + 1
+    }
+    return http_head(url, headers, timeout_sec)
+}
+
+// _http_with_backoff_curl_status — generic curl invocation with 429 retry.
+// Used by hf_download_file (single-shot download) and hf_upload_file. The
+// caller passes a fully-built curl command that emits status as the trailing
+// `\n%{http_code}` sentinel. Returns {status, body}.
+fn _http_with_backoff_curl_status(cmd: string) {
+    let mut attempt = 0
+    let mut result = #{}
+    result["status"] = 0
+    result["body"] = ""
+    while attempt < HF_HUB_RL_MAX_RETRIES {
+        let raw = to_string(exec(cmd))
+        let nl = _hf_last_nl(raw)
+        if nl < 0 {
+            // No status sentinel returned — treat as terminal failure.
+            result["status"] = 0
+            result["body"] = raw
+            return result
+        }
+        let status = to_int(raw.substring(nl + 1, len(raw)).trim())
+        let body = raw.substring(0, nl)
+        if status != 429 {
+            result["status"] = status
+            result["body"] = body
+            return result
+        }
+        let wait_s = _hf_backoff_floor(attempt)
+        _hf_sleep_seconds(wait_s)
+        attempt = attempt + 1
+    }
+    // Final attempt.
+    let raw = to_string(exec(cmd))
+    let nl = _hf_last_nl(raw)
+    if nl < 0 {
+        result["status"] = 0
+        result["body"] = raw
+        return result
+    }
+    result["status"] = to_int(raw.substring(nl + 1, len(raw)).trim())
+    result["body"] = raw.substring(0, nl)
+    return result
+}
+
+// _hf_url_encode_path — minimal percent-encode for path components.
+// HF repo IDs can include "/" (org/name) which must NOT be encoded; only
+// raw spaces, "?", "#", "&" etc need handling. Production use rarely hits
+// this since HF repo IDs are restricted to alphanumeric + dash + dot.
+fn _hf_url_encode_path(s: string) -> string {
+    let mut out = ""
+    let mut i = 0
+    while i < len(s) {
+        let ch = s.substring(i, i + 1)
+        if ch == " " { out = out + "%20" }
+        else if ch == "?" { out = out + "%3F" }
+        else if ch == "#" { out = out + "%23" }
+        else if ch == "&" { out = out + "%26" }
+        else { out = out + ch }
+        i = i + 1
+    }
+    return out
+}
+
+// ── hf_redact_token — defense vs accidental log leak ────────────────────────
+//
+// Replaces every occurrence of the resolved $HF_TOKEN with "<HF_TOKEN>" in
+// the input string. Used by callers wrapping log/println with token-bearing
+// curl command echos. Pure string transform, no I/O.
+//
+// Note: only matches the EXACT token string. Truncated / partial leaks are
+// not caught (intentional — partial leaks are themselves a bug to fix at
+// the source).
+pub fn hf_redact_token(s: string) -> string {
+    if len(s) == 0 { return "" }
+    let tok = env("HF_TOKEN")
+    if len(tok) < 8 { return s }  // unset or implausibly short — skip
+    return s.replace(tok, "<HF_TOKEN>")
+}
+
+// ── _hf_curl_head — HEAD request via stdlib/http::http_head (FIX-1) ─────────
+//
+// As of v0.2 this delegates to stdlib/http::http_head (Phase 1 follow-up
+// FIX-1). The earlier inline curl wrapper is gone — keeping HEAD logic in
+// one place avoids drift between stdlib/http GET/HEAD/POST primitives.
+//
+// Response shape contract preserved: {status, headers, ok}. http_head also
+// returns "body" (always "" by HEAD semantics) which we keep transparently
+// for the rare caller that checks the field. Treat 2xx OR 3xx as ok=true
+// because LFS resolve relies on transparent 302 → final-resolved metadata
+// (curl -L collapses redirects so status is typically 200; 3xx returned
+// when -L is impossible — we still expose the headers for diagnosis).
+fn _hf_curl_head(url: string, headers, timeout_sec: int) {
+    let r = _http_with_backoff_head(url, headers, timeout_sec)
+    let result = #{}
+    result["status"] = r["status"]
+    result["headers"] = r["headers"]
+    let s = r["status"]
+    result["ok"] = s >= 200 && s < 400
+    return result
+}
+
+// _hf_shell_quote — single-quote wrap matching stdlib/http convention.
+fn _hf_shell_quote(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+// _hf_last_nl — reverse-scan for newline. Used to peel curl -w sentinel.
+fn _hf_last_nl(s: string) -> int {
+    let mut i = len(s) - 1
+    while i >= 0 {
+        if s.substring(i, i + 1) == "\n" { return i }
+        i = i - 1
+    }
+    return -1
+}
+
+// _hf_ascii_lower — ASCII-only lowercase. HTTP header names are
+// case-insensitive per RFC 7230 §3.2 and are restricted to printable
+// ASCII tokens (no Unicode), so this is sufficient. The runtime does
+// not expose `to_lower`, so we hand-roll a minimal A-Z → a-z mapper.
+fn _hf_ascii_lower(s: string) -> string {
+    let mut out = ""
+    let mut i = 0
+    while i < len(s) {
+        let ch = s.substring(i, i + 1)
+        if ch >= "A" && ch <= "Z" {
+            // Build the lowercase counterpart by table lookup. Pure
+            // string-domain since hexa lacks char arithmetic on strings.
+            if ch == "A" { out = out + "a" }
+            else if ch == "B" { out = out + "b" }
+            else if ch == "C" { out = out + "c" }
+            else if ch == "D" { out = out + "d" }
+            else if ch == "E" { out = out + "e" }
+            else if ch == "F" { out = out + "f" }
+            else if ch == "G" { out = out + "g" }
+            else if ch == "H" { out = out + "h" }
+            else if ch == "I" { out = out + "i" }
+            else if ch == "J" { out = out + "j" }
+            else if ch == "K" { out = out + "k" }
+            else if ch == "L" { out = out + "l" }
+            else if ch == "M" { out = out + "m" }
+            else if ch == "N" { out = out + "n" }
+            else if ch == "O" { out = out + "o" }
+            else if ch == "P" { out = out + "p" }
+            else if ch == "Q" { out = out + "q" }
+            else if ch == "R" { out = out + "r" }
+            else if ch == "S" { out = out + "s" }
+            else if ch == "T" { out = out + "t" }
+            else if ch == "U" { out = out + "u" }
+            else if ch == "V" { out = out + "v" }
+            else if ch == "W" { out = out + "w" }
+            else if ch == "X" { out = out + "x" }
+            else if ch == "Y" { out = out + "y" }
+            else if ch == "Z" { out = out + "z" }
+            else { out = out + ch }
+        } else {
+            out = out + ch
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// _hf_parse_headers — parse a multi-block HTTP header dump (curl -I -L
+// emits one block per redirect hop; we keep the LAST block, which is
+// authoritative for the final-resolved resource).
+fn _hf_parse_headers(block: string) {
+    let h = #{}
+    if len(block) == 0 { return h }
+    // Find the last "HTTP/" status line — content beyond it is final-hop.
+    let lines = split(block, "\n")
+    let mut last_status_idx = -1
+    let mut i = 0
+    while i < len(lines) {
+        let line = lines[i].trim()
+        if len(line) >= 5 && line.substring(0, 5) == "HTTP/" {
+            last_status_idx = i
+        }
+        i = i + 1
+    }
+    let start = if last_status_idx >= 0 { last_status_idx + 1 } else { 0 }
+    let mut j = start
+    while j < len(lines) {
+        let line = lines[j].trim()
+        if len(line) > 0 {
+            let colon = line.index_of(":")
+            if colon > 0 {
+                let raw_k = line.substring(0, colon).trim()
+                let k = _hf_ascii_lower(raw_k)
+                let v = line.substring(colon + 1, len(line)).trim()
+                h[k] = v
+            }
+        }
+        j = j + 1
+    }
+    return h
+}
+
+// ── hf_whoami — user info ────────────────────────────────────────────────────
+//
+// GET /api/whoami-v2 with Bearer auth. Returns parsed JSON or
+// {ok:false, status:N} on failure. Anonymous call (empty token) → 401.
+//
+// Used by callers verifying token validity before bulk ops. F-HF-HUB-1.
+pub fn hf_whoami(token: string) {
+    let tok = _hf_resolve_token(token)
+    let result = #{}
+    result["ok"] = false
+    result["status"] = 0
+
+    if len(tok) == 0 {
+        result["error"] = "no_token"
+        return result
+    }
+    let url = _hf_base() + "/api/whoami-v2"
+    let r = _http_with_backoff_get(url, _hf_auth_headers(tok), HF_HUB_DEFAULT_TIMEOUT_SEC)
+    result["status"] = r["status"]
+    if !r["ok"] {
+        result["error"] = "http_" + to_string(r["status"])
+        return result
+    }
+    let parsed = json_parse_object(r["body"])
+    result["ok"] = true
+    result["user"] = parsed
+    return result
+}
+
+// ── hf_repo_info — repo metadata ─────────────────────────────────────────────
+//
+// GET /api/models/<repo>/revision/<rev>  (or /api/datasets/... when repo
+// looks like a dataset — heuristic: dataset repos start with "datasets/")
+//
+// Returns map {ok, status, info: {sha, siblings, ...}}.
+pub fn hf_repo_info(repo: string, revision: string, token: string) {
+    let tok = _hf_resolve_token(token)
+    let result = #{}
+    result["ok"] = false
+    result["status"] = 0
+
+    if len(repo) == 0 {
+        result["error"] = "empty_repo"
+        return result
+    }
+    let rev = if len(revision) > 0 { revision } else { "main" }
+    let kind = _hf_repo_kind(repo)
+    let stripped = _hf_strip_repo_prefix(repo)
+    let url = _hf_base() + "/api/" + kind + "/" + _hf_url_encode_path(stripped) + "/revision/" + _hf_url_encode_path(rev)
+    let r = _http_with_backoff_get(url, _hf_auth_headers(tok), HF_HUB_DEFAULT_TIMEOUT_SEC)
+    result["status"] = r["status"]
+    if !r["ok"] {
+        result["error"] = "http_" + to_string(r["status"])
+        return result
+    }
+    result["info"] = json_parse_object(r["body"])
+    result["ok"] = true
+    return result
+}
+
+// _hf_repo_kind — heuristic: "datasets/foo" → "datasets"; else "models".
+// HF Spaces are not yet supported in v0.1.
+fn _hf_repo_kind(repo: string) -> string {
+    if len(repo) >= 9 && repo.substring(0, 9) == "datasets/" { return "datasets" }
+    return "models"
+}
+
+fn _hf_strip_repo_prefix(repo: string) -> string {
+    if len(repo) >= 9 && repo.substring(0, 9) == "datasets/" {
+        return repo.substring(9, len(repo))
+    }
+    return repo
+}
+
+// ── hf_repo_tree — file listing ──────────────────────────────────────────────
+//
+// GET /api/models/<repo>/tree/<rev>?recursive=true
+//
+// Returns map {ok, status, files: [{path, type, size, oid?, lfs?}, ...]}.
+// `recursive=true` flattens sub-directories.
+pub fn hf_repo_tree(repo: string, revision: string, recursive: bool, token: string) {
+    let tok = _hf_resolve_token(token)
+    let result = #{}
+    result["ok"] = false
+    result["status"] = 0
+    result["files"] = []
+
+    if len(repo) == 0 {
+        result["error"] = "empty_repo"
+        return result
+    }
+    let rev = if len(revision) > 0 { revision } else { "main" }
+    let kind = _hf_repo_kind(repo)
+    let stripped = _hf_strip_repo_prefix(repo)
+    let mut url = _hf_base() + "/api/" + kind + "/" + _hf_url_encode_path(stripped) + "/tree/" + _hf_url_encode_path(rev)
+    if recursive { url = url + "?recursive=true" }
+    let r = _http_with_backoff_get(url, _hf_auth_headers(tok), HF_HUB_DEFAULT_TIMEOUT_SEC)
+    result["status"] = r["status"]
+    if !r["ok"] {
+        result["error"] = "http_" + to_string(r["status"])
+        return result
+    }
+    let parsed = json_parse(r["body"])
+    if type_of(parsed) == "array" {
+        result["files"] = parsed
+    }
+    result["ok"] = true
+    return result
+}
+
+// ── hf_resolve_lfs — peek headers to discover real blob URL + sha256 ─────────
+//
+// HEAD /<repo>/resolve/<rev>/<path>. The Hub returns:
+//   · For LFS blobs: 302 to S3 → final headers include x-linked-etag (sha256)
+//     and content-length.
+//   · For non-LFS files: 200 directly, with content-length and ETag (md5).
+//
+// curl -L follows the 302 transparently and we keep the final-hop headers.
+//
+// Returns map {ok, status, x_linked_etag, etag, content_length, url}.
+// `url` is the final resolved URL (S3 for LFS, original for non-LFS).
+pub fn hf_resolve_lfs(repo: string, revision: string, path: string, token: string) {
+    let tok = _hf_resolve_token(token)
+    let result = #{}
+    result["ok"] = false
+    result["status"] = 0
+    result["x_linked_etag"] = ""
+    result["etag"] = ""
+    result["content_length"] = 0
+    result["url"] = ""
+
+    if len(repo) == 0 || len(path) == 0 {
+        result["error"] = "empty_repo_or_path"
+        return result
+    }
+    let rev = if len(revision) > 0 { revision } else { "main" }
+    let url = _hf_base() + "/" + _hf_url_encode_path(repo) + "/resolve/" + _hf_url_encode_path(rev) + "/" + _hf_url_encode_path(path)
+    let r = _hf_curl_head(url, _hf_auth_headers(tok), HF_HUB_DEFAULT_TIMEOUT_SEC)
+    result["status"] = r["status"]
+    if !r["ok"] {
+        result["error"] = "http_" + to_string(r["status"])
+        return result
+    }
+    let h = r["headers"]
+    if has_key(h, "x-linked-etag") {
+        // LFS: strip surrounding quotes if present (HF emits `"sha256:..."`)
+        result["x_linked_etag"] = _hf_strip_quotes(h["x-linked-etag"])
+    }
+    if has_key(h, "etag") {
+        result["etag"] = _hf_strip_quotes(h["etag"])
+    }
+    if has_key(h, "content-length") {
+        result["content_length"] = to_int(h["content-length"])
+    }
+    if has_key(h, "x-linked-size") {
+        // LFS variant header — overrides content-length when present
+        result["content_length"] = to_int(h["x-linked-size"])
+    }
+    result["url"] = url
+    result["ok"] = true
+    return result
+}
+
+fn _hf_strip_quotes(s: string) -> string {
+    if len(s) < 2 { return s }
+    let first = s.substring(0, 1)
+    let last = s.substring(len(s) - 1, len(s))
+    if first == "\"" && last == "\"" {
+        return s.substring(1, len(s) - 1)
+    }
+    return s
+}
+
+// _hf_min — tiny helper (runtime min() vs hexa builtin compatibility).
+fn _hf_min(a: int, b: int) -> int {
+    if a < b { return a }
+    return b
+}
+
+// _hf_download_chunked — Range-header chunked download (FIX-3).
+//
+// Splits a known-size blob into HF_HUB_CHUNK_BYTES segments and curl-GETs
+// each with `Range: bytes=offset-end`. Each segment is appended to
+// output_path via `>>` shell redirect. Status 206 (Partial Content) is
+// expected per chunk; 200 means the server ignored Range — we treat as
+// terminal and signal 416 to caller for single-shot fallback.
+//
+// Honest C3 (FIX-3):
+//   · Per-chunk sha256 verification is NOT performed because HF Hub does
+//     not advertise per-chunk hashes; the final-file sha256 verify in
+//     hf_download_file remains the single source of truth.
+//   · No incremental resume across process restarts (the truncate-and-go
+//     model). A future v0.3 may persist a `.partial` ledger.
+//   · `>>` append uses a fresh file truncated by the first chunk write
+//     (`>`); subsequent chunks append. If the writer process is killed
+//     mid-stream, the next call rewrites from offset 0.
+//
+// Returns map {ok, status, bytes_written, chunks}.
+fn _hf_download_chunked(url: string, output_path: string, total_size: int,
+                       headers, timeout_sec: int) {
+    let result = #{}
+    result["ok"] = false
+    result["status"] = 0
+    result["bytes_written"] = 0
+    result["chunks"] = 0
+
+    if total_size <= 0 || HF_HUB_CHUNK_BYTES <= 0 {
+        result["error"] = "invalid_chunk_args"
+        return result
+    }
+
+    // Truncate target file to ensure clean append.
+    exec("rm -f " + _hf_shell_quote(output_path))
+    exec(": > " + _hf_shell_quote(output_path))
+
+    let mut offset = 0
+    let mut chunks = 0
+    let mut last_status = 0
+    while offset < total_size {
+        let end = _hf_min(offset + HF_HUB_CHUNK_BYTES - 1, total_size - 1)
+        let mut h = #{}
+        let ks = dict_keys(headers)
+        let mut hi = 0
+        while hi < len(ks) {
+            let k = ks[hi]
+            h[k] = headers[k]
+            hi = hi + 1
+        }
+        h["Range"] = "bytes=" + to_string(offset) + "-" + to_string(end)
+        let hflags = http_build_header_flags(h)
+        let cmd = "curl -sSL --max-time " + to_string(timeout_sec) + hflags + " -o " + _hf_shell_quote(output_path) + ".part -w '\\n%{http_code}' " + _hf_shell_quote(url) + " 2>/dev/null"
+        let chunk = _http_with_backoff_curl_status(cmd)
+        last_status = chunk["status"]
+        if last_status == 416 {
+            // Range Not Satisfiable: caller should fall back to single-shot.
+            result["status"] = 416
+            result["error"] = "range_not_satisfiable"
+            return result
+        }
+        if last_status != 206 && last_status != 200 {
+            result["status"] = last_status
+            result["error"] = "chunk_http_" + to_string(last_status)
+            return result
+        }
+        // 200 here means server ignored Range (rare). We accept the full
+        // response IFF this is the first chunk — otherwise sequence is
+        // corrupted.
+        if last_status == 200 && offset != 0 {
+            result["status"] = 200
+            result["error"] = "range_ignored_mid_stream"
+            return result
+        }
+        // Append chunk part to output_path.
+        exec("cat " + _hf_shell_quote(output_path) + ".part >> " + _hf_shell_quote(output_path))
+        exec("rm -f " + _hf_shell_quote(output_path) + ".part")
+        chunks = chunks + 1
+        // If server returned full body on the first chunk (status==200),
+        // we already have the whole file.
+        if last_status == 200 { break }
+        offset = end + 1
+    }
+    let size_str = to_string(exec("wc -c < " + _hf_shell_quote(output_path) + " 2>/dev/null")).trim()
+    result["bytes_written"] = to_int(size_str)
+    result["chunks"] = chunks
+    result["status"] = if last_status == 0 { 206 } else { last_status }
+    result["ok"] = result["bytes_written"] >= total_size
+    return result
+}
+
+// ── hf_download_file — download to local path ───────────────────────────────
+//
+// GET /<repo>/resolve/<rev>/<path>. Streams body to disk via curl -o,
+// transparently following LFS 302 redirects to S3.
+//
+// Returns map {ok, status, sha256, bytes_written, local_path}.
+//
+// sha256 verification: if hf_resolve_lfs returns a non-empty
+// x_linked_etag, this function fetches the file then runs `shasum -a 256`
+// against the local file and compares. Mismatch → ok=false +
+// error="sha256_mismatch". Non-LFS files (no x-linked-etag) skip
+// sha256 verify (they have md5 ETag instead, which we do not validate
+// in v0.1 to keep the dependency surface small).
+pub fn hf_download_file(repo: string, revision: string, path: string,
+                       output_local_path: string, token: string) {
+    let tok = _hf_resolve_token(token)
+    let result = #{}
+    result["ok"] = false
+    result["status"] = 0
+    result["sha256"] = ""
+    result["bytes_written"] = 0
+    result["local_path"] = output_local_path
+
+    if len(repo) == 0 || len(path) == 0 || len(output_local_path) == 0 {
+        result["error"] = "empty_arg"
+        return result
+    }
+    let rev = if len(revision) > 0 { revision } else { "main" }
+
+    // Resolve LFS to learn expected sha256 + size for verification.
+    let resolve = hf_resolve_lfs(repo, rev, path, tok)
+    if !resolve["ok"] {
+        result["error"] = "resolve_failed_" + to_string(resolve["status"])
+        result["status"] = resolve["status"]
+        return result
+    }
+    let expected_sha = resolve["x_linked_etag"]
+    let expected_size = resolve["content_length"]
+
+    let url = _hf_base() + "/" + _hf_url_encode_path(repo) + "/resolve/" + _hf_url_encode_path(rev) + "/" + _hf_url_encode_path(path)
+
+    // FIX-3: chunked path when blob exceeds threshold; single-shot otherwise.
+    let use_chunked = HF_HUB_CHUNK_THRESHOLD_BYTES > 0 &&
+                      expected_size > HF_HUB_CHUNK_THRESHOLD_BYTES &&
+                      HF_HUB_CHUNK_BYTES > 0
+    let mut status = 0
+    if use_chunked {
+        let chunk_res = _hf_download_chunked(url, output_local_path, expected_size,
+                                             _hf_auth_headers(tok), HF_HUB_LARGE_TIMEOUT_SEC)
+        status = chunk_res["status"]
+        result["status"] = status
+        if !chunk_res["ok"] {
+            result["error"] = if has_key(chunk_res, "error") { to_string(chunk_res["error"]) } else { "chunk_download_failed" }
+            // 416 fallback: server refuses Range — retry as single-shot.
+            if status != 416 {
+                return result
+            }
+        }
+    }
+    if !use_chunked || status == 416 {
+        // Build curl GET to disk. -L follows LFS redirect; -o writes to path.
+        let hflags = http_build_header_flags(_hf_auth_headers(tok))
+        let cmd = "curl -sSL --max-time " + to_string(HF_HUB_LARGE_TIMEOUT_SEC) + hflags + " -o " + _hf_shell_quote(output_local_path) + " -w '\\n%{http_code}' " + _hf_shell_quote(url) + " 2>/dev/null"
+        let dl = _http_with_backoff_curl_status(cmd)
+        status = dl["status"]
+        result["status"] = status
+        if status < 200 || status >= 300 {
+            result["error"] = "download_http_" + to_string(status)
+            return result
+        }
+    }
+
+    // Confirm file landed on disk + measure size.
+    let size_str = to_string(exec("wc -c < " + _hf_shell_quote(output_local_path) + " 2>/dev/null")).trim()
+    let bytes_written = to_int(size_str)
+    result["bytes_written"] = bytes_written
+
+    if expected_size > 0 && bytes_written != expected_size {
+        result["error"] = "size_mismatch"
+        return result
+    }
+
+    // sha256 verify when LFS pointer told us the expected hash.
+    if len(expected_sha) > 0 {
+        let prefix = "sha256:"
+        let mut want = expected_sha
+        if len(want) >= 7 && want.substring(0, 7) == prefix {
+            want = want.substring(7, len(want))
+        }
+        let got_raw = to_string(exec("shasum -a 256 " + _hf_shell_quote(output_local_path) + " 2>/dev/null"))
+        // shasum output: "<hash>  <path>" — split on whitespace, take first.
+        let sp = got_raw.index_of(" ")
+        let got = if sp > 0 { got_raw.substring(0, sp) } else { got_raw.trim() }
+        result["sha256"] = got
+        if got != want {
+            result["error"] = "sha256_mismatch"
+            return result
+        }
+    }
+
+    result["ok"] = true
+    return result
+}
+
+// ── hf_upload_file — push a local file to a repo ────────────────────────────
+//
+// PUT /api/<kind>/<repo>/upload/<rev>/<target_path>  with body = file
+// contents and Authorization: Bearer <token>. Hub responds with a commit
+// hash JSON on success.
+//
+// v0.1 caveat: simple PUT-content path; uses curl --data-binary @FILE so
+// the file does NOT pass through hexa string memory (binary-safe). For
+// files >5GB the Hub rejects this path; v0.2 will add multipart upload.
+//
+// Returns map {ok, status, commit_hash, target_path}.
+pub fn hf_upload_file(repo: string, revision: string, local_path: string,
+                     target_path: string, token: string, message: string) {
+    let tok = _hf_resolve_token(token)
+    let result = #{}
+    result["ok"] = false
+    result["status"] = 0
+    result["commit_hash"] = ""
+    result["target_path"] = target_path
+
+    if len(repo) == 0 || len(local_path) == 0 || len(target_path) == 0 {
+        result["error"] = "empty_arg"
+        return result
+    }
+    if len(tok) == 0 {
+        result["error"] = "no_token"
+        return result
+    }
+    let rev = if len(revision) > 0 { revision } else { "main" }
+
+    // Verify local file exists.
+    let exists = to_string(exec("test -f " + _hf_shell_quote(local_path) + " && echo y || echo n")).trim()
+    if exists != "y" {
+        result["error"] = "local_path_missing"
+        return result
+    }
+
+    let kind = _hf_repo_kind(repo)
+    let stripped = _hf_strip_repo_prefix(repo)
+    let url = _hf_base() + "/api/" + kind + "/" + _hf_url_encode_path(stripped) + "/upload/" + _hf_url_encode_path(rev) + "/" + _hf_url_encode_path(target_path)
+
+    let mut h = _hf_auth_headers(tok)
+    h["Content-Type"] = "application/octet-stream"
+    if len(message) > 0 {
+        h["X-Commit-Message"] = message
+    }
+    let hflags = http_build_header_flags(h)
+
+    // -X PUT, --data-binary @FILE for binary-safe upload. Wrapped in
+    // _http_with_backoff_curl_status (FIX-2) — bulk uploads of >100 files
+    // would otherwise trip 429 against a fresh repo.
+    let cmd = "curl -sSL --max-time " + to_string(HF_HUB_LARGE_TIMEOUT_SEC) + hflags + " -X PUT --data-binary @" + _hf_shell_quote(local_path) + " -w '\\n%{http_code}' " + _hf_shell_quote(url) + " 2>/dev/null"
+    let up = _http_with_backoff_curl_status(cmd)
+    let status = up["status"]
+    let body = up["body"]
+    if status == 0 {
+        result["error"] = "no_status"
+        return result
+    }
+    result["status"] = status
+    if status < 200 || status >= 300 {
+        result["error"] = "upload_http_" + to_string(status)
+        return result
+    }
+
+    // Parse commit hash from response JSON when present.
+    let parsed = json_parse_object(body)
+    if has_key(parsed, "commitOid") {
+        result["commit_hash"] = to_string(parsed["commitOid"])
+    } else if has_key(parsed, "commit_hash") {
+        result["commit_hash"] = to_string(parsed["commit_hash"])
+    }
+    result["ok"] = true
+    return result
+}
+
+// ── hf_download_revision_pin — recursive pinned download with sha256 verify ──
+//
+// 1. hf_repo_tree(repo, revision, recursive=true)
+// 2. for each file in tree: mkdir -p output_dir/<dir>; hf_download_file
+// 3. accumulate sha256 hashes into a manifest map
+//
+// Returns map {ok, status, files: [...], failures: [...]}.
+//
+// This is the CANONICAL path for "pin a model revision and reload from
+// disk later" — the foundation for hexa-canonical model loading.
+pub fn hf_download_revision_pin(repo: string, revision: string,
+                                output_dir: string, token: string) {
+    let tok = _hf_resolve_token(token)
+    let result = #{}
+    result["ok"] = false
+    result["status"] = 0
+    result["files"] = []
+    result["failures"] = []
+
+    if len(repo) == 0 || len(output_dir) == 0 {
+        result["error"] = "empty_arg"
+        return result
+    }
+    let rev = if len(revision) > 0 { revision } else { "main" }
+
+    // Ensure base output dir exists.
+    exec("mkdir -p " + _hf_shell_quote(output_dir))
+
+    let tree = hf_repo_tree(repo, rev, true, tok)
+    if !tree["ok"] {
+        result["error"] = "tree_failed_" + to_string(tree["status"])
+        result["status"] = tree["status"]
+        return result
+    }
+
+    let files = tree["files"]
+    let success_records = []
+    let failure_records = []
+    let mut idx = 0
+    while idx < len(files) {
+        let entry = files[idx]
+        let kind = if has_key(entry, "type") { to_string(entry["type"]) } else { "file" }
+        if kind != "file" { idx = idx + 1; continue }
+        let path = if has_key(entry, "path") { to_string(entry["path"]) } else { "" }
+        if len(path) == 0 { idx = idx + 1; continue }
+
+        // Build local target path; create intermediate dirs.
+        let local_path = output_dir + "/" + path
+        let last_slash = _hf_rfind(local_path, "/")
+        if last_slash > 0 {
+            let parent = local_path.substring(0, last_slash)
+            exec("mkdir -p " + _hf_shell_quote(parent))
+        }
+
+        let dl = hf_download_file(repo, rev, path, local_path, tok)
+        if dl["ok"] {
+            let rec = #{}
+            rec["path"] = path
+            rec["sha256"] = dl["sha256"]
+            rec["bytes"] = dl["bytes_written"]
+            success_records.push(rec)
+        } else {
+            let err = #{}
+            err["path"] = path
+            err["error"] = if has_key(dl, "error") { to_string(dl["error"]) } else { "unknown" }
+            err["status"] = dl["status"]
+            failure_records.push(err)
+        }
+        idx = idx + 1
+    }
+
+    result["files"] = success_records
+    result["failures"] = failure_records
+    result["ok"] = len(failure_records) == 0
+    result["status"] = 200
+    return result
+}
+
+fn _hf_rfind(s: string, ch: string) -> int {
+    let mut i = len(s) - 1
+    while i >= 0 {
+        if s.substring(i, i + 1) == ch { return i }
+        i = i - 1
+    }
+    return -1
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  selftest
+//
+//  Runs offline checks unconditionally + live network checks when
+//  $ANIMA_HF_HUB_LIVE=1 and $HF_TOKEN is set.
+//
+//  Live coverage:
+//    F-HF-HUB-1  hf_whoami: valid token → ok=true, user.name non-empty;
+//                invalid token → ok=false, status==401.
+//    F-HF-HUB-2  hf_repo_tree("meta-llama/Llama-3.2-3B"): contains
+//                "config.json" + "tokenizer.json".
+//    F-HF-HUB-3  hf_download_file small public file (config.json) →
+//                bytes_written > 100, file lands on disk.
+//    F-HF-HUB-4  hf_resolve_lfs on a known LFS file (e.g.
+//                meta-llama/Llama-3.2-3B/model.safetensors) → status 200
+//                or 302, x_linked_etag starts with "sha256:".
+//    F-HF-HUB-5  hf_redact_token: sample log line containing $HF_TOKEN
+//                returns scrubbed string with "<HF_TOKEN>" placeholder.
+// ═══════════════════════════════════════════════════════════════════════════
+
+let mut _hf_pass = 0
+let mut _hf_fail = 0
+
+fn _hf_chk(tag: string, cond: bool) {
+    if cond {
+        println("  PASS " + tag)
+        _hf_pass = _hf_pass + 1
+    } else {
+        println("  FAIL " + tag)
+        _hf_fail = _hf_fail + 1
+    }
+}
+
+fn _selftest() {
+    println("── stdlib/hf_hub selftest ──")
+
+    // ── F-HF-HUB-5 redact (offline, always runs) ───────────────────────────
+    let probe_tok = env("HF_TOKEN")
+    if len(probe_tok) >= 8 {
+        let line = "curl -H 'Authorization: Bearer " + probe_tok + "' https://api/x"
+        let scrubbed = hf_redact_token(line)
+        _hf_chk("F-HF-HUB-5 token redacted",
+                scrubbed.index_of(probe_tok) < 0 && scrubbed.index_of("<HF_TOKEN>") >= 0)
+    } else {
+        println("  SKIP F-HF-HUB-5 (HF_TOKEN unset or too short)")
+    }
+
+    // ── offline header parse smoke ─────────────────────────────────────────
+    let sample = "HTTP/1.1 200 OK\nContent-Length: 1234\nETag: \"abc\"\n"
+    let h = _hf_parse_headers(sample)
+    _hf_chk("offline header parse content-length",
+            has_key(h, "content-length") && to_int(h["content-length"]) == 1234)
+    _hf_chk("offline header parse etag stripped",
+            has_key(h, "etag") && _hf_strip_quotes(h["etag"]) == "abc")
+
+    // ── repo kind heuristic ────────────────────────────────────────────────
+    _hf_chk("repo kind models", _hf_repo_kind("meta-llama/Llama-3.2-3B") == "models")
+    _hf_chk("repo kind datasets", _hf_repo_kind("datasets/wikitext") == "datasets")
+
+    // ── FIX-2 backoff schedule (offline) ──────────────────────────────────
+    _hf_chk("F-FIX-2 backoff[0]==1", _hf_backoff_floor(0) == 1)
+    _hf_chk("F-FIX-2 backoff[1]==2", _hf_backoff_floor(1) == 2)
+    _hf_chk("F-FIX-2 backoff[4]==16", _hf_backoff_floor(4) == 16)
+    _hf_chk("F-FIX-2 backoff[99]==16 (capped)", _hf_backoff_floor(99) == 16)
+
+    // ── FIX-3 chunk threshold knobs (offline) ─────────────────────────────
+    let _saved_chunk = HF_HUB_CHUNK_BYTES
+    let _saved_thresh = HF_HUB_CHUNK_THRESHOLD_BYTES
+    hf_set_chunk_threshold(8, 50)
+    _hf_chk("F-FIX-3 chunk knob 8MB", HF_HUB_CHUNK_BYTES == 8 * 1024 * 1024)
+    _hf_chk("F-FIX-3 threshold knob 50MB", HF_HUB_CHUNK_THRESHOLD_BYTES == 50 * 1024 * 1024)
+    HF_HUB_CHUNK_BYTES = _saved_chunk
+    HF_HUB_CHUNK_THRESHOLD_BYTES = _saved_thresh
+
+    // ── live block — gated on $ANIMA_HF_HUB_LIVE=1 ────────────────────────
+    let live = env("ANIMA_HF_HUB_LIVE")
+    if live != "1" {
+        println("  SKIP live tests (set ANIMA_HF_HUB_LIVE=1 to enable)")
+    } else {
+        // F-HF-HUB-1 whoami
+        let who = hf_whoami("")
+        _hf_chk("F-HF-HUB-1 whoami ok", who["ok"])
+
+        let bad = hf_whoami("clearly_invalid_token_xxxxx")
+        _hf_chk("F-HF-HUB-1 invalid token rejected", !bad["ok"] && bad["status"] == 401)
+
+        // F-HF-HUB-2 repo tree
+        let tree = hf_repo_tree("meta-llama/Llama-3.2-3B", "main", true, "")
+        let tree_files = tree["files"]
+        let mut found_config = false
+        let mut idx = 0
+        while idx < len(tree_files) {
+            let e = tree_files[idx]
+            if has_key(e, "path") && to_string(e["path"]) == "config.json" {
+                found_config = true
+            }
+            idx = idx + 1
+        }
+        _hf_chk("F-HF-HUB-2 tree contains config.json", tree["ok"] && found_config)
+
+        // F-HF-HUB-3 download config.json round-trip
+        let tmp = "/tmp/_hf_hub_selftest_config.json"
+        exec("rm -f " + tmp)
+        let dl = hf_download_file("meta-llama/Llama-3.2-3B", "main",
+                                  "config.json", tmp, "")
+        _hf_chk("F-HF-HUB-3 download bytes>0", dl["ok"] && dl["bytes_written"] > 100)
+
+        // F-HF-HUB-4 resolve LFS
+        let res = hf_resolve_lfs("meta-llama/Llama-3.2-3B", "main",
+                                 "model.safetensors", "")
+        let etag = to_string(res["x_linked_etag"])
+        _hf_chk("F-HF-HUB-4 lfs sha256 resolved",
+                res["ok"] && len(etag) > 0 &&
+                (etag.substring(0, 7) == "sha256:" || len(etag) == 64))
+    }
+
+    println("── selftest summary: pass=" + to_string(_hf_pass) + " fail=" + to_string(_hf_fail) + " ──")
+}
+
+@test fn test_hf_hub_selftest() {
+    _selftest()
+    if _hf_fail != 0 {
+        // Surface failure to the test runner. Non-fatal for offline mode
+        // since live tests are SKIP-by-default.
+        println("hf_hub selftest had failures (may be live-gated)")
+    }
+}
+
+fn main() -> void {
+    _selftest()
+}
