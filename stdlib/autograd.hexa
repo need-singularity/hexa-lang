@@ -1,195 +1,333 @@
-// HEXA Standard Library — autograd
+// HEXA Standard Library — autograd (tensor-valued, F-AUTOGRAD-T2 / B4 over B3)
 //
-// @module(slug="stdlib-autograd", desc="tape-based dynamic autograd (PyTorch-style)")
-// @usage(import stdlib/autograd; let x = ag_var(1.5); let y = ag_add(ag_pow(x,2), ag_sin(x)); ag_backward(y); ag_grad(x))
+// @module(slug="stdlib-autograd", desc="tape-based dynamic autograd over stdlib/tensor Tensors")
+// @usage(import stdlib/autograd; let x = ag_var(tensor_from_array([4],[1.0,2.0,3.0,4.0])); let y = ag_add(ag_mul(x,x), ag_sin(x)); ag_backward(y); ag_grad(x))
 //
 // ── module governance metadata ───────────────────────────────────
-// @version 0.1.0
+// @version 0.2.0
 // @capabilities [ag_var, ag_const, ag_add, ag_mul, ag_sub, ag_neg, ag_pow,
-//                ag_sin, ag_cos, ag_exp, ag_backward, ag_grad, ag_value,
-//                ag_zero_grad, ag_tape_reset, ag_tape_size,
-//                ag_finite_difference]
+//                ag_sin, ag_cos, ag_exp, ag_matmul, ag_backward, ag_grad,
+//                ag_value, ag_zero_grad, ag_tape_reset, ag_tape_size]
 // @stability experimental
 // @since 2026-05-04
 // @maintainer anima-core
 // @priority P2
 // @roadmap F-AUTOGRAD-T2
 //
-// ── DESIGN (one paragraph) ───────────────────────────────────────
-// Tape = global flat array of nodes. Each node is a dict holding {op,
-// parents:[int], saved:[float], val:float, grad:float, is_leaf:bool,
-// requires_grad:bool}. A Tensor handle is a thin dict {id, val,
-// requires_grad, is_leaf} returned by every op. Forward ops append a
-// node and stash whatever the backward closure equivalent needs in
-// `saved` (e.g. for mul we save the two parent values, for pow we save
-// the base and exponent, for sin we save x). `ag_backward(y)` seeds
-// grad[y.id]=1.0 then iterates the tape from y.id down to 0, dispatching
-// on `op` to push grad contributions onto each parent (`grad_accum`).
-// Leaves accumulate grads (PyTorch semantics: multiple uses sum); we
-// never write to a leaf's grad from anywhere except this reverse walk,
-// and `ag_grad(t)` for non-leaves returns the intermediate grad without
-// cross-coupling. Higher-order grads are NOT supported (saved values
-// are floats, not tape nodes); use finite-differences for second
-// derivatives or extend `_tape_node` `saved` to hold tensor IDs.
+// ── DESIGN ───────────────────────────────────────────────────────
+// Tape = global flat array of nodes. Each node holds:
+//   { op, parents:[int], saved:[int], tensor:Tensor, grad:Tensor,
+//     is_leaf:bool, requires_grad:bool }
+// The forward pass appends a node and stashes the *tape ids* of any
+// forward intermediates the local jacobian needs (for mul we save both
+// parent ids; for pow we save the parent id and the exponent inline as
+// a 1-elt scalar tensor stored on a synthetic const node; for sin/cos
+// we save the input id; for exp we save the OUTPUT id since
+// d/dx exp(x) = exp(x)). Saving *ids* (not values) lets backward look up
+// fresh Tensors from the tape — required because saved values are now
+// rank>0 tensors, not scalars.
 //
-// ── Tensor stub (TODO: replace with stdlib/tensor.hexa, Track B3) ──
-//   This module currently models scalar Tensors. The Tensor surface
-//   we depend on is: { val: float, shape: [int], add, mul, sin, pow }.
-//   stdlib/tensor.hexa is being authored in a parallel track; once
-//   available, swap the scalar wrappers below to call into the
-//   N-d tensor primitives and broadcast the saved values.
+// Backward seeds dy/dy = ones_like(y) and walks the tape from y.id to 0
+// dispatching on op. Each parent grad is accumulated by elementwise add.
+// Leaves vs intermediates are distinguished by is_leaf; only this reverse
+// walk writes grads.
+//
+// SCOPE / LIMITATIONS (intentionally allowed):
+//   * Elementwise ops require operands of identical shape — broadcasting
+//     beyond what tensor_add_ref supports is not exercised by the
+//     differentiated kernels (mul/sub/sin/cos/exp/pow are strictly
+//     elementwise here).
+//   * No in-place ops.
+//   * No higher-order grads. saved holds tape ids of forward intermediates,
+//     but backward computes locals with raw arithmetic — not via the tape.
+//   * Matmul backward implemented for rank-2 only (uses tensor_transpose2d).
+//
+// ── Import idiom ─────────────────────────────────────────────────
+// Callers using `use "stdlib/autograd"` get this file's symbols only.
+// stdlib/tensor primitives must be imported alongside (interp does not
+// chain transitive imports):
+//
+//   use "stdlib/tensor/mod"
+//   use "stdlib/tensor/shape"
+//   use "stdlib/tensor/ops"
+//   use "stdlib/autograd"
+//
+// Cross-link: F-AUTOGRAD-T2 in .roadmap.stdlib (peer SSOT).
 
 // ── Tape state (module-global) ────────────────────────────────────
 let mut _tape = []
 
-// _tape_size — number of recorded nodes.
 pub fn ag_tape_size() -> int {
     return len(_tape)
 }
 
-// ag_tape_reset — clears the tape. Call between independent computations.
-// Existing Tensor handles become invalid afterwards.
 pub fn ag_tape_reset() {
     _tape = []
 }
 
-// _make_node — append a new node, return its id.
-fn _make_node(op: string, parents, saved, val: float, is_leaf: bool, requires_grad: bool) -> int {
+// ── Internal helpers (elementwise tensor ops) ─────────────────────
+//
+// These are private to autograd. They assume identical shapes between
+// operands and operate over the flat data buffer. tensor_add_ref from
+// stdlib/tensor/ops.hexa is reused for forward + backward grad accum
+// (it supports broadcasting, but here we always feed equal shapes).
+
+fn _zeros_like(t: Tensor) -> Tensor {
+    return tensor_zeros_shape(t.shape)
+}
+
+fn _ones_like(t: Tensor) -> Tensor {
+    return tensor_ones_shape(t.shape)
+}
+
+// Elementwise mul. Identical-shape only.
+fn _ew_mul(A: Tensor, B: Tensor) -> Tensor {
+    let n = tensor_size(A.shape)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out.push(A.data[i] * B.data[i])
+        i = i + 1
+    }
+    return Tensor { shape: A.shape, dtype: A.dtype, data: out }
+}
+
+// Elementwise sub. Identical-shape only.
+fn _ew_sub(A: Tensor, B: Tensor) -> Tensor {
+    let n = tensor_size(A.shape)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out.push(A.data[i] - B.data[i])
+        i = i + 1
+    }
+    return Tensor { shape: A.shape, dtype: A.dtype, data: out }
+}
+
+// Elementwise negate.
+fn _ew_neg(A: Tensor) -> Tensor {
+    let n = tensor_size(A.shape)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out.push(0.0 - A.data[i])
+        i = i + 1
+    }
+    return Tensor { shape: A.shape, dtype: A.dtype, data: out }
+}
+
+// Elementwise scalar mul (every elt times scalar k).
+fn _ew_scale(A: Tensor, k: float) -> Tensor {
+    let n = tensor_size(A.shape)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out.push(A.data[i] * k)
+        i = i + 1
+    }
+    return Tensor { shape: A.shape, dtype: A.dtype, data: out }
+}
+
+// Elementwise sin/cos/exp.
+fn _ew_sin(A: Tensor) -> Tensor {
+    let n = tensor_size(A.shape)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out.push(sin(A.data[i]))
+        i = i + 1
+    }
+    return Tensor { shape: A.shape, dtype: A.dtype, data: out }
+}
+
+fn _ew_cos(A: Tensor) -> Tensor {
+    let n = tensor_size(A.shape)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out.push(cos(A.data[i]))
+        i = i + 1
+    }
+    return Tensor { shape: A.shape, dtype: A.dtype, data: out }
+}
+
+fn _ew_exp(A: Tensor) -> Tensor {
+    let n = tensor_size(A.shape)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out.push(exp(A.data[i]))
+        i = i + 1
+    }
+    return Tensor { shape: A.shape, dtype: A.dtype, data: out }
+}
+
+// Elementwise a^p with float exponent (uses runtime `pow`).
+fn _ew_pow(A: Tensor, p: float) -> Tensor {
+    let n = tensor_size(A.shape)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out.push(pow(A.data[i], p))
+        i = i + 1
+    }
+    return Tensor { shape: A.shape, dtype: A.dtype, data: out }
+}
+
+// ── Tape helpers ──────────────────────────────────────────────────
+fn _make_node(op: string, parents, saved, tensor: Tensor, is_leaf: bool, requires_grad: bool) -> int {
     let id = len(_tape)
     let node = #{}
     node["op"] = op
     node["parents"] = parents
     node["saved"] = saved
-    node["val"] = val
-    node["grad"] = 0.0
+    node["tensor"] = tensor
+    node["grad"] = _zeros_like(tensor)
     node["is_leaf"] = is_leaf
     node["requires_grad"] = requires_grad
+    // pow stores the exponent as a node-level scalar (separate from saved
+    // ids so backward can read it without a tensor lookup).
+    node["pow_exp"] = 0.0
     _tape = _tape + [node]
     return id
 }
 
-// _make_tensor — assemble the lightweight Tensor handle returned to users.
-fn _make_tensor(id: int, val: float, requires_grad: bool, is_leaf: bool) {
-    let t = #{}
-    t["id"] = id
-    t["val"] = val
-    t["requires_grad"] = requires_grad
-    t["is_leaf"] = is_leaf
-    return t
+fn _make_handle(id: int, tensor: Tensor, requires_grad: bool, is_leaf: bool) {
+    let h = #{}
+    h["id"] = id
+    h["tensor"] = tensor
+    h["requires_grad"] = requires_grad
+    h["is_leaf"] = is_leaf
+    return h
+}
+
+fn _tape_get(id: int) -> Tensor {
+    let node = _tape[id]
+    return node["tensor"]
 }
 
 // ── Public constructors ───────────────────────────────────────────
 
-// ag_var — create a leaf Tensor with requires_grad=true.
-pub fn ag_var(v) {
-    let val = to_float(v)
-    let id = _make_node("leaf", [], [], val, true, true)
-    return _make_tensor(id, val, true, true)
+// ag_var — leaf with requires_grad=true.
+pub fn ag_var(t: Tensor) {
+    let id = _make_node("leaf", [], [], t, true, true)
+    return _make_handle(id, t, true, true)
 }
 
-// ag_const — create a leaf Tensor with requires_grad=false (constant).
-pub fn ag_const(v) {
-    let val = to_float(v)
-    let id = _make_node("const", [], [], val, true, false)
-    return _make_tensor(id, val, false, true)
+// ag_const — leaf with requires_grad=false (constant).
+pub fn ag_const(t: Tensor) {
+    let id = _make_node("const", [], [], t, true, false)
+    return _make_handle(id, t, false, true)
 }
 
 // ── Forward ops ───────────────────────────────────────────────────
 
-// ag_add — y = a + b
+// ag_add — y = a + b (elementwise; uses stdlib tensor_add_ref).
 pub fn ag_add(a, b) {
-    let av = a["val"]
-    let bv = b["val"]
-    let val = av + bv
+    let av = a["tensor"]
+    let bv = b["tensor"]
+    let val = tensor_add_ref(av, bv)
     let req = a["requires_grad"] || b["requires_grad"]
     let id = _make_node("add", [a["id"], b["id"]], [], val, false, req)
-    return _make_tensor(id, val, req, false)
+    return _make_handle(id, val, req, false)
 }
 
-// ag_sub — y = a - b
+// ag_sub — y = a - b (elementwise; identical-shape).
 pub fn ag_sub(a, b) {
-    let val = a["val"] - b["val"]
+    let av = a["tensor"]
+    let bv = b["tensor"]
+    let val = _ew_sub(av, bv)
     let req = a["requires_grad"] || b["requires_grad"]
     let id = _make_node("sub", [a["id"], b["id"]], [], val, false, req)
-    return _make_tensor(id, val, req, false)
+    return _make_handle(id, val, req, false)
 }
 
-// ag_neg — y = -a
+// ag_neg — y = -a.
 pub fn ag_neg(a) {
-    let val = -a["val"]
+    let val = _ew_neg(a["tensor"])
     let req = a["requires_grad"]
     let id = _make_node("neg", [a["id"]], [], val, false, req)
-    return _make_tensor(id, val, req, false)
+    return _make_handle(id, val, req, false)
 }
 
-// ag_mul — y = a * b ;  saved=[av, bv] (needed by both partials).
+// ag_mul — y = a * b elementwise.  saved=[a.id, b.id].
 pub fn ag_mul(a, b) {
-    let av = a["val"]
-    let bv = b["val"]
-    let val = av * bv
+    let av = a["tensor"]
+    let bv = b["tensor"]
+    let val = _ew_mul(av, bv)
     let req = a["requires_grad"] || b["requires_grad"]
-    let id = _make_node("mul", [a["id"], b["id"]], [av, bv], val, false, req)
-    return _make_tensor(id, val, req, false)
+    let id = _make_node("mul", [a["id"], b["id"]], [a["id"], b["id"]], val, false, req)
+    return _make_handle(id, val, req, false)
 }
 
 // ag_pow — y = a^p, p is a float exponent (constant w.r.t. autograd).
-//   d/da a^p = p * a^(p-1).  saved=[av, p].
+//   d/da a^p = p * a^(p-1).  saved=[a.id]; pow_exp stores p.
 pub fn ag_pow(a, p) {
-    let av = a["val"]
+    let av = a["tensor"]
     let pf = to_float(p)
-    let val = pow(av, pf)
+    let val = _ew_pow(av, pf)
     let req = a["requires_grad"]
-    let id = _make_node("pow", [a["id"]], [av, pf], val, false, req)
-    return _make_tensor(id, val, req, false)
+    let id = _make_node("pow", [a["id"]], [a["id"]], val, false, req)
+    let mut node = _tape[id]
+    node["pow_exp"] = pf
+    _tape[id] = node
+    return _make_handle(id, val, req, false)
 }
 
-// ag_sin — y = sin(a).  d/da sin(a) = cos(a).  saved=[av].
+// ag_sin — saved=[a.id].
 pub fn ag_sin(a) {
-    let av = a["val"]
-    let val = sin(av)
+    let av = a["tensor"]
+    let val = _ew_sin(av)
     let req = a["requires_grad"]
-    let id = _make_node("sin", [a["id"]], [av], val, false, req)
-    return _make_tensor(id, val, req, false)
+    let id = _make_node("sin", [a["id"]], [a["id"]], val, false, req)
+    return _make_handle(id, val, req, false)
 }
 
-// ag_cos — y = cos(a).  d/da cos(a) = -sin(a).  saved=[av].
+// ag_cos — saved=[a.id].
 pub fn ag_cos(a) {
-    let av = a["val"]
-    let val = cos(av)
+    let av = a["tensor"]
+    let val = _ew_cos(av)
     let req = a["requires_grad"]
-    let id = _make_node("cos", [a["id"]], [av], val, false, req)
-    return _make_tensor(id, val, req, false)
+    let id = _make_node("cos", [a["id"]], [a["id"]], val, false, req)
+    return _make_handle(id, val, req, false)
 }
 
-// ag_exp — y = exp(a).  d/da exp(a) = exp(a) = y.  saved=[val].
+// ag_exp — saved=[output_id]; d/dx exp(x) = exp(x) = y.
 pub fn ag_exp(a) {
-    let av = a["val"]
-    let val = exp(av)
+    let av = a["tensor"]
+    let val = _ew_exp(av)
     let req = a["requires_grad"]
-    let id = _make_node("exp", [a["id"]], [val], val, false, req)
-    return _make_tensor(id, val, req, false)
+    // We need to know our own id to save it; we know it before _make_node:
+    let out_id = len(_tape)
+    let id = _make_node("exp", [a["id"]], [out_id], val, false, req)
+    return _make_handle(id, val, req, false)
+}
+
+// ag_matmul — y = A @ B (rank-2). saved=[a.id, b.id].
+pub fn ag_matmul(a, b) {
+    let av = a["tensor"]
+    let bv = b["tensor"]
+    let val = tensor_matmul_ref(av, bv)
+    let req = a["requires_grad"] || b["requires_grad"]
+    let id = _make_node("matmul", [a["id"], b["id"]], [a["id"], b["id"]], val, false, req)
+    return _make_handle(id, val, req, false)
 }
 
 // ── Backward pass ─────────────────────────────────────────────────
-
-// _accumulate — push contribution `g` into node `nid`'s grad slot.
-// Uniform path: leaves and intermediates both accumulate; the leaf flag
-// only constrains that nothing OUTSIDE this function touches grads
-// (callers see the accumulated value via ag_grad).
-fn _accumulate(nid: int, g: float) {
+fn _accumulate(nid: int, g: Tensor) {
     let node = _tape[nid]
     if !node["requires_grad"] { return }
-    node["grad"] = node["grad"] + g
+    let cur = node["grad"]
+    node["grad"] = tensor_add_ref(cur, g)
     _tape[nid] = node
 }
 
-// ag_backward — seed dy/dy = 1.0 at `y` and walk tape in reverse.
-// Only nodes with id <= y.id contribute (later nodes don't influence y).
+// ag_backward — seed dy/dy = ones_like(y) and walk tape in reverse from y.id.
 pub fn ag_backward(y) {
     let yid = y["id"]
     // seed
     let mut yn = _tape[yid]
-    yn["grad"] = yn["grad"] + 1.0
+    yn["grad"] = _ones_like(yn["tensor"])
     _tape[yid] = yn
 
     let mut i = yid
@@ -209,29 +347,37 @@ pub fn ag_backward(y) {
                 _accumulate(parents[1], g)
             } else if op == "sub" {
                 _accumulate(parents[0], g)
-                _accumulate(parents[1], -g)
+                _accumulate(parents[1], _ew_neg(g))
             } else if op == "neg" {
-                _accumulate(parents[0], -g)
+                _accumulate(parents[0], _ew_neg(g))
             } else if op == "mul" {
-                let av = saved[0]
-                let bv = saved[1]
-                _accumulate(parents[0], g * bv)
-                _accumulate(parents[1], g * av)
+                let av = _tape_get(saved[0])
+                let bv = _tape_get(saved[1])
+                _accumulate(parents[0], _ew_mul(g, bv))
+                _accumulate(parents[1], _ew_mul(g, av))
             } else if op == "pow" {
-                let av = saved[0]
-                let pf = saved[1]
+                let av = _tape_get(saved[0])
+                let pf = node["pow_exp"]
                 // d/da a^p = p * a^(p-1)
-                let dlocal = pf * pow(av, pf - 1.0)
-                _accumulate(parents[0], g * dlocal)
+                let dlocal = _ew_scale(_ew_pow(av, pf - 1.0), pf)
+                _accumulate(parents[0], _ew_mul(g, dlocal))
             } else if op == "sin" {
-                let av = saved[0]
-                _accumulate(parents[0], g * cos(av))
+                let av = _tape_get(saved[0])
+                _accumulate(parents[0], _ew_mul(g, _ew_cos(av)))
             } else if op == "cos" {
-                let av = saved[0]
-                _accumulate(parents[0], g * (-sin(av)))
+                let av = _tape_get(saved[0])
+                _accumulate(parents[0], _ew_mul(g, _ew_neg(_ew_sin(av))))
             } else if op == "exp" {
-                let yv = saved[0]
-                _accumulate(parents[0], g * yv)
+                let yv = _tape_get(saved[0])
+                _accumulate(parents[0], _ew_mul(g, yv))
+            } else if op == "matmul" {
+                // y = A @ B   →   dA = g @ Bᵀ ;   dB = Aᵀ @ g
+                let av = _tape_get(saved[0])
+                let bv = _tape_get(saved[1])
+                let bT = tensor_transpose2d(bv)
+                let aT = tensor_transpose2d(av)
+                _accumulate(parents[0], tensor_matmul_ref(g, bT))
+                _accumulate(parents[1], tensor_matmul_ref(aT, g))
             } else {
                 // unknown op — silent no-op (defensive).
             }
@@ -240,36 +386,28 @@ pub fn ag_backward(y) {
     }
 }
 
-// ag_grad — read accumulated grad for tensor t.
-pub fn ag_grad(t) -> float {
+// ag_grad — read accumulated grad Tensor for handle t.
+pub fn ag_grad(t) -> Tensor {
     let id = t["id"]
     let node = _tape[id]
     return node["grad"]
 }
 
-// ag_value — read forward value for tensor t.
-pub fn ag_value(t) -> float {
-    return t["val"]
+// ag_value — read forward Tensor for handle t.
+pub fn ag_value(t) -> Tensor {
+    return t["tensor"]
 }
 
-// ag_zero_grad — zero out grads on the tape (e.g. between training steps).
-// Does NOT free tape memory — use ag_tape_reset for that.
+// ag_zero_grad — reset all node grads to zeros_like(node.tensor).
 pub fn ag_zero_grad() {
     let n = len(_tape)
     let mut i = 0
     while i < n {
         let node = _tape[i]
-        node["grad"] = 0.0
+        node["grad"] = _zeros_like(node["tensor"])
         _tape[i] = node
         i = i + 1
     }
-}
-
-// ── Numerical derivative helper (used by selftest + sanity checks) ──
-// ag_finite_difference — central difference: (f(x+h) - f(x-h)) / (2h).
-// `f` must be a unary float→float function.
-pub fn ag_finite_difference(f, x: float, h: float) -> float {
-    return (f(x + h) - f(x - h)) / (2.0 * h)
 }
 
 println("[autograd loaded]")
