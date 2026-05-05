@@ -30,6 +30,105 @@ static void _hexa_init_stdio(void) {
 }
 
 // ═══════════════════════════════════════════════════════════
+//  PATH augmentation for macOS — Homebrew / MacPorts visibility
+// ═══════════════════════════════════════════════════════════
+//
+// Background: hexa modules call exec("timeout 30 ...") / exec("python3 -c ...")
+// expecting that subshells (popen → /bin/sh -c) can find binaries on the
+// operator's normal PATH. On macOS, common operator tools (timeout, gtimeout,
+// python3, qrencode, jq, ripgrep, ...) live under /opt/homebrew/bin (Apple
+// Silicon) or /usr/local/bin (Intel + linuxbrew). When hexa is invoked from a
+// context where the parent's PATH was sanitized (launchd, cron, system
+// services that bypass the user shell, or any caller that exec'd hexa with a
+// minimal env), popen() faithfully passes that minimal PATH through to
+// /bin/sh, and "timeout" / "python3" disappear — surfacing as silent failures
+// or 127 exit codes inside hexa modules.
+//
+// Pragmatic root-cause fix: on macOS, pre-pend the standard package-manager
+// prefixes to PATH at runtime startup so every popen()/fork+exec child
+// inherits a path that can resolve the operator's everyday tools. This
+// matches what an interactive shell startup (zsh + /etc/zprofile + path_helper)
+// would do, except we apply it inside the hexa process even when launched
+// from a non-shell parent. Linux is left untouched (its FHS layout already
+// has /usr/local/bin in the default PATH on most distros, and Homebrew on
+// Linux installs to /home/linuxbrew/.linuxbrew/bin which the operator's
+// shell rc already injects).
+//
+// Escape hatch:
+//   HEXA_PATH_NO_AUGMENT=1   → disable; child sees parent PATH verbatim.
+//
+// Idempotency: each candidate is added only if not already present
+// (substring match against `:`-delimited segments). Order: candidates are
+// pre-pended in the order listed below, so /opt/homebrew/bin wins over
+// /usr/local/bin (matches Apple Silicon Homebrew priority over linuxbrew /
+// stale Intel installs).
+//
+// Security boundary: this changes which directories popen() searches; it
+// does NOT introduce a new shell-injection vector (callers still pass a
+// quoted command to popen as before). An operator who explicitly wants the
+// minimal PATH (e.g. for sandbox testing) sets HEXA_PATH_NO_AUGMENT=1.
+__attribute__((constructor))
+static void _hexa_init_path_augment(void) {
+#if defined(__APPLE__)
+    const char* opt = getenv("HEXA_PATH_NO_AUGMENT");
+    if (opt && opt[0] == '1' && opt[1] == '\0') return;
+
+    const char* old = getenv("PATH");
+    if (!old) old = "";
+
+    // Candidates pre-pended in order. /opt/homebrew first (Apple Silicon
+    // Homebrew default), /usr/local next (Intel Homebrew + manual installs),
+    // /opt/local last (MacPorts). sbin variants included for tools like
+    // pfctl wrappers shipped under sbin in some bottles.
+    static const char* const candidates[] = {
+        "/opt/homebrew/bin",
+        "/opt/homebrew/sbin",
+        "/usr/local/bin",
+        "/usr/local/sbin",
+        "/opt/local/bin",
+        "/opt/local/sbin",
+        NULL
+    };
+
+    // Build new PATH = <missing candidates joined by ':'> + ':' + old.
+    // Worst-case length: sum of all candidates + separators + old + NUL.
+    size_t cap = strlen(old) + 1;
+    for (int i = 0; candidates[i]; i++) cap += strlen(candidates[i]) + 1;
+    char* buf = (char*)malloc(cap);
+    if (!buf) return;
+    buf[0] = '\0';
+
+    for (int i = 0; candidates[i]; i++) {
+        const char* c = candidates[i];
+        size_t clen = strlen(c);
+        // Substring search for ":<c>:", "<c>:" (start), or ":<c>" (end), or
+        // exact match. Cheap O(n*m) scan — PATH is rarely > 4 KB and this
+        // runs once at process start.
+        int found = 0;
+        const char* p = old;
+        while (*p) {
+            const char* q = strchr(p, ':');
+            size_t seg = q ? (size_t)(q - p) : strlen(p);
+            if (seg == clen && memcmp(p, c, clen) == 0) { found = 1; break; }
+            if (!q) break;
+            p = q + 1;
+        }
+        if (!found) {
+            strcat(buf, c);
+            strcat(buf, ":");
+        }
+    }
+    strcat(buf, old);
+
+    // Only call setenv if we actually added something (buf longer than old).
+    if (strlen(buf) > strlen(old)) {
+        setenv("PATH", buf, 1);
+    }
+    free(buf);
+#endif
+}
+
+// ═══════════════════════════════════════════════════════════
 //  RSS soft cap — runtime guard against runaway memory
 // ═══════════════════════════════════════════════════════════
 //
