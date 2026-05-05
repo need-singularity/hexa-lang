@@ -47,13 +47,19 @@ static void _hexa_init_stdio(void) {
 // Defaults & overrides:
 //   HEXA_MEM_UNLIMITED=1           → cap disabled
 //   HEXA_MEM_CAP_MB=<N>            → cap to N MB (must be >0)
-//   default                        → 2048 MB
+//   default                        → 768 MB (2026-05-05: lowered 2048 → 768
+//                                    after hive watcher logged repeat
+//                                    runaways at 0.5–6 GB; the prior 2 GB
+//                                    default never fired before the
+//                                    external 250MB watcher SIGKILL'd.
+//                                    768 MB still permits 41-file
+//                                    flatten+transpile compiles.)
 //
 // CLI flags (parsed by the hexa wrapper script, exported as env above):
 //   --mem-unlimited                → HEXA_MEM_UNLIMITED=1
 //   --mem-cap=<N>                  → HEXA_MEM_CAP_MB=<N>
 
-static size_t _hx_mem_cap_bytes = 2048ull * 1024ull * 1024ull;  // 2 GB default
+static size_t _hx_mem_cap_bytes = 768ull * 1024ull * 1024ull;   // 768 MB default
 static int    _hx_mem_cap_disabled = 0;
 static volatile uint64_t _hx_mem_tick_ctr = 0;
 
@@ -107,7 +113,10 @@ static void _hx_mem_cap_fire(size_t rss) {
 
 static inline void _hx_mem_tick(void) {
     if (_hx_mem_cap_disabled) return;
-    if ((++_hx_mem_tick_ctr & 0xFFFFu) != 0) return;
+    // 2026-05-05: 0xFFFF (65 536 calls) → 0x0FFF (4 096 calls) — 16× more
+    // frequent. Tightens overshoot bound on bursty allocators (the
+    // observed runaways went 1 → 5 GB inside one 30s watcher window).
+    if ((++_hx_mem_tick_ctr & 0x0FFFu) != 0) return;
     size_t rss = _hx_self_rss_bytes();
     if (rss > _hx_mem_cap_bytes) _hx_mem_cap_fire(rss);
 }
