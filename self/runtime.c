@@ -346,6 +346,7 @@ HexaVal hexa_str_parse_int(HexaVal s);
 HexaVal hexa_str_parse_float(HexaVal s);
 HexaVal hexa_str_slice(HexaVal s, HexaVal start, HexaVal end);
 HexaVal hexa_str_bytes(HexaVal s);
+// Polymorphic — string→hexa_str_slice; array→true array slice.
 HexaVal hexa_array_slice(HexaVal arr, HexaVal start, HexaVal end);
 HexaVal hexa_array_map(HexaVal arr, HexaVal fn);
 HexaVal hexa_array_filter(HexaVal arr, HexaVal fn);
@@ -5610,7 +5611,14 @@ HexaVal hexa_str_slice(HexaVal s, HexaVal start, HexaVal end) {
     return hexa_str_own_with_len(strndup(HX_STR(s) + a, b - a), (size_t)(b - a));
 }
 
+// hexa_array_slice — polymorphic at runtime. Codegen emits this symbol
+// for `.slice(a,b)` calls without knowing receiver type at compile time;
+// previously a string receiver returned hexa_array_new() (empty array),
+// silently breaking `s.slice(0,1)` callers across hive/papers/anima
+// (e.g. tool/raw_mk2_loader.hexa) — they had to work around with
+// substring/starts_with. Now: route string→hexa_str_slice, else array path.
 HexaVal hexa_array_slice(HexaVal arr, HexaVal start, HexaVal end) {
+    if (HX_IS_STR(arr)) return hexa_str_slice(arr, start, end);
     if (!HX_IS_ARRAY(arr)) return hexa_array_new();
     int n = HX_ARR_LEN(arr);
     int a = (int)HX_INT(start), b = (int)HX_INT(end);
@@ -6815,7 +6823,9 @@ HexaVal hexa_http_get(HexaVal url) {
 // Minimal recursive-descent JSON handler that covers Anima's use
 // (tokenizer configs, checkpoint metadata, serve_alm request bodies).
 // Supported: null / bool / int / float / string / array / object.
-// Limits: no \uXXXX surrogates (passthrough as raw bytes), no +NaN/Inf.
+// Limits: \uXXXX BMP decoded to UTF-8; surrogate pair (\uD8XX\uDCXX)
+// also decoded; lone surrogate falls back to literal passthrough.
+// No +NaN/Inf.
 // TAG mapping:
 //   null   → TAG_VOID  (hexa_void)
 //   true   → TAG_BOOL 1
@@ -6835,6 +6845,22 @@ static void _jp_skip_ws(const char* s, size_t n, size_t* pi) {
 }
 
 static HexaVal _jp_parse_value(const char* s, size_t n, size_t* pi);
+
+// Parse 4 hex digits at s+i; returns -1 on malformed.
+static int _jp_hex4(const char* s, size_t n, size_t i) {
+    if (i + 4 > n) return -1;
+    int v = 0;
+    for (int k = 0; k < 4; k++) {
+        char c = s[i + k];
+        int d;
+        if (c >= '0' && c <= '9') d = c - '0';
+        else if (c >= 'a' && c <= 'f') d = 10 + (c - 'a');
+        else if (c >= 'A' && c <= 'F') d = 10 + (c - 'A');
+        else return -1;
+        v = (v << 4) | d;
+    }
+    return v;
+}
 
 static HexaVal _jp_parse_string(const char* s, size_t n, size_t* pi) {
     if (*pi >= n || s[*pi] != '"') return hexa_str("");
@@ -6858,18 +6884,74 @@ static HexaVal _jp_parse_string(const char* s, size_t n, size_t* pi) {
                 case 't':  out = '\t'; break;
                 case 'b':  out = '\b'; break;
                 case 'f':  out = '\f'; break;
-                case 'u':
-                    // Raw passthrough (no unicode expansion) — write literal
-                    // \uXXXX as the 6 bytes so round-trip is lossless.
-                    if (*pi + 5 < n) {
+                case 'u': {
+                    // \uXXXX → UTF-8. Handles BMP + surrogate pair
+                    // (\uD8XX\uDCXX). Lone surrogate or malformed
+                    // hex falls back to literal passthrough so the
+                    // 6-byte input round-trips losslessly.
+                    int cp = _jp_hex4(s, n, *pi + 2);
+                    if (cp < 0) {
+                        // malformed — emit literal "\u" and let
+                        // outer loop continue past it.
+                        if (len + 2 >= cap) { cap = (cap + 2) * 2; char* nb = (char*)realloc(buf, cap); if (!nb) { free(buf); return hexa_str(""); } buf = nb; }
+                        buf[len++] = '\\';
+                        buf[len++] = 'u';
+                        *pi += 2;
+                        continue;
+                    }
+                    // Surrogate pair?
+                    if (cp >= 0xD800 && cp <= 0xDBFF) {
+                        // high surrogate — expect \uDCxx low surrogate
+                        if (*pi + 12 <= n && s[*pi + 6] == '\\' && s[*pi + 7] == 'u') {
+                            int lo = _jp_hex4(s, n, *pi + 8);
+                            if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                                cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                                *pi += 12;
+                            } else {
+                                // not a low surrogate — passthrough 6 bytes literal
+                                if (len + 6 >= cap) { cap = (cap + 6) * 2; char* nb = (char*)realloc(buf, cap); if (!nb) { free(buf); return hexa_str(""); } buf = nb; }
+                                memcpy(buf + len, s + *pi, 6);
+                                len += 6;
+                                *pi += 6;
+                                continue;
+                            }
+                        } else {
+                            // lone high surrogate at end — passthrough literal
+                            if (len + 6 >= cap) { cap = (cap + 6) * 2; char* nb = (char*)realloc(buf, cap); if (!nb) { free(buf); return hexa_str(""); } buf = nb; }
+                            memcpy(buf + len, s + *pi, 6);
+                            len += 6;
+                            *pi += 6;
+                            continue;
+                        }
+                    } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+                        // lone low surrogate — passthrough literal
                         if (len + 6 >= cap) { cap = (cap + 6) * 2; char* nb = (char*)realloc(buf, cap); if (!nb) { free(buf); return hexa_str(""); } buf = nb; }
                         memcpy(buf + len, s + *pi, 6);
                         len += 6;
                         *pi += 6;
                         continue;
+                    } else {
+                        *pi += 6;
                     }
-                    out = 'u';
-                    break;
+                    // Emit UTF-8 for cp.
+                    if (len + 4 >= cap) { cap = (cap + 4) * 2; char* nb = (char*)realloc(buf, cap); if (!nb) { free(buf); return hexa_str(""); } buf = nb; }
+                    if (cp < 0x80) {
+                        buf[len++] = (char)cp;
+                    } else if (cp < 0x800) {
+                        buf[len++] = (char)(0xC0 | (cp >> 6));
+                        buf[len++] = (char)(0x80 | (cp & 0x3F));
+                    } else if (cp < 0x10000) {
+                        buf[len++] = (char)(0xE0 | (cp >> 12));
+                        buf[len++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                        buf[len++] = (char)(0x80 | (cp & 0x3F));
+                    } else {
+                        buf[len++] = (char)(0xF0 | (cp >> 18));
+                        buf[len++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+                        buf[len++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                        buf[len++] = (char)(0x80 | (cp & 0x3F));
+                    }
+                    continue;
+                }
                 default:   out = e; break;
             }
             if (len + 1 >= cap) { cap *= 2; char* nb = (char*)realloc(buf, cap); if (!nb) { free(buf); return hexa_str(""); } buf = nb; }
