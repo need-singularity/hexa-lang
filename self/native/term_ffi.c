@@ -15,7 +15,7 @@
  *   Window size:
  *     int  term_get_winsize(int *rows, int *cols)  — ioctl TIOCGWINSZ; rc=0 ok
  *   I/O (non-blocking via poll):
- *     int  term_poll_stdin(int timeout_ms)  — 1=ready, 0=timeout, -1=error
+ *     int  term_poll_stdin(int timeout_ms)  — 1=ready, 0=timeout, -1=error, -2=hangup/eof
  *     int  term_read_byte(void)             — read 1 byte; -1 on EOF/error
  *     int  term_read_bytes(unsigned char *buf, int max_n) — short read; bytes-read or -1
  *     int  term_write(const char *buf, int n) — write n bytes to stdout; rc=bytes or -1
@@ -28,6 +28,7 @@
  *   Introspection:
  *     int  term_isatty_stdin(void)          — isatty(0)
  *     int  term_isatty_stdout(void)         — isatty(1)
+ *     int  term_getppid(void)               — getppid() for orphan-suicide
  *
  * INVARIANTS
  *   - Single-process (no thread safety; matches hexa runtime's single-threaded
@@ -151,7 +152,25 @@ int term_poll_stdin(int timeout_ms) {
     } while (rc < 0 && errno == EINTR);
     if (rc < 0) return -1;
     if (rc == 0) return 0;
-    return (pfd.revents & POLLIN) ? 1 : 0;
+    if (pfd.revents & POLLIN) return 1;
+    /* No POLLIN but POLLHUP/POLLERR/POLLNVAL — stdin permanently dead
+     * (parent/terminal hangup, orphan case). Distinct from -1 (poll
+     * syscall error) and 0 (timeout) so callers can route to clean EOF.
+     * Root-cause for the 2026-05-05 hive-hexa-bin runaway (PPID=1 orphan
+     * tight-looped poll() → hexa_array_push allocations for 5h, RSS 36GB):
+     * the prior `(POLLIN ? 1 : 0)` collapse made callers treat hangup as
+     * timeout and re-poll forever, never reaching an exit branch. */
+    if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) return -2;
+    return 0;
+}
+
+/* getppid() — exposed to hexa for orphan-suicide defense-in-depth.
+ * If parent dies, kernel reparents to PID 1 (init/launchd). hexa app
+ * loops can poll this every N iterations and exit when parent==1, in
+ * case POLLHUP isn't delivered (e.g. stdin is /dev/null or a still-live
+ * pipe whose other end leaked to a different process). */
+int term_getppid(void) {
+    return (int)getppid();
 }
 
 int term_read_byte(void) {

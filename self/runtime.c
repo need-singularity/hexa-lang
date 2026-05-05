@@ -7601,6 +7601,7 @@ static void _hexa_init_fn_shims(void) {
  *   term_sigint_pending()    -> Int (1/0)
  *   term_isatty_stdin()      -> Int
  *   term_isatty_stdout()     -> Int
+ *   term_getppid()           -> Int (parent pid; 1 = orphaned to init)
  *
  * Kick witness:
  *   state/design_strategy_trawl/2026-04-27_hexa-native-tui-implementation-plan_KICK_omega_cycle.json
@@ -7642,6 +7643,7 @@ HexaVal hexa_term_install_sigint(void) { return hexa_int((int64_t)term_install_s
 HexaVal hexa_term_sigint_pending(void) { return hexa_int((int64_t)term_sigint_pending()); }
 HexaVal hexa_term_isatty_stdin(void) { return hexa_int((int64_t)term_isatty_stdin()); }
 HexaVal hexa_term_isatty_stdout(void) { return hexa_int((int64_t)term_isatty_stdout()); }
+HexaVal hexa_term_getppid(void) { return hexa_int((int64_t)term_getppid()); }
 
 /* PTY harness builtins (forward-only "real PTY" closure, commit 43bec17b). */
 
