@@ -1,0 +1,146 @@
+// self/test/ssh_exec_local.hexa — ssh.hexa fixture against localhost
+// ─────────────────────────────────────────────────────────────────────
+//
+// Exercises ssh_exec / ssh_exec_async / ssh_close_master against
+// `localhost` when ssh-localhost is configured. Emits a clear
+// __SSH_LOCAL_TEST__ SKIPPED|PASS|FAIL sentinel so harnesses can
+// branch on env capability without misclassifying a missing key
+// agent as a failure.
+//
+// Pre-flight: ssh -o BatchMode=yes localhost true must exit 0. If
+// not, we emit SKIPPED and exit 0 — explicitly NOT a failure, since
+// localhost ssh requires user-side setup (sshd enabled, key added
+// to authorized_keys) that the language test rig cannot provision.
+
+use "self/stdlib/ssh"
+use "self/stdlib/shell_escape"
+
+fn _localhost_reachable() -> bool {
+    // Direct ssh probe; we deliberately don't go through ssh_test()
+    // here so a regression in ssh_test() doesn't masquerade as a
+    // skipped-environment.
+    let cmd = "ssh -o BatchMode=yes -o ConnectTimeout=5 localhost true >/dev/null 2>&1; echo \"__rc=$?__\""
+    let out = to_string(exec(cmd))
+    return out.contains("__rc=0__")
+}
+
+fn _opts_with_timeout(seconds) {
+    let m = {}
+    m["timeout"] = seconds
+    return m
+}
+
+fn main() {
+    if !_localhost_reachable() {
+        println("__SSH_LOCAL_TEST__ SKIPPED reason=localhost-ssh-unavailable")
+        return
+    }
+
+    let mut fail = 0
+    let mut n = 0
+
+    // 1. ssh_exec captures stdout for `whoami`. Compare against the
+    //    local `id -un` since localhost ssh runs as the same user.
+    n = n + 1
+    let local_user = to_string(exec("id -un")).trim()
+    let opts1 = _opts_with_timeout(10)
+    let r1 = ssh_exec("localhost", "whoami", opts1)
+    let remote_user = to_string(r1["stdout"]).trim()
+    if r1["exit"] != 0 || remote_user != local_user {
+        eprintln("FAIL 1 whoami: exit=" + to_string(r1["exit"]) +
+                 " remote=" + remote_user + " local=" + local_user +
+                 " stderr=" + to_string(r1["stderr"]))
+        fail = fail + 1
+    }
+
+    // 2. ControlMaster socket present at canonical path after first
+    //    successful call (lifecycle invariant).
+    n = n + 1
+    let cp = _ssh_control_path("localhost")
+    let socket_present = to_string(exec("test -S " + shell_escape(cp) + " && echo 1 || echo 0")).trim()
+    if socket_present != "1" {
+        eprintln("FAIL 2 ControlPath socket missing at " + cp)
+        fail = fail + 1
+    }
+
+    // 3. Second call hits the master and is faster than the first
+    //    (sanity check, not strict — we just verify it succeeds).
+    n = n + 1
+    let opts3 = _opts_with_timeout(5)
+    let r3 = ssh_exec("localhost", "echo hello-multiplex", opts3)
+    if r3["exit"] != 0 || !to_string(r3["stdout"]).contains("hello-multiplex") {
+        eprintln("FAIL 3 multiplexed call: " + to_string(r3))
+        fail = fail + 1
+    }
+
+    // 4. Argument-with-apostrophes survives shell-escape round-trip.
+    //    Without the escape, the apostrophe would close the remote
+    //    shell quote and inject a stray token.
+    n = n + 1
+    let opts4 = _opts_with_timeout(5)
+    let r4 = ssh_exec("localhost", "echo \"it's safe\"", opts4)
+    if r4["exit"] != 0 || !to_string(r4["stdout"]).contains("it's safe") {
+        eprintln("FAIL 4 apostrophe round-trip: stdout=" + to_string(r4["stdout"]))
+        fail = fail + 1
+    }
+
+    // 5. Non-zero remote exit propagates.
+    n = n + 1
+    let opts5 = _opts_with_timeout(5)
+    let r5 = ssh_exec("localhost", "exit 42", opts5)
+    if r5["exit"] != 42 {
+        eprintln("FAIL 5 exit propagation: got " + to_string(r5["exit"]))
+        fail = fail + 1
+    }
+
+    // 6. ssh_test() agrees with the pre-flight probe.
+    n = n + 1
+    if !ssh_test("localhost") {
+        eprintln("FAIL 6 ssh_test(localhost) returned false despite reachability")
+        fail = fail + 1
+    }
+
+    // 7. ssh_exec_async returns a positive pid and a writable log.
+    n = n + 1
+    let opts7 = {}
+    let r7 = ssh_exec_async("localhost", "echo async-ok; sleep 1", opts7)
+    let pid = to_int(r7["pid"])
+    let log_path = to_string(r7["log_path"])
+    if pid <= 0 || len(log_path) == 0 {
+        eprintln("FAIL 7 async spawn: pid=" + to_string(pid) + " log=" + log_path)
+        fail = fail + 1
+    } else {
+        // Wait up to 5 seconds for the async log to contain the marker.
+        let mut waited = 0
+        let mut hit = false
+        while waited < 50 && !hit {
+            let body = to_string(exec("cat " + shell_escape(log_path) + " 2>/dev/null"))
+            if body.contains("async-ok") { hit = true }
+            else {
+                let _ = exec("sleep 0.1")
+                waited = waited + 1
+            }
+        }
+        if !hit {
+            eprintln("FAIL 7b async log never received marker (path=" + log_path + ")")
+            fail = fail + 1
+        }
+        let _ = exec("rm -f " + shell_escape(log_path))
+    }
+
+    // 8. ssh_close_master removes the socket; subsequent ssh -O check fails.
+    n = n + 1
+    let _ = ssh_close_master("localhost")
+    let still = to_string(exec("test -S " + shell_escape(cp) + " && echo 1 || echo 0")).trim()
+    if still == "1" {
+        eprintln("FAIL 8 socket survived ssh_close_master at " + cp)
+        fail = fail + 1
+    }
+
+    if fail == 0 {
+        println("__SSH_LOCAL_TEST__ PASS n=" + to_string(n) + " fail=0")
+    } else {
+        println("__SSH_LOCAL_TEST__ FAIL n=" + to_string(n) + " fail=" + to_string(fail))
+        exit(1)
+    }
+}

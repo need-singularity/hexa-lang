@@ -1,0 +1,558 @@
+// self/stdlib/ssh.hexa — OpenSSH ControlMaster wrapper for hexa
+// ─────────────────────────────────────────────────────────────────────────
+//
+// @module(slug="stdlib-ssh", desc="multiplexed remote command execution via OpenSSH ControlMaster")
+// @usage(use "self/stdlib/ssh"; let r = ssh_exec("ubu1", "git -C /path rev-parse HEAD", {}))
+//
+// Closes hexa-lang upstream gap #7 (per
+// docs/hexa_url_complete_support_upstream_spec_2026_05_05.ai.md §2.6).
+// Today gate/remote_preflight.hexa drift probe and hive/sync/<verb>.hexa
+// shell-escape every remote git/ls call as exec("ssh ...") with hand-rolled
+// quoting that breaks under apostrophes, dollars, and newlines. This stdlib
+// gives the call a typed surface and reuses a single multiplexed TCP/SSH
+// session per host so the second-and-subsequent probes skip key negotiation.
+//
+// raw 9 (hexa-only-strict): pure hexa over exec/exec_with_status; no C
+// runtime change. raw 91 (no_silent_errors): every fork verifies its
+// post-condition (timeout exit, control-master socket presence) before
+// claiming success. raw 159 (upstream-proposal-mandate): hive consumers
+// import this and never re-implement.
+//
+// Exports
+// ───────
+//   ssh_exec(host, cmd, opts) -> map         {exit, stdout, stderr, duration_ms}
+//   ssh_exec_async(host, cmd, opts) -> map   {pid, log_path}
+//   ssh_close_master(host) -> bool
+//   ssh_test(host) -> bool                   reachability probe (5s timeout)
+//
+// ControlMaster lifecycle
+// ───────────────────────
+//   - Socket lives at /tmp/hexa_ssh_cm_<sanitized-host> (NEVER under $HOME;
+//     callers are sealed-SSOT-aware and must keep tmp churn out of registered
+//     directories — resource.016 enforcement).
+//   - First call with a given host opens the master via -o ControlMaster=auto
+//     -o ControlPersist=<ttl_seconds>; ControlPersist=120s default. Subsequent
+//     calls hit the existing socket without re-handshake (sub-50ms typical).
+//   - Auto-close: ControlPersist tears down the master after ttl_seconds of
+//     inactivity. Explicit close: ssh_close_master(host) sends -O exit.
+//   - The sanitization step replaces any non-alnum/dot/dash/underscore byte
+//     with `_` so a hostile host string cannot escape /tmp/hexa_ssh_cm_*.
+//
+// Argument safety
+// ───────────────
+//   - host is whitelisted via the same regex as hexa-url-handler.sh safe_arg
+//     (alnum + .-_:) — anything else hard-fails before fork.
+//   - cmd is passed through shell_escape() before being placed inside the
+//     remote shell line, so apostrophes/dollars/newlines stay literal on the
+//     remote side.
+//   - opts.env is rendered as `KEY=val ` prefixes (each value also escaped);
+//     the remote sshd must allow env passthrough or the values are simply
+//     consumed by the wrapper sh -c.
+//
+// Timeout
+// ───────
+//   - opts.timeout (seconds) wraps the ssh invocation in `timeout` (Linux)
+//     or `gtimeout` (macOS coreutils). When the helper is missing we fall
+//     back to ssh's own -o ConnectTimeout=N + ServerAliveInterval and accept
+//     that a hung remote shell can outlast the desired bound; this is logged
+//     in stderr as a clear "ssh_exec: timeout helper unavailable" line so
+//     callers can surface the fact in their own audit trail.
+//
+// Known limitations (carried into the report)
+// ───────────────────────────────────────────
+//   - Concurrent calls to the SAME host: OpenSSH ControlMaster is safe
+//     across concurrent channels, but the FIRST caller racing two opens of
+//     the master may produce a transient "ControlPath already in use"
+//     warning. We treat the warning as benign (the second opener will
+//     attach to the winning socket).
+//   - Key-agent env: ssh inherits the parent's $SSH_AUTH_SOCK. If the
+//     caller wants a non-default agent they must export it BEFORE invoking
+//     the hexa runtime; this module does not synthesize an agent.
+//   - ssh-config discovery: we rely on the user's ~/.ssh/config + system
+//     /etc/ssh/ssh_config exactly as ssh(1) resolves them. No override hook
+//     here — by design, since this layer must NOT carry credentials per
+//     the contract.
+
+use "self/stdlib/shell_escape"
+
+// ── _ssh_has_key ────────────────────────────────────────────────────────
+// Map-key probe via .keys() walk. Mirrors anthropic_sdk._has_key — the
+// runtime does not expose a uniform `.has()` across map types so we walk
+// the key array. False-positive impossible (exact string equality).
+fn _ssh_has_key(d, k: string) -> bool {
+    if type_of(d) == "void" { return false }
+    if type_of(d) != "map" { return false }
+    let ks = d.keys()
+    let mut i = 0
+    let n = len(ks)
+    while i < n {
+        if ks[i] == k { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ── _ssh_sanitize_host ──────────────────────────────────────────────────
+// Returns host string reduced to [A-Za-z0-9._-]; any other byte becomes _.
+// The sanitized form is used as a filesystem-safe ControlPath suffix.
+fn _ssh_sanitize_host(host: string) -> string {
+    let n = len(host)
+    let mut parts = []
+    let mut i = 0
+    while i < n {
+        let c = host.substring(i, i + 1)
+        let ok =
+            (c >= "a" && c <= "z") ||
+            (c >= "A" && c <= "Z") ||
+            (c >= "0" && c <= "9") ||
+            c == "." || c == "-" || c == "_"
+        if ok {
+            parts.push(c)
+        } else {
+            parts.push("_")
+        }
+        i = i + 1
+    }
+    return parts.join("")
+}
+
+// ── _ssh_host_is_safe ───────────────────────────────────────────────────
+// Hard whitelist for the host argument BEFORE any fork. Same shape as the
+// safe_arg() regex in ~/.hx/bin/hexa-url-handler.sh: alnum + . - _ + ':'
+// (the colon allows user@host syntax and bracketed [::1]:22 form). Empty
+// host is rejected.
+fn _ssh_host_is_safe(host: string) -> bool {
+    let n = len(host)
+    if n == 0 { return false }
+    let mut i = 0
+    while i < n {
+        let c = host.substring(i, i + 1)
+        let ok =
+            (c >= "a" && c <= "z") ||
+            (c >= "A" && c <= "Z") ||
+            (c >= "0" && c <= "9") ||
+            c == "." || c == "-" || c == "_" ||
+            c == "@" || c == ":" || c == "[" || c == "]"
+        if !ok { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// ── _ssh_control_path ───────────────────────────────────────────────────
+// Returns the absolute ControlPath socket path for `host`. Placed under
+// /tmp (not $HOME) per the design constraint to keep registered SSOT
+// directories quiet.
+pub fn _ssh_control_path(host: string) -> string {
+    return "/tmp/hexa_ssh_cm_" + _ssh_sanitize_host(host)
+}
+
+// ── _ssh_timeout_prefix ─────────────────────────────────────────────────
+// Returns the timeout-helper command prefix or "" if no helper is on PATH.
+// macOS ships `gtimeout` from coreutils (homebrew); GNU systems ship plain
+// `timeout`. We probe both, prefer gtimeout because some ancient mac BSDs
+// have a non-coreutils `timeout` that takes different flags.
+fn _ssh_timeout_prefix(seconds: int) -> string {
+    if seconds <= 0 { return "" }
+    let g = to_string(exec("command -v gtimeout 2>/dev/null")).trim()
+    if len(g) > 0 {
+        return g + " " + to_string(seconds) + " "
+    }
+    let t = to_string(exec("command -v timeout 2>/dev/null")).trim()
+    if len(t) > 0 {
+        return t + " " + to_string(seconds) + " "
+    }
+    return ""
+}
+
+// ── _ssh_now_ms ─────────────────────────────────────────────────────────
+// Wall-clock millisecond reading. macOS `date` lacks %N so we shell out to
+// python3 -c 'import time; print(int(time.time()*1000))' which is present
+// on every supported runtime mode. Fallback to seconds*1000 when python3
+// is unavailable (loses sub-second resolution but never panics).
+fn _ssh_now_ms() -> int {
+    let py = to_string(exec("command -v python3 2>/dev/null")).trim()
+    if len(py) > 0 {
+        let s = to_string(exec("python3 -c 'import time; print(int(time.time()*1000))' 2>/dev/null")).trim()
+        if len(s) > 0 { return to_int(s) }
+    }
+    let s = to_string(exec("date +%s 2>/dev/null")).trim()
+    if len(s) == 0 { return 0 }
+    return to_int(s) * 1000
+}
+
+// ── _ssh_render_env ─────────────────────────────────────────────────────
+// Render an opts.env map as a `KEY=val KEY=val ` prefix string, with each
+// value shell-escaped. The whole thing is destined to land inside the
+// REMOTE shell line (sh -c '<env_prefix> <cmd>'), so escaping there is
+// what matters; the local side is not subject to expansion because the
+// remote payload is already wrapped in shell_escape().
+fn _ssh_render_env(env_map) -> string {
+    if type_of(env_map) == "void" { return "" }
+    let t = type_of(env_map)
+    if t != "map" { return "" }
+    let keys = env_map.keys()
+    if len(keys) == 0 { return "" }
+    let mut out = []
+    let mut i = 0
+    while i < len(keys) {
+        let k = to_string(keys[i])
+        // KEY whitelist: alnum + underscore (POSIX env name rules).
+        let mut ok = len(k) > 0
+        let mut j = 0
+        while ok && j < len(k) {
+            let ch = k.substring(j, j + 1)
+            let in_class =
+                (ch >= "a" && ch <= "z") ||
+                (ch >= "A" && ch <= "Z") ||
+                (ch >= "0" && ch <= "9") ||
+                ch == "_"
+            if !in_class { ok = false }
+            j = j + 1
+        }
+        if ok {
+            let v = to_string(env_map[k])
+            out.push(k + "=" + shell_escape(v) + " ")
+        }
+        i = i + 1
+    }
+    return out.join("")
+}
+
+// ── _ssh_master_alive ───────────────────────────────────────────────────
+// True if a ControlMaster socket exists for `host` AND `ssh -O check` says
+// it's alive. We check both because a stale socket file outlives a crashed
+// master process.
+fn _ssh_master_alive(host: string) -> bool {
+    let cp = _ssh_control_path(host)
+    let r = to_string(exec("test -S " + shell_escape(cp) + " && echo 1 || echo 0")).trim()
+    if r != "1" { return false }
+    let h = shell_escape(host)
+    let s = shell_escape(cp)
+    let probe = to_string(exec("ssh -o ControlPath=" + s + " -O check " + h + " 2>&1; echo \"__rc=$?__\"")).trim()
+    // -O check exits 0 on alive; we cannot read $? portably from exec(), so
+    // we tag the rc inline and parse for it. The probe may also print
+    // "Master running" to stderr; either way the rc tag is authoritative.
+    return probe.contains("__rc=0__")
+}
+
+// ── _ssh_open_master ────────────────────────────────────────────────────
+// Open the ControlMaster for `host` if not already alive. ControlPersist
+// is in seconds and equals max(ttl, 60). Returns true on success (alive
+// after the call), false otherwise. Errors are logged to stderr; callers
+// fall back to single-shot ssh on failure (no multiplex benefit but the
+// command still runs).
+fn _ssh_open_master(host: string, ttl_seconds: int) -> bool {
+    if _ssh_master_alive(host) { return true }
+    let cp = _ssh_control_path(host)
+    let persist = if ttl_seconds < 60 { 60 } else { ttl_seconds }
+    let h = shell_escape(host)
+    let s = shell_escape(cp)
+    // -fN backgrounds the master after auth; -o BatchMode prevents prompts
+    // so a missing key fails fast instead of hanging the runtime.
+    let cmd =
+        "ssh -fN " +
+        "-o ControlMaster=auto " +
+        "-o ControlPath=" + s + " " +
+        "-o ControlPersist=" + to_string(persist) + " " +
+        "-o BatchMode=yes " +
+        "-o ConnectTimeout=10 " +
+        h + " 2>&1"
+    let _ = exec(cmd)
+    return _ssh_master_alive(host)
+}
+
+// ── ssh_close_master ────────────────────────────────────────────────────
+// Tear down the ControlMaster socket for `host`. Idempotent: returns true
+// even if no master was running (raw 65 idempotency).
+pub fn ssh_close_master(host: string) -> bool {
+    if !_ssh_host_is_safe(host) { return false }
+    let cp = _ssh_control_path(host)
+    let alive = _ssh_master_alive(host)
+    if alive {
+        let h = shell_escape(host)
+        let s = shell_escape(cp)
+        let _ = exec("ssh -o ControlPath=" + s + " -O exit " + h + " 2>&1")
+    }
+    // Sweep any stale socket file that survived a master crash.
+    let _ = exec("rm -f " + shell_escape(cp))
+    return true
+}
+
+// ── ssh_test ────────────────────────────────────────────────────────────
+// Quick reachability probe. Returns true if `ssh -o BatchMode=yes
+// host true` exits 0 within 5 seconds.
+pub fn ssh_test(host: string) -> bool {
+    if !_ssh_host_is_safe(host) { return false }
+    let prefix = _ssh_timeout_prefix(5)
+    let h = shell_escape(host)
+    let cmd = prefix + "ssh -o BatchMode=yes -o ConnectTimeout=5 " + h + " true >/dev/null 2>&1; echo \"__rc=$?__\""
+    let out = to_string(exec(cmd))
+    return out.contains("__rc=0__")
+}
+
+// ── _ssh_default_int ────────────────────────────────────────────────────
+// Read an int field from opts with a default. opts may be a plain map or
+// null/missing; we never crash on absent key.
+fn _ssh_default_int(opts, key: string, fallback: int) -> int {
+    if type_of(opts) == "void" { return fallback }
+    if type_of(opts) != "map" { return fallback }
+    if !_ssh_has_key(opts, key) { return fallback }
+    let v = opts[key]
+    if type_of(v) == "void" { return fallback }
+    return to_int(v)
+}
+
+// ── ssh_exec ────────────────────────────────────────────────────────────
+// Execute `cmd` on `host`. Returns a map with exit/stdout/stderr/duration_ms.
+//
+// Shape:
+//   ssh_exec("ubu1", "git -C /a rev-parse HEAD", {timeout: 10}) -> map
+//
+// On host-validation failure: returns {exit: 127, stdout: "",
+//   stderr: "ssh_exec: unsafe host", duration_ms: 0}. On timeout helper
+// unavailable: still runs (with ssh internal timeout only) and the
+// stderr field carries a one-line note so the caller can audit.
+pub fn ssh_exec(host: string, cmd: string, opts) {
+    let started = _ssh_now_ms()
+    let result = {}
+    result["exit"] = 0
+    result["stdout"] = ""
+    result["stderr"] = ""
+    result["duration_ms"] = 0
+
+    if !_ssh_host_is_safe(host) {
+        result["exit"] = 127
+        result["stderr"] = "ssh_exec: unsafe host"
+        return result
+    }
+
+    let timeout_s = _ssh_default_int(opts, "timeout", 60)
+    let ttl_s = _ssh_default_int(opts, "control_persist", 120)
+
+    // Open master (best-effort; a failure here just means we run single-shot).
+    let _master_ok = _ssh_open_master(host, ttl_s)
+
+    let cp = _ssh_control_path(host)
+    let h = shell_escape(host)
+    let s = shell_escape(cp)
+
+    let env_prefix =
+        if type_of(opts) == "map" && _ssh_has_key(opts, "env") {
+            _ssh_render_env(opts["env"])
+        } else { "" }
+
+    // The remote payload is `<env> sh -c '<cmd>'` once shell_escape'd, so the
+    // local invocation looks like:  ssh ... HOST "<env> sh -c '<escaped-cmd>'"
+    // We further wrap the whole right-hand operand in double quotes; sh will
+    // see the env prefix as literal env assignments because shell_escape
+    // returns single-quoted forms.
+    let remote = env_prefix + "sh -c " + shell_escape(cmd)
+
+    // Capture stdout and stderr separately via two temp files so the call is
+    // POSIX-portable (no `process substitution`).
+    let nonce = to_string(_ssh_now_ms()) + "_" + to_string(len(cmd))
+    let out_path = "/tmp/hexa_ssh_out_" + nonce
+    let err_path = "/tmp/hexa_ssh_err_" + nonce
+
+    let prefix = _ssh_timeout_prefix(timeout_s)
+    let timeout_warn =
+        if timeout_s > 0 && len(prefix) == 0 {
+            "ssh_exec: timeout helper (gtimeout/timeout) unavailable; relying on ssh ConnectTimeout only\n"
+        } else { "" }
+
+    // -T: no PTY; -o BatchMode=yes: no prompts; ControlPath reuses master
+    // if open. The trailing `; echo "__rc=$?__"` lets us recover the exit
+    // code regardless of exec() return-value shape.
+    let line =
+        prefix +
+        "ssh -T " +
+        "-o BatchMode=yes " +
+        "-o ControlPath=" + s + " " +
+        "-o ConnectTimeout=10 " +
+        h + " " +
+        shell_escape(remote) +
+        " >" + shell_escape(out_path) +
+        " 2>" + shell_escape(err_path) +
+        "; echo \"__rc=$?__\""
+
+    let trailer = to_string(exec(line))
+
+    // Parse the rc tag from the trailer; if missing, fall back to 1.
+    let rc =
+        if trailer.contains("__rc=0__") { 0 }
+        else if trailer.contains("__rc=") {
+            let i_open = trailer.last_index_of("__rc=")
+            let body = trailer.substring(i_open + 5, len(trailer))
+            let i_close = body.index_of("__")
+            if i_close >= 0 { to_int(body.substring(0, i_close)) } else { 1 }
+        }
+        else { 1 }
+
+    // Slurp captured stdio.
+    let out_body = to_string(exec("cat " + shell_escape(out_path) + " 2>/dev/null"))
+    let err_body = to_string(exec("cat " + shell_escape(err_path) + " 2>/dev/null"))
+    let _drop1 = exec("rm -f " + shell_escape(out_path) + " " + shell_escape(err_path))
+
+    let ended = _ssh_now_ms()
+    result["exit"] = rc
+    result["stdout"] = out_body
+    result["stderr"] = timeout_warn + err_body
+    result["duration_ms"] = ended - started
+    return result
+}
+
+// ── ssh_exec_async ──────────────────────────────────────────────────────
+// Fork a backgrounded ssh invocation and return immediately with the
+// child PID and a log path holding combined stdout+stderr. The caller is
+// responsible for tailing the log and reaping the PID (e.g. via `wait` or
+// `kill -0` checks). ControlMaster reuse still applies.
+//
+// Shape: returns {pid: int, log_path: string}. On host-validation failure
+// returns {pid: -1, log_path: ""}.
+pub fn ssh_exec_async(host: string, cmd: string, opts) {
+    let result = {}
+    result["pid"] = -1
+    result["log_path"] = ""
+
+    if !_ssh_host_is_safe(host) { return result }
+
+    let ttl_s = _ssh_default_int(opts, "control_persist", 120)
+    let _ = _ssh_open_master(host, ttl_s)
+
+    let cp = _ssh_control_path(host)
+    let h = shell_escape(host)
+    let s = shell_escape(cp)
+
+    let env_prefix =
+        if type_of(opts) == "map" && _ssh_has_key(opts, "env") {
+            _ssh_render_env(opts["env"])
+        } else { "" }
+    let remote = env_prefix + "sh -c " + shell_escape(cmd)
+
+    let nonce = to_string(_ssh_now_ms()) + "_" + to_string(len(cmd))
+    let log_path = "/tmp/hexa_ssh_async_" + nonce + ".log"
+    let pid_path = "/tmp/hexa_ssh_async_" + nonce + ".pid"
+
+    // Spawn detached: redirect stdio to log, write pid to pid_path, exec
+    // ssh from the subshell. We use `nohup ... &` so the child survives
+    // when the parent hexa run exits.
+    let line =
+        "( nohup ssh -T " +
+        "-o BatchMode=yes " +
+        "-o ControlPath=" + s + " " +
+        "-o ConnectTimeout=10 " +
+        h + " " +
+        shell_escape(remote) +
+        " >" + shell_escape(log_path) +
+        " 2>&1 & echo $! > " + shell_escape(pid_path) +
+        " ) >/dev/null 2>&1"
+    let _ = exec(line)
+
+    let pid_str = to_string(exec("cat " + shell_escape(pid_path) + " 2>/dev/null")).trim()
+    let _drop = exec("rm -f " + shell_escape(pid_path))
+    let pid = if len(pid_str) > 0 { to_int(pid_str) } else { -1 }
+
+    result["pid"] = pid
+    result["log_path"] = log_path
+    return result
+}
+
+// ── --selftest dispatcher ──────────────────────────────────────────────
+// Run with: hexa run self/stdlib/ssh.hexa --selftest
+// Exercises pure-helper invariants (sanitization, safety) WITHOUT touching
+// the network — those live in self/test/ssh_exec_local.hexa.
+fn _ssh_selftest() -> int {
+    let mut n = 0
+    let mut fail = 0
+
+    // 1. host sanitization keeps allowed chars
+    n = n + 1
+    if _ssh_sanitize_host("ubu1.local") != "ubu1.local" {
+        eprintln("FAIL 1 sanitize alnum dot: " + _ssh_sanitize_host("ubu1.local"))
+        fail = fail + 1
+    }
+
+    // 2. host sanitization neutralizes path-traversal bytes
+    n = n + 1
+    let hostile = _ssh_sanitize_host("../../etc/passwd")
+    if hostile.contains(".") && hostile.contains("/") {
+        eprintln("FAIL 2 sanitize did not neutralize / : " + hostile)
+        fail = fail + 1
+    }
+
+    // 3. host whitelist accepts user@host syntax
+    n = n + 1
+    if !_ssh_host_is_safe("git@github.com") {
+        eprintln("FAIL 3 user@host rejected")
+        fail = fail + 1
+    }
+
+    // 4. host whitelist rejects shell metas
+    n = n + 1
+    if _ssh_host_is_safe("foo;rm -rf /") {
+        eprintln("FAIL 4 host with ; accepted")
+        fail = fail + 1
+    }
+
+    // 5. host whitelist rejects empty
+    n = n + 1
+    if _ssh_host_is_safe("") {
+        eprintln("FAIL 5 empty host accepted")
+        fail = fail + 1
+    }
+
+    // 6. control path lives under /tmp
+    n = n + 1
+    let cp = _ssh_control_path("ubu1")
+    if cp.substring(0, 5) != "/tmp/" {
+        eprintln("FAIL 6 control path not in /tmp: " + cp)
+        fail = fail + 1
+    }
+
+    // 7. ssh_exec on unsafe host returns exit=127, no fork
+    n = n + 1
+    let r7 = ssh_exec("foo;evil", "true", {})
+    if r7["exit"] != 127 {
+        eprintln("FAIL 7 unsafe host exit was: " + to_string(r7["exit"]))
+        fail = fail + 1
+    }
+
+    // 8. ssh_exec_async on unsafe host returns pid=-1
+    n = n + 1
+    let r8 = ssh_exec_async("foo;evil", "true", {})
+    if r8["pid"] != -1 {
+        eprintln("FAIL 8 unsafe host async pid was: " + to_string(r8["pid"]))
+        fail = fail + 1
+    }
+
+    // 9. ssh_close_master is idempotent on never-opened host
+    n = n + 1
+    if !ssh_close_master("never_opened_host_xyz_42") {
+        eprintln("FAIL 9 close idempotency violated")
+        fail = fail + 1
+    }
+
+    let status = if fail == 0 { "PASS" } else { "FAIL" }
+    println("__SSH_SELFTEST__ " + status + " n=" + to_string(n) + " fail=" + to_string(fail))
+    return fail
+}
+
+let _ssh_argv = args()
+let mut _ssh_selftest_flag = false
+let mut _ssh_ai = 0
+while _ssh_ai < len(_ssh_argv) {
+    if _ssh_argv[_ssh_ai] == "--selftest-ssh" {
+        _ssh_selftest_flag = true
+        break
+    }
+    if _ssh_argv[_ssh_ai] == "--selftest" {
+        _ssh_selftest_flag = true
+        break
+    }
+    _ssh_ai = _ssh_ai + 1
+}
+if _ssh_selftest_flag {
+    let rc = _ssh_selftest()
+    if rc != 0 { exit(1) }
+}

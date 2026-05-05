@@ -1,0 +1,1526 @@
+// self/stdlib/yaml.hexa — Native YAML 1.2 (subset) parse / emit / mutate.
+//
+// Closes hexa-lang upstream gap #3 (and 8b: line-preserving mutation) per
+// docs/hexa_url_complete_support_upstream_spec_2026_05_05.ai.md §2.2 / §2.8.
+//
+// Resolves part of the cross-sister python3-removal initiative — every
+// consumer that needed yaml mutation (hive-resource resource_op.hexa,
+// raw_mk2_loader, every spec.yaml writer) was shelling out to python3 for
+// round-trip-byte-identical writes that preserve comments + ordering +
+// whitespace. Per raw 9 (hexa-only), this leaks resolver banner
+// contamination via python's stderr and grows a python3 surface that
+// raw 159 mandates we shrink.
+//
+// CONTRACT (stdlib-yaml v1 / 2026-05-05)
+//   Pure hexa (raw 9): zero exec(), zero external libs. Parser and
+//   emitter are hand-rolled; mutator is line-anchored.
+//
+// raw 91 (no_silent_errors) HONEST DISCLOSURES — see also
+//   docs/stdlib_yaml_rfc_2026_05_05.md
+//   L1. Parser handles the YAML 1.2 SUBSET that the hive ecosystem
+//       writes: block-style mappings + lists, plain scalars, single-
+//       and double-quoted strings, line comments (`# ...`), block
+//       scalars (`|` literal + `>` folded — basic indentation handling),
+//       null/bool/int/float scalars per yaml 1.2 core schema. The
+//       yaml 1.1 boolean alias quirk (`on:` `off:` `yes:` `no:`) is
+//       intentionally NOT honoured — those parse as strings (BaseLoader
+//       behaviour), per the task spec.
+//   L2. Sub-gaps surfaced (see §SUB_GAPS at file end):
+//       no anchors/aliases/custom-tags resolution, no multi-doc
+//       streams, partial flow-style support, no regex stdlib so the
+//       jq-style path expression grammar is hand-parsed.
+//   L3. yaml_mutate preserves bytes EXCEPT at the mutation site. The
+//       site rewrite uses minimal-perturbation rules: scalar in-place
+//       (preserves indentation + comment-on-same-line whitespace),
+//       list/map replacement re-emits at existing indentation. A
+//       no-op mutation (new value byte-equal to current serialization
+//       at that line) returns the original text byte-for-byte.
+//   L4. yaml_emit produces yaml 1.2 block-style output. NOT guaranteed
+//       byte-equal to PyYAML/ruamel; IS guaranteed to round-trip
+//       through yaml_parse_safe to a logically-equal value.
+//
+// raw 159 (hexa-lang-upstream-proposal-mandate):
+//   This module is the upstream-of-truth for hive's + papers' yaml ops.
+//   Sister repos `use "self/stdlib/yaml"` and never re-implement these.
+//
+// --selftest mode:
+//   hexa run self/stdlib/yaml.hexa --selftest
+//     → emits __YAML_SELFTEST__ <PASS|FAIL> n=<N> fail=<M>
+//
+//   hexa run self/stdlib/yaml.hexa --selftest-fixture <path>
+//     → reads <path>, no-op mutates, verifies byte-eq, emits
+//       __YAML_BYTE_EQ__ PASS/FAIL plus the literal token BYTE_EQ_PASS.
+//
+// Exports:
+//   yaml_parse_safe(text: string) -> [bool, value]
+//       [true, parsed] on success, [false, void] on parse error.
+//       Mirrors json_parse_safe shape.
+//   yaml_parse_or_throw(text: string) -> value
+//       Parsed value or eprintln + exit 1 on bad input.
+//   yaml_emit(value, opts: map) -> string
+//       Block-style yaml 1.2 emitter. opts: indent (default 2).
+//   yaml_mutate(text: string, path_expr: string, new_value) -> [bool, string]
+//       jq-style path mutation. Returns [true, new_text] on success
+//       or [false, original_text] on path-not-found.
+
+// ─────────────────────────────────────────────────────────────────────────
+// Internal helpers
+// ─────────────────────────────────────────────────────────────────────────
+
+// Make a fresh empty map. (Bare {} literal can be order-fragile; routing
+// through json_parse("{}") matches the json.hexa-tested pattern.)
+fn _yml_new_map() {
+    return json_parse("{}")
+}
+
+fn _yml_count_indent(line) {
+    let n = len(line)
+    let mut i = 0
+    while i < n {
+        let c = line[i]
+        if c != " " { return i }
+        i = i + 1
+    }
+    return n
+}
+
+// Strip a trailing # comment from a flow-context line. Returns
+// [pre_comment, comment_with_leading_ws] so callers can preserve
+// original whitespace during mutate.
+fn _yml_strip_comment(s) {
+    let n = len(s)
+    let mut i = 0
+    let mut in_sq = false
+    let mut in_dq = false
+    while i < n {
+        let c = s[i]
+        if in_sq {
+            if c == "'" { in_sq = false }
+        } else {
+            if in_dq {
+                if c == "\\" {
+                    i = i + 1  // skip escaped char
+                } else {
+                    if c == "\"" { in_dq = false }
+                }
+            } else {
+                if c == "'" { in_sq = true }
+                if c == "\"" { in_dq = true }
+                if c == "#" {
+                    if i == 0 { return [s.substring(0, 0), s.substring(0, n)] }
+                    let prev = s[i - 1]
+                    if prev == " " || prev == "\t" {
+                        return [s.substring(0, i), s.substring(i, n)]
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return [s, ""]
+}
+
+// Remove balanced surrounding quotes. Process \-escapes for double-
+// quoted; verbatim with '' → ' for single-quoted; plain pass-through.
+fn _yml_unquote_scalar(s) {
+    let t = s.trim()
+    let n = len(t)
+    if n == 0 { return "" }
+    let first = t[0]
+    let last = t[n - 1]
+    if first == "\"" && last == "\"" && n >= 2 {
+        let body = t.substring(1, n - 1)
+        let bn = len(body)
+        let mut out = ""
+        let mut i = 0
+        while i < bn {
+            let c = body[i]
+            if c == "\\" && i + 1 < bn {
+                let nx = body[i + 1]
+                if nx == "n" { out = out + "\n" }
+                else { if nx == "t" { out = out + "\t" }
+                else { if nx == "r" { out = out + "\r" }
+                else { if nx == "\"" { out = out + "\"" }
+                else { if nx == "\\" { out = out + "\\" }
+                else { if nx == "/" { out = out + "/" }
+                else { if nx == "0" { out = out + "" }
+                else { out = out + nx } } } } } } }
+                i = i + 2
+            } else {
+                out = out + c
+                i = i + 1
+            }
+        }
+        return out
+    }
+    if first == "'" && last == "'" && n >= 2 {
+        let body = t.substring(1, n - 1)
+        let bn = len(body)
+        let mut out = ""
+        let mut i = 0
+        while i < bn {
+            let c = body[i]
+            if c == "'" && i + 1 < bn && body[i + 1] == "'" {
+                out = out + "'"
+                i = i + 2
+            } else {
+                out = out + c
+                i = i + 1
+            }
+        }
+        return out
+    }
+    return t
+}
+
+// Convert a plain scalar string to its yaml 1.2 typed value.
+// Note: yaml 1.1 yes/no/on/off NOT translated (BaseLoader behaviour).
+fn _yml_typed_scalar(raw) {
+    let s = raw
+    if s == "" { return void }
+    if s == "null" { return void }
+    if s == "Null" { return void }
+    if s == "NULL" { return void }
+    if s == "~" { return void }
+    if s == "true" { return true }
+    if s == "True" { return true }
+    if s == "TRUE" { return true }
+    if s == "false" { return false }
+    if s == "False" { return false }
+    if s == "FALSE" { return false }
+    let n = len(s)
+    let mut i = 0
+    let mut has_digit = false
+    let mut has_dot = false
+    let mut has_e = false
+    let mut ok = true
+    if n == 0 { return s }
+    let first = s[0]
+    if first == "-" || first == "+" { i = 1 }
+    while i < n {
+        let c = s[i]
+        if c >= "0" && c <= "9" { has_digit = true }
+        else { if c == "." && !has_dot && !has_e { has_dot = true }
+        else { if (c == "e" || c == "E") && has_digit && !has_e { has_e = true; if i + 1 < n {
+                let nx = s[i + 1]
+                if nx == "-" || nx == "+" { i = i + 1 }
+            } }
+        else { ok = false; i = n } } }
+        i = i + 1
+    }
+    if ok && has_digit {
+        // Route through json_parse for parity with json.hexa numeric range.
+        let r = json_parse(s)
+        let rt = type_of(r)
+        if rt == "int" || rt == "float" { return r }
+        return s
+    }
+    return s
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Parser — block style (subset)
+// ─────────────────────────────────────────────────────────────────────────
+
+let mut _yml_lines = []
+let mut _yml_cur = 0
+
+fn _yml_peek_line() {
+    if _yml_cur >= len(_yml_lines) { return "" }
+    return _yml_lines[_yml_cur]
+}
+
+// Skip comment-only and blank lines. Return false at EOF.
+fn _yml_skip_blank() {
+    let mut found = false
+    let mut done = false
+    while !done && _yml_cur < len(_yml_lines) {
+        let raw = _yml_lines[_yml_cur]
+        let t = raw.trim()
+        if t == "" { _yml_cur = _yml_cur + 1 }
+        else { if t[0] == "#" { _yml_cur = _yml_cur + 1 }
+        else { found = true; done = true } }
+    }
+    return found
+}
+
+fn _yml_starts_with_block_indicator(body) {
+    if len(body) == 0 { return false }
+    let c = body[0]
+    if c != "|" && c != ">" { return false }
+    if len(body) == 1 { return true }
+    let nx = body[1]
+    if nx == "-" || nx == "+" || (nx >= "0" && nx <= "9") || nx == " " || nx == "\t" { return true }
+    return false
+}
+
+fn _yml_line_is_mapping(body) {
+    let n = len(body)
+    let mut i = 0
+    let mut in_sq = false
+    let mut in_dq = false
+    if n > 0 && (body[0] == "{" || body[0] == "[") { return false }
+    let mut found = false
+    let mut done = false
+    while !done && i < n {
+        let c = body[i]
+        if in_sq { if c == "'" { in_sq = false } }
+        else { if in_dq {
+                if c == "\\" { i = i + 1 } else { if c == "\"" { in_dq = false } }
+            }
+        else {
+            if c == "'" { in_sq = true }
+            else { if c == "\"" { in_dq = true }
+            else { if c == "#" { done = true }
+            else { if c == ":" {
+                if i + 1 >= n { found = true; done = true }
+                else {
+                    let nx = body[i + 1]
+                    if nx == " " || nx == "\t" { found = true; done = true }
+                }
+            } } } }
+        } }
+        if !done { i = i + 1 }
+    }
+    return found
+}
+
+fn _yml_find_map_colon(body) {
+    let n = len(body)
+    let mut i = 0
+    let mut in_sq = false
+    let mut in_dq = false
+    let mut result = -1
+    let mut done = false
+    while !done && i < n {
+        let c = body[i]
+        if in_sq { if c == "'" { in_sq = false } }
+        else { if in_dq {
+                if c == "\\" { i = i + 1 } else { if c == "\"" { in_dq = false } }
+            }
+        else {
+            if c == "'" { in_sq = true }
+            else { if c == "\"" { in_dq = true }
+            else { if c == "#" { done = true }
+            else { if c == ":" {
+                if i + 1 >= n { result = i; done = true }
+                else {
+                    let nx = body[i + 1]
+                    if nx == " " || nx == "\t" { result = i; done = true }
+                }
+            } } } }
+        } }
+        if !done { i = i + 1 }
+    }
+    return result
+}
+
+fn _yml_parse_value(base_indent) {
+    if !_yml_skip_blank() { return void }
+    let line = _yml_peek_line()
+    let ind = _yml_count_indent(line)
+    if ind < base_indent { return void }
+    let body = line.substring(ind, len(line))
+    if len(body) >= 2 && body[0] == "-" && body[1] == " " { return _yml_parse_list(ind) }
+    if body == "-" { return _yml_parse_list(ind) }
+    if _yml_line_is_mapping(body) { return _yml_parse_map(ind) }
+    if body == "|" || body == ">" || _yml_starts_with_block_indicator(body) {
+        _yml_cur = _yml_cur + 1
+        return _yml_parse_block_scalar_body(ind, body)
+    }
+    _yml_cur = _yml_cur + 1
+    return _yml_parse_scalar_or_flow(body)
+}
+
+fn _yml_parse_map(base_indent) {
+    let m = _yml_new_map()
+    let mut done = false
+    while !done && _yml_skip_blank() {
+        let line = _yml_peek_line()
+        let ind = _yml_count_indent(line)
+        if ind < base_indent { done = true }
+        else { if ind > base_indent { done = true }
+        else {
+            let body = line.substring(ind, len(line))
+            if !_yml_line_is_mapping(body) { done = true }
+            else {
+                let cp = _yml_find_map_colon(body)
+                if cp < 0 { done = true }
+                else {
+                    let key_raw = body.substring(0, cp).trim()
+                    let key = _yml_unquote_scalar(key_raw)
+                    let after = body.substring(cp + 1, len(body))
+                    let stripped = _yml_strip_comment(after)
+                    let value_text = stripped[0].trim()
+                    _yml_cur = _yml_cur + 1
+                    if value_text == "" {
+                        let saved = _yml_cur
+                        if !_yml_skip_blank() { m[key] = void }
+                        else {
+                            let nx_line = _yml_peek_line()
+                            let nx_ind = _yml_count_indent(nx_line)
+                            if nx_ind > base_indent {
+                                m[key] = _yml_parse_value(nx_ind)
+                            } else {
+                                _yml_cur = saved
+                                m[key] = void
+                            }
+                        }
+                    } else {
+                        if value_text == "|" || value_text == ">" || _yml_starts_with_block_indicator(value_text) {
+                            m[key] = _yml_parse_block_scalar_body(base_indent, value_text)
+                        } else {
+                            m[key] = _yml_parse_scalar_or_flow(value_text)
+                        }
+                    }
+                }
+            }
+        } }
+    }
+    return m
+}
+
+fn _yml_parse_list(base_indent) {
+    let arr = []
+    let mut done = false
+    while !done && _yml_skip_blank() {
+        let line = _yml_peek_line()
+        let ind = _yml_count_indent(line)
+        if ind != base_indent { done = true }
+        else {
+            let body = line.substring(ind, len(line))
+            if len(body) == 0 || body[0] != "-" { done = true }
+            else {
+                let mut rest_str = ""
+                if len(body) > 1 { rest_str = body.substring(2, len(body)) }
+                _yml_cur = _yml_cur + 1
+                if rest_str == "" {
+                    let saved = _yml_cur
+                    if !_yml_skip_blank() { arr.push(void) }
+                    else {
+                        let nx_line = _yml_peek_line()
+                        let nx_ind = _yml_count_indent(nx_line)
+                        if nx_ind > base_indent {
+                            arr.push(_yml_parse_value(nx_ind))
+                        } else {
+                            _yml_cur = saved
+                            arr.push(void)
+                        }
+                    }
+                } else {
+                    let stripped = _yml_strip_comment(rest_str)
+                    let rs = stripped[0].trim()
+                    if _yml_line_is_mapping(rs) {
+                        // Treat as inline mapping starting at col ind+2.
+                        _yml_cur = _yml_cur - 1
+                        let synth_indent = ind + 2
+                        let pad = _yml_pad(synth_indent)
+                        _yml_lines[_yml_cur] = pad + rs
+                        arr.push(_yml_parse_map(synth_indent))
+                    } else {
+                        if rs == "|" || rs == ">" || _yml_starts_with_block_indicator(rs) {
+                            arr.push(_yml_parse_block_scalar_body(ind, rs))
+                        } else {
+                            arr.push(_yml_parse_scalar_or_flow(rs))
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return arr
+}
+
+fn _yml_parse_block_scalar_body(base_indent, header) {
+    let folded = (header[0] == ">")
+    let mut chomp = "clip"
+    let hn = len(header)
+    let mut hi = 1
+    while hi < hn {
+        let c = header[hi]
+        if c == "-" { chomp = "strip" }
+        else { if c == "+" { chomp = "keep" } }
+        hi = hi + 1
+    }
+    let mut child_indent = -1
+    let mut buf = ""
+    let mut first = true
+    let mut done = false
+    while !done && _yml_cur < len(_yml_lines) {
+        let raw = _yml_lines[_yml_cur]
+        let t = raw.trim()
+        if t == "" {
+            buf = buf + "\n"
+            _yml_cur = _yml_cur + 1
+        } else {
+            let ind = _yml_count_indent(raw)
+            if ind <= base_indent { done = true }
+            else {
+                if child_indent < 0 { child_indent = ind }
+                let body = raw.substring(child_indent, len(raw))
+                if first {
+                    buf = body
+                    first = false
+                } else {
+                    if folded { buf = buf + " " + body }
+                    else { buf = buf + "\n" + body }
+                }
+                _yml_cur = _yml_cur + 1
+            }
+        }
+    }
+    if chomp == "strip" {
+        let mut sdone = false
+        while !sdone {
+            if len(buf) > 0 && buf[len(buf) - 1] == "\n" {
+                buf = buf.substring(0, len(buf) - 1)
+            } else { sdone = true }
+        }
+    } else { if chomp == "clip" {
+        let mut sdone = false
+        while !sdone {
+            if len(buf) > 0 && buf[len(buf) - 1] == "\n" {
+                buf = buf.substring(0, len(buf) - 1)
+            } else { sdone = true }
+        }
+        buf = buf + "\n"
+    } }
+    return buf
+}
+
+fn _yml_parse_scalar_or_flow(raw) {
+    let t = raw.trim()
+    if t == "" { return void }
+    let stripped = _yml_strip_comment(t)
+    let body = stripped[0].trim()
+    if body == "" { return void }
+    let n = len(body)
+    let first = body[0]
+    if first == "\"" || first == "'" { return _yml_unquote_scalar(body) }
+    if first == "[" || first == "{" {
+        let r = json_parse(body)
+        if type_of(r) == "void" { return body }
+        return r
+    }
+    return _yml_typed_scalar(body)
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Public parse API
+// ─────────────────────────────────────────────────────────────────────────
+
+fn yaml_parse_safe(text) {
+    let s = to_string(text)
+    if len(s) == 0 { return [false, void] }
+    _yml_lines = s.split("\n")
+    _yml_cur = 0
+    let mut ldone = false
+    while !ldone && _yml_cur < len(_yml_lines) {
+        let raw = _yml_lines[_yml_cur]
+        let t = raw.trim()
+        if t == "---" || t == "" || (len(t) > 0 && t[0] == "#") {
+            _yml_cur = _yml_cur + 1
+        } else { ldone = true }
+    }
+    if _yml_cur >= len(_yml_lines) { return [true, void] }
+    let first_line = _yml_lines[_yml_cur]
+    let base = _yml_count_indent(first_line)
+    let v = _yml_parse_value(base)
+    return [true, v]
+}
+
+fn yaml_parse_or_throw(text) {
+    let r = yaml_parse_safe(text)
+    if !r[0] {
+        eprintln("yaml_parse: invalid YAML input (len=" + to_string(len(to_string(text))) + ")")
+        exit(1)
+    }
+    return r[1]
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Emitter — block style (yaml 1.2)
+// ─────────────────────────────────────────────────────────────────────────
+
+fn _yml_pad(n) {
+    let mut s = ""
+    let mut i = 0
+    while i < n {
+        s = s + " "
+        i = i + 1
+    }
+    return s
+}
+
+fn _yml_scalar_needs_quotes(s) {
+    if s == "" { return true }
+    let n = len(s)
+    if s == "null" || s == "Null" || s == "NULL" || s == "~" { return true }
+    if s == "true" || s == "True" || s == "TRUE" { return true }
+    if s == "false" || s == "False" || s == "FALSE" { return true }
+    if s[0] == " " || s[0] == "\t" { return true }
+    if s[n - 1] == " " || s[n - 1] == "\t" { return true }
+    let first = s[0]
+    if first == "-" && n >= 2 && (s[1] == " " || s[1] == "\t") { return true }
+    if first == "?" || first == "*" || first == "&" || first == "!"
+       || first == "|" || first == ">" || first == "%" || first == "@"
+       || first == "`" || first == "[" || first == "]" || first == "{"
+       || first == "}" || first == "," || first == "#" {
+        return true
+    }
+    let typed = _yml_typed_scalar(s)
+    if type_of(typed) != "string" { return true }
+    let mut i = 0
+    let mut found = false
+    while !found && i < n {
+        let c = s[i]
+        if c == "\n" || c == "\r" || c == "\t" { found = true }
+        else { if c == ":" {
+            if i + 1 >= n { found = true }
+            else { if s[i + 1] == " " { found = true } }
+        }
+        else { if c == "#" && i > 0 {
+            let prev = s[i - 1]
+            if prev == " " || prev == "\t" { found = true }
+        } } }
+        if !found { i = i + 1 }
+    }
+    return found
+}
+
+fn _yml_quote_dq(s) {
+    let n = len(s)
+    let mut out = "\""
+    let mut i = 0
+    while i < n {
+        let c = s[i]
+        if c == "\\" { out = out + "\\\\" }
+        else { if c == "\"" { out = out + "\\\"" }
+        else { if c == "\n" { out = out + "\\n" }
+        else { if c == "\r" { out = out + "\\r" }
+        else { if c == "\t" { out = out + "\\t" }
+        else { out = out + c } } } } }
+        i = i + 1
+    }
+    out = out + "\""
+    return out
+}
+
+fn _yml_emit_scalar(v) {
+    let t = type_of(v)
+    if t == "void" { return "null" }
+    if t == "bool" { if v { return "true" } else { return "false" } }
+    if t == "int" { return to_string(v) }
+    if t == "float" { return to_string(v) }
+    if t == "string" {
+        if _yml_scalar_needs_quotes(v) { return _yml_quote_dq(v) }
+        return v
+    }
+    return to_string(v)
+}
+
+fn _yml_emit_value(v, indent_step, level) {
+    let t = type_of(v)
+    if t == "map" { return _yml_emit_map(v, indent_step, level) }
+    if t == "array" { return _yml_emit_list(v, indent_step, level) }
+    return _yml_emit_scalar(v)
+}
+
+fn _yml_emit_map(m, indent_step, level) {
+    let ks = dict_keys(m)
+    if len(ks) == 0 { return "{}" }
+    let pad = _yml_pad(level * indent_step)
+    let mut out = ""
+    let mut i = 0
+    while i < len(ks) {
+        let k = ks[i]
+        let v = m[k]
+        let t = type_of(v)
+        let ks_emit = _yml_emit_scalar(k)
+        if t == "map" {
+            let kk = dict_keys(v)
+            if len(kk) == 0 { out = out + pad + ks_emit + ": {}\n" }
+            else {
+                out = out + pad + ks_emit + ":\n"
+                out = out + _yml_emit_map(v, indent_step, level + 1)
+            }
+        } else { if t == "array" {
+            if len(v) == 0 { out = out + pad + ks_emit + ": []\n" }
+            else {
+                out = out + pad + ks_emit + ":\n"
+                out = out + _yml_emit_list(v, indent_step, level + 1)
+            }
+        } else {
+            out = out + pad + ks_emit + ": " + _yml_emit_scalar(v) + "\n"
+        } }
+        i = i + 1
+    }
+    return out
+}
+
+fn _yml_emit_list(arr, indent_step, level) {
+    if len(arr) == 0 { return "[]" }
+    let pad = _yml_pad(level * indent_step)
+    let mut out = ""
+    let mut i = 0
+    while i < len(arr) {
+        let v = arr[i]
+        let t = type_of(v)
+        if t == "map" {
+            let kk = dict_keys(v)
+            if len(kk) == 0 { out = out + pad + "- {}\n" }
+            else {
+                let mut j = 0
+                while j < len(kk) {
+                    let k = kk[j]
+                    let kv = v[k]
+                    let kvt = type_of(kv)
+                    let mut p = ""
+                    if j == 0 { p = pad + "- " } else { p = pad + "  " }
+                    let ks_emit = _yml_emit_scalar(k)
+                    if kvt == "map" {
+                        let kkk = dict_keys(kv)
+                        if len(kkk) == 0 { out = out + p + ks_emit + ": {}\n" }
+                        else {
+                            out = out + p + ks_emit + ":\n"
+                            out = out + _yml_emit_map(kv, indent_step, level + 2)
+                        }
+                    } else { if kvt == "array" {
+                        if len(kv) == 0 { out = out + p + ks_emit + ": []\n" }
+                        else {
+                            out = out + p + ks_emit + ":\n"
+                            out = out + _yml_emit_list(kv, indent_step, level + 2)
+                        }
+                    } else {
+                        out = out + p + ks_emit + ": " + _yml_emit_scalar(kv) + "\n"
+                    } }
+                    j = j + 1
+                }
+            }
+        } else { if t == "array" {
+            if len(v) == 0 { out = out + pad + "- []\n" }
+            else {
+                out = out + pad + "-\n"
+                out = out + _yml_emit_list(v, indent_step, level + 1)
+            }
+        } else {
+            out = out + pad + "- " + _yml_emit_scalar(v) + "\n"
+        } }
+        i = i + 1
+    }
+    return out
+}
+
+fn yaml_emit(value, opts) {
+    let mut indent_step = 2
+    if type_of(opts) == "map" {
+        let ks = dict_keys(opts)
+        let mut i = 0
+        while i < len(ks) {
+            if ks[i] == "indent" { indent_step = opts["indent"] }
+            i = i + 1
+        }
+    }
+    return _yml_emit_value(value, indent_step, 0)
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Mutator — line-anchored (preserves comments, blank lines, ordering)
+// ─────────────────────────────────────────────────────────────────────────
+//
+// Strategy:
+//   1. Parse path expression → segment list (key | filter | index).
+//   2. Walk source line-by-line tracking path stack via indentation.
+//   3. Re-emit only the matched node's lines at original indent;
+//      every other line is byte-preserved.
+//
+// Sub-gap (L2): no regex stdlib; path grammar hand-parsed.
+
+fn _yml_path_parse(expr) {
+    let segs = []
+    let n = len(expr)
+    let mut i = 0
+    let mut cur = ""
+    while i < n {
+        let c = expr[i]
+        if c == "." {
+            if cur != "" {
+                let seg = _yml_new_map()
+                seg["op"] = "key"
+                seg["name"] = cur
+                segs.push(seg)
+                cur = ""
+            }
+            i = i + 1
+        } else { if c == "[" {
+            if cur != "" {
+                let seg = _yml_new_map()
+                seg["op"] = "key"
+                seg["name"] = cur
+                let close = expr.index_of("]")
+                if close < 0 { return [] }
+                let inside = expr.substring(i + 1, close)
+                let eq = inside.index_of("=")
+                if eq >= 0 {
+                    seg["filter_key"] = inside.substring(0, eq).trim()
+                    seg["filter_value"] = inside.substring(eq + 1, len(inside)).trim()
+                    segs.push(seg)
+                    i = close + 1
+                    cur = ""
+                } else {
+                    segs.push(seg)
+                    let idx_seg = _yml_new_map()
+                    idx_seg["op"] = "index"
+                    idx_seg["index"] = json_parse(inside.trim())
+                    segs.push(idx_seg)
+                    i = close + 1
+                    cur = ""
+                }
+            } else {
+                let close = expr.index_of("]")
+                if close < 0 { return [] }
+                let inside = expr.substring(i + 1, close)
+                let eq = inside.index_of("=")
+                if eq < 0 {
+                    let idx_seg = _yml_new_map()
+                    idx_seg["op"] = "index"
+                    idx_seg["index"] = json_parse(inside.trim())
+                    segs.push(idx_seg)
+                    i = close + 1
+                } else { return [] }
+            }
+        } else {
+            cur = cur + c
+            i = i + 1
+        } }
+    }
+    if cur != "" {
+        let seg = _yml_new_map()
+        seg["op"] = "key"
+        seg["name"] = cur
+        segs.push(seg)
+    }
+    return segs
+}
+
+fn _yml_seg_has_filter(seg) {
+    let segks = dict_keys(seg)
+    let mut kk = 0
+    while kk < len(segks) {
+        if segks[kk] == "filter_key" { return true }
+        kk = kk + 1
+    }
+    return false
+}
+
+fn _yml_locate(lines, path) {
+    let res = _yml_new_map()
+    res["ok"] = false
+    if len(path) == 0 { return res }
+    let mut cur = 0
+    let mut base_indent = 0
+    let mut done = false
+    while !done && cur < len(lines) {
+        let raw = lines[cur]
+        let t = raw.trim()
+        if t == "" || (len(t) > 0 && t[0] == "#") || t == "---" {
+            cur = cur + 1
+        } else {
+            base_indent = _yml_count_indent(raw)
+            done = true
+        }
+    }
+    return _yml_locate_walk(lines, path, 0, cur, base_indent, res)
+}
+
+fn _yml_locate_walk(lines, path, pidx, start_cur, base, res) {
+    if pidx >= len(path) { return res }
+    let seg = path[pidx]
+    let op = seg["op"]
+    let total = len(lines)
+    let mut cur = start_cur
+    if op == "index" {
+        return _yml_locate_list_index(lines, path, pidx, cur, base - 2, res)
+    }
+    if op != "key" { return res }
+    let mut wdone = false
+    while !wdone && cur < total {
+        let raw = lines[cur]
+        let t = raw.trim()
+        if t == "" || (len(t) > 0 && t[0] == "#") {
+            cur = cur + 1
+        } else {
+            let ind = _yml_count_indent(raw)
+            if ind < base { return res }
+            if ind > base { cur = cur + 1 }
+            else {
+                let body = raw.substring(ind, len(raw))
+                if !_yml_line_is_mapping(body) { return res }
+                let cp = _yml_find_map_colon(body)
+                let key_raw = body.substring(0, cp).trim()
+                let key = _yml_unquote_scalar(key_raw)
+                let after = body.substring(cp + 1, len(body))
+                let stripped = _yml_strip_comment(after)
+                let value_text = stripped[0].trim()
+                if key == seg["name"] {
+                    let has_filter = _yml_seg_has_filter(seg)
+                    if has_filter {
+                        return _yml_locate_filter(lines, path, pidx, cur + 1, ind, res)
+                    }
+                    if pidx + 1 >= len(path) {
+                        res["ok"] = true
+                        res["key_indent"] = ind
+                        res["key_line"] = raw
+                        res["after_colon"] = after
+                        res["start"] = cur
+                        if value_text == "" {
+                            let mut nxt = cur + 1
+                            let mut bdone = false
+                            while !bdone && nxt < total {
+                                let r2 = lines[nxt]
+                                let t2 = r2.trim()
+                                if t2 == "" || (len(t2) > 0 && t2[0] == "#") { nxt = nxt + 1 }
+                                else {
+                                    let i2 = _yml_count_indent(r2)
+                                    if i2 <= ind { bdone = true } else { nxt = nxt + 1 }
+                                }
+                            }
+                            res["end"] = nxt
+                            res["style"] = "block_value"
+                        } else {
+                            res["end"] = cur + 1
+                            res["style"] = "inline_value"
+                        }
+                        return res
+                    }
+                    let nxt_seg = path[pidx + 1]
+                    if nxt_seg["op"] == "index" {
+                        return _yml_locate_list_index(lines, path, pidx + 1, cur + 1, ind, res)
+                    }
+                    let mut child_cur = cur + 1
+                    let mut child_indent = -1
+                    let mut sdone = false
+                    while !sdone && child_cur < total {
+                        let r2 = lines[child_cur]
+                        let t2 = r2.trim()
+                        if t2 == "" || (len(t2) > 0 && t2[0] == "#") { child_cur = child_cur + 1 }
+                        else {
+                            child_indent = _yml_count_indent(r2)
+                            sdone = true
+                        }
+                    }
+                    if child_indent < 0 || child_indent <= ind { return res }
+                    return _yml_locate_walk(lines, path, pidx + 1, child_cur, child_indent, res)
+                }
+                if value_text == "" {
+                    let mut nxt = cur + 1
+                    let mut sdone = false
+                    while !sdone && nxt < total {
+                        let r2 = lines[nxt]
+                        let t2 = r2.trim()
+                        if t2 == "" || (len(t2) > 0 && t2[0] == "#") { nxt = nxt + 1 }
+                        else {
+                            let i2 = _yml_count_indent(r2)
+                            if i2 <= ind { sdone = true } else { nxt = nxt + 1 }
+                        }
+                    }
+                    cur = nxt
+                } else {
+                    cur = cur + 1
+                }
+            }
+        }
+    }
+    return res
+}
+
+fn _yml_locate_filter(lines, path, pidx, start_cur, parent_indent, res) {
+    let seg = path[pidx]
+    let fk = seg["filter_key"]
+    let fv = _yml_unquote_scalar(seg["filter_value"])
+    let total = len(lines)
+    let mut cur = start_cur
+    let mut child_indent = -1
+    let mut found_first = false
+    while !found_first && cur < total {
+        let r2 = lines[cur]
+        let t2 = r2.trim()
+        if t2 == "" || (len(t2) > 0 && t2[0] == "#") { cur = cur + 1 }
+        else {
+            let i2 = _yml_count_indent(r2)
+            if i2 <= parent_indent { return res }
+            child_indent = i2
+            found_first = true
+        }
+    }
+    if child_indent < 0 { return res }
+    let mut done = false
+    while !done && cur < total {
+        let raw = lines[cur]
+        let t = raw.trim()
+        if t == "" || (len(t) > 0 && t[0] == "#") { cur = cur + 1 }
+        else {
+            let ind = _yml_count_indent(raw)
+            if ind < child_indent { return res }
+            if ind > child_indent { cur = cur + 1 }
+            else {
+                let body = raw.substring(ind, len(raw))
+                if len(body) == 0 || body[0] != "-" { return res }
+                let item_start = cur
+                let item_indent = ind
+                let mut nxt = cur + 1
+                let mut edone = false
+                while !edone && nxt < total {
+                    let r2 = lines[nxt]
+                    let t2 = r2.trim()
+                    if t2 == "" || (len(t2) > 0 && t2[0] == "#") { nxt = nxt + 1 }
+                    else {
+                        let i2 = _yml_count_indent(r2)
+                        if i2 < item_indent { edone = true }
+                        else { if i2 == item_indent {
+                            let b2 = r2.substring(i2, len(r2))
+                            if len(b2) > 0 && b2[0] == "-" { edone = true }
+                            else { nxt = nxt + 1 }
+                        } else { nxt = nxt + 1 } }
+                    }
+                }
+                let inline_body = body.substring(2, len(body))
+                let inline_text = _yml_strip_comment(inline_body)[0].trim()
+                let mut matched = false
+                if _yml_line_is_mapping(inline_text) {
+                    let cp = _yml_find_map_colon(inline_text)
+                    let k0 = _yml_unquote_scalar(inline_text.substring(0, cp).trim())
+                    let v0_raw = inline_text.substring(cp + 1, len(inline_text))
+                    let v0 = _yml_unquote_scalar(_yml_strip_comment(v0_raw)[0].trim())
+                    if k0 == fk && v0 == fv { matched = true }
+                }
+                if !matched {
+                    let mut sc = item_start + 1
+                    let mut sdone = false
+                    while !sdone && sc < nxt {
+                        let rr = lines[sc]
+                        let tr = rr.trim()
+                        if tr != "" && !(len(tr) > 0 && tr[0] == "#") {
+                            let ir = _yml_count_indent(rr)
+                            if ir == item_indent + 2 {
+                                let b3 = rr.substring(ir, len(rr))
+                                if _yml_line_is_mapping(b3) {
+                                    let cp2 = _yml_find_map_colon(b3)
+                                    let k1 = _yml_unquote_scalar(b3.substring(0, cp2).trim())
+                                    let v1_raw = b3.substring(cp2 + 1, len(b3))
+                                    let v1 = _yml_unquote_scalar(_yml_strip_comment(v1_raw)[0].trim())
+                                    if k1 == fk && v1 == fv { matched = true; sdone = true }
+                                }
+                            }
+                        }
+                        if !sdone { sc = sc + 1 }
+                    }
+                }
+                if matched {
+                    if pidx + 1 >= len(path) {
+                        res["ok"] = true
+                        res["start"] = item_start
+                        res["end"] = nxt
+                        res["key_indent"] = item_indent
+                        res["key_line"] = lines[item_start]
+                        res["after_colon"] = ""
+                        res["style"] = "list_item"
+                        return res
+                    }
+                    return _yml_locate_walk(lines, path, pidx + 1, item_start + 1, item_indent + 2, res)
+                }
+                cur = nxt
+            }
+        }
+    }
+    return res
+}
+
+fn _yml_locate_list_index(lines, path, pidx, start_cur, parent_indent, res) {
+    let seg = path[pidx]
+    let target_idx = seg["index"]
+    let total = len(lines)
+    let mut cur = start_cur
+    let mut child_indent = -1
+    let mut found_first = false
+    while !found_first && cur < total {
+        let r2 = lines[cur]
+        let t2 = r2.trim()
+        if t2 == "" || (len(t2) > 0 && t2[0] == "#") { cur = cur + 1 }
+        else {
+            let i2 = _yml_count_indent(r2)
+            if i2 <= parent_indent { return res }
+            child_indent = i2
+            found_first = true
+        }
+    }
+    if child_indent < 0 { return res }
+    let mut idx = 0
+    let mut done = false
+    while !done && cur < total {
+        let raw = lines[cur]
+        let t = raw.trim()
+        if t == "" || (len(t) > 0 && t[0] == "#") { cur = cur + 1 }
+        else {
+            let ind = _yml_count_indent(raw)
+            if ind < child_indent { return res }
+            if ind > child_indent { cur = cur + 1 }
+            else {
+                let body = raw.substring(ind, len(raw))
+                if len(body) == 0 || body[0] != "-" { return res }
+                let item_start = cur
+                let mut nxt = cur + 1
+                let mut edone = false
+                while !edone && nxt < total {
+                    let r2 = lines[nxt]
+                    let t2 = r2.trim()
+                    if t2 == "" || (len(t2) > 0 && t2[0] == "#") { nxt = nxt + 1 }
+                    else {
+                        let i2 = _yml_count_indent(r2)
+                        if i2 < child_indent { edone = true }
+                        else { if i2 == child_indent {
+                            let b2 = r2.substring(i2, len(r2))
+                            if len(b2) > 0 && b2[0] == "-" { edone = true }
+                            else { nxt = nxt + 1 }
+                        } else { nxt = nxt + 1 } }
+                    }
+                }
+                if idx == target_idx {
+                    if pidx + 1 >= len(path) {
+                        res["ok"] = true
+                        res["start"] = item_start
+                        res["end"] = nxt
+                        res["key_indent"] = child_indent
+                        res["key_line"] = lines[item_start]
+                        res["after_colon"] = ""
+                        res["style"] = "list_item"
+                        return res
+                    }
+                    return _yml_locate_walk(lines, path, pidx + 1, item_start + 1, child_indent + 2, res)
+                }
+                idx = idx + 1
+                cur = nxt
+            }
+        }
+    }
+    return res
+}
+
+fn _yml_build_replacement(loc, new_value) {
+    let style = loc["style"]
+    let out = []
+    if style == "inline_value" {
+        let key_line = loc["key_line"]
+        let after = loc["after_colon"]
+        let stripped = _yml_strip_comment(after)
+        let value_part = stripped[0]
+        let comment = stripped[1]
+        let key_indent = loc["key_indent"]
+        let t = type_of(new_value)
+        let prefix_len = len(key_line) - len(after)
+        let prefix = key_line.substring(0, prefix_len)
+        if t == "map" || t == "array" {
+            let mut header = prefix
+            let mut hdone = false
+            while !hdone {
+                if len(header) > 0 && (header[len(header) - 1] == " " || header[len(header) - 1] == "\t") {
+                    header = header.substring(0, len(header) - 1)
+                } else { hdone = true }
+            }
+            out.push(header)
+            let child_indent = key_indent + 2
+            let body = _yml_emit_value(new_value, 2, 0)
+            let body_lines = body.split("\n")
+            let pad = _yml_pad(child_indent)
+            let mut i = 0
+            while i < len(body_lines) {
+                let bl = body_lines[i]
+                if i + 1 == len(body_lines) && bl == "" {} else { out.push(pad + bl) }
+                i = i + 1
+            }
+            return out
+        }
+        // Scalar replacement.
+        let new_scalar = _yml_emit_scalar(new_value)
+        let cur_trimmed = value_part.trim()
+        if new_scalar == cur_trimmed {
+            // No-op at byte level — keep original line verbatim.
+            out.push(key_line)
+            return out
+        }
+        let n_vp = len(value_part)
+        let mut lead = 0
+        let mut ldone = false
+        while !ldone && lead < n_vp {
+            let c = value_part[lead]
+            if c == " " || c == "\t" { lead = lead + 1 } else { ldone = true }
+        }
+        let mut trail = 0
+        let mut tdone = false
+        let mut k = n_vp - 1
+        while !tdone && k >= 0 {
+            let c = value_part[k]
+            if c == " " || c == "\t" { trail = trail + 1; k = k - 1 } else { tdone = true }
+        }
+        let lead_ws = value_part.substring(0, lead)
+        let trail_ws = value_part.substring(n_vp - trail, n_vp)
+        out.push(prefix + lead_ws + new_scalar + trail_ws + comment)
+        return out
+    }
+    if style == "block_value" {
+        let key_indent = loc["key_indent"]
+        let key_line = loc["key_line"]
+        let after = loc["after_colon"]
+        let stripped = _yml_strip_comment(after)
+        let t = type_of(new_value)
+        if t != "map" && t != "array" {
+            let comment = stripped[1]
+            let prefix_len = len(key_line) - len(after)
+            let prefix = key_line.substring(0, prefix_len)
+            let scalar = _yml_emit_scalar(new_value)
+            let mut new_line = prefix + " " + scalar
+            if comment != "" { new_line = new_line + " " + comment }
+            out.push(new_line)
+            return out
+        }
+        out.push(key_line)
+        let child_indent = key_indent + 2
+        let body = _yml_emit_value(new_value, 2, 0)
+        let body_lines = body.split("\n")
+        let pad = _yml_pad(child_indent)
+        let mut i = 0
+        while i < len(body_lines) {
+            let bl = body_lines[i]
+            if i + 1 == len(body_lines) && bl == "" {} else { out.push(pad + bl) }
+            i = i + 1
+        }
+        return out
+    }
+    if style == "list_item" {
+        let key_indent = loc["key_indent"]
+        let pad = _yml_pad(key_indent)
+        let t = type_of(new_value)
+        if t != "map" && t != "array" {
+            out.push(pad + "- " + _yml_emit_scalar(new_value))
+            return out
+        }
+        if t == "map" {
+            let ks = dict_keys(new_value)
+            if len(ks) == 0 { out.push(pad + "- {}"); return out }
+            let mut j = 0
+            while j < len(ks) {
+                let k = ks[j]
+                let kv = new_value[k]
+                let kvt = type_of(kv)
+                let mut pp = ""
+                if j == 0 { pp = pad + "- " } else { pp = pad + "  " }
+                let ks_emit = _yml_emit_scalar(k)
+                if kvt == "map" {
+                    let kkk = dict_keys(kv)
+                    if len(kkk) == 0 { out.push(pp + ks_emit + ": {}") }
+                    else {
+                        out.push(pp + ks_emit + ":")
+                        let body = _yml_emit_value(kv, 2, 0)
+                        let body_lines = body.split("\n")
+                        let cpad = _yml_pad(key_indent + 4)
+                        let mut i = 0
+                        while i < len(body_lines) {
+                            let bl = body_lines[i]
+                            if i + 1 == len(body_lines) && bl == "" {} else { out.push(cpad + bl) }
+                            i = i + 1
+                        }
+                    }
+                } else { if kvt == "array" {
+                    if len(kv) == 0 { out.push(pp + ks_emit + ": []") }
+                    else {
+                        out.push(pp + ks_emit + ":")
+                        let body = _yml_emit_value(kv, 2, 0)
+                        let body_lines = body.split("\n")
+                        let cpad = _yml_pad(key_indent + 4)
+                        let mut i = 0
+                        while i < len(body_lines) {
+                            let bl = body_lines[i]
+                            if i + 1 == len(body_lines) && bl == "" {} else { out.push(cpad + bl) }
+                            i = i + 1
+                        }
+                    }
+                } else {
+                    out.push(pp + ks_emit + ": " + _yml_emit_scalar(kv))
+                } }
+                j = j + 1
+            }
+            return out
+        }
+        let body = _yml_emit_value(new_value, 2, 0)
+        let body_lines = body.split("\n")
+        out.push(pad + "-")
+        let cpad = _yml_pad(key_indent + 2)
+        let mut i = 0
+        while i < len(body_lines) {
+            let bl = body_lines[i]
+            if i + 1 == len(body_lines) && bl == "" {} else { out.push(cpad + bl) }
+            i = i + 1
+        }
+        return out
+    }
+    return out
+}
+
+fn _yml_splice_lines(lines, start_idx, end_idx, replacement) {
+    let out = []
+    let mut i = 0
+    while i < start_idx { out.push(lines[i]); i = i + 1 }
+    let mut j = 0
+    while j < len(replacement) { out.push(replacement[j]); j = j + 1 }
+    let mut k = end_idx
+    while k < len(lines) { out.push(lines[k]); k = k + 1 }
+    return out
+}
+
+fn yaml_mutate(text, path_expr, new_value) {
+    let lines = to_string(text).split("\n")
+    let path = _yml_path_parse(path_expr)
+    if len(path) == 0 { return [false, text] }
+    let loc = _yml_locate(lines, path)
+    if !loc["ok"] { return [false, text] }
+    let replacement = _yml_build_replacement(loc, new_value)
+    // No-op short-circuit: if replacement byte-identical to original
+    // lines slice, return input verbatim (byte-eq guarantee).
+    let mut same = (len(replacement) == loc["end"] - loc["start"])
+    if same {
+        let mut i = 0
+        let mut sdone = false
+        while !sdone && i < len(replacement) {
+            if replacement[i] != lines[loc["start"] + i] { same = false; sdone = true }
+            else { i = i + 1 }
+        }
+    }
+    if same { return [true, text] }
+    let new_lines = _yml_splice_lines(lines, loc["start"], loc["end"], replacement)
+    return [true, new_lines.join("\n")]
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// SUB_GAPS — surfaced during this implementation
+// ─────────────────────────────────────────────────────────────────────────
+//
+// SG-1 (regex stdlib). yaml_mutate's path expression parser is hand-
+//   rolled because hexa-lang has no `self/stdlib/regex.hexa`. A regex
+//   stdlib would let us accept richer jq path syntax (slices, recursive
+//   descent, etc.).
+//
+// SG-2 (multi-document yaml). `---`-separated streams collapse to first
+//   doc only. A future yaml_parse_all_safe would close this.
+//
+// SG-3 (anchors / aliases / custom tags). Preserved verbatim during
+//   mutate (lines outside the mutation site, so byte-eq holds), but
+//   parse drops alias resolution and tag-typing. Honest C3.
+//
+// SG-4 (strict YAML 1.2 scalar grammar). Covers null/bool/int/float/string
+//   but does NOT cover every yaml 1.2 oddity (`0o17`, `0x1F`, `.inf`,
+//   `.nan`). Those coerce to strings under L1.
+//
+// SG-5 (flow-style multi-line). Single-line flow `[1, 2, 3]` works;
+//   multi-line flow with embedded newlines is out of scope.
+//
+// SG-6 (round-trip emitter). yaml_emit→parse→emit is byte-equal only
+//   when input had no comments and was already in our canonical block
+//   style. Byte-eq contract is on yaml_mutate's no-op path, not the
+//   emitter alone — see L4.
+
+// ─────────────────────────────────────────────────────────────────────────
+// --selftest + fixture-byte-eq entry points
+// ─────────────────────────────────────────────────────────────────────────
+
+fn _yml_selftest() {
+    let mut fail = 0
+    let mut n = 0
+
+    n = n + 1
+    let r1 = yaml_parse_safe("a: 1\nb: hi\n")
+    if !r1[0] { eprintln("FAIL 1 parse"); fail = fail + 1 }
+    else {
+        let v = r1[1]
+        if to_string(v["a"]) != "1" || v["b"] != "hi" {
+            eprintln("FAIL 1b values"); fail = fail + 1
+        }
+    }
+
+    n = n + 1
+    let r2 = yaml_parse_safe("- 1\n- 2\n- 3\n")
+    if !r2[0] { eprintln("FAIL 2 list"); fail = fail + 1 }
+    else {
+        let v = r2[1]
+        if len(v) != 3 || to_string(v[0]) != "1" {
+            eprintln("FAIL 2b list contents"); fail = fail + 1
+        }
+    }
+
+    n = n + 1
+    let r3 = yaml_parse_safe("outer:\n  inner: 42\n  list:\n    - a\n    - b\n")
+    if !r3[0] { eprintln("FAIL 3 nested"); fail = fail + 1 }
+    else {
+        let v = r3[1]
+        if to_string(v["outer"]["inner"]) != "42" || len(v["outer"]["list"]) != 2 {
+            eprintln("FAIL 3b nested"); fail = fail + 1
+        }
+    }
+
+    n = n + 1
+    let r4 = yaml_parse_safe("# leading\na: 1  # trailing\nb: 2\n")
+    if !r4[0] { eprintln("FAIL 4 comments"); fail = fail + 1 }
+    else {
+        let v = r4[1]
+        if to_string(v["a"]) != "1" {
+            eprintln("FAIL 4b values"); fail = fail + 1
+        }
+    }
+
+    // yaml 1.1 alias quirks → strings (BaseLoader)
+    n = n + 1
+    let r5 = yaml_parse_safe("yes_field: yes\nno_field: no\non_field: on\n")
+    if !r5[0] { eprintln("FAIL 5 1.1-quirks"); fail = fail + 1 }
+    else {
+        let v = r5[1]
+        if v["yes_field"] != "yes" || v["no_field"] != "no" || v["on_field"] != "on" {
+            eprintln("FAIL 5b yaml-1.1 quirk leaked: " + to_string(v["yes_field"])); fail = fail + 1
+        }
+    }
+
+    // emit + reparse round trip
+    n = n + 1
+    let m = _yml_new_map()
+    m["name"] = "hive"
+    m["count"] = 3
+    let arr = []
+    arr.push("a"); arr.push("b")
+    m["items"] = arr
+    let emitted = yaml_emit(m, _yml_new_map())
+    let r6 = yaml_parse_safe(emitted)
+    if !r6[0] { eprintln("FAIL 6 emit-reparse"); fail = fail + 1 }
+    else {
+        let v = r6[1]
+        if v["name"] != "hive" || to_string(v["count"]) != "3" || len(v["items"]) != 2 {
+            eprintln("FAIL 6b roundtrip"); fail = fail + 1
+        }
+    }
+
+    // mutate inline scalar — preserve trailing comment
+    n = n + 1
+    let src7 = "a: 1  # keep me\nb: 2\n"
+    let r7 = yaml_mutate(src7, "a", 99)
+    if !r7[0] { eprintln("FAIL 7 mutate"); fail = fail + 1 }
+    else {
+        let nt = r7[1]
+        if !nt.contains("a: 99") || !nt.contains("# keep me") || !nt.contains("b: 2") {
+            eprintln("FAIL 7b mutate result: " + nt); fail = fail + 1
+        }
+    }
+
+    // no-op mutate → byte-eq
+    n = n + 1
+    let src8 = "a: 1  # keep\nb: 2\n"
+    let r8 = yaml_mutate(src8, "a", 1)
+    if !r8[0] { eprintln("FAIL 8 noop ok"); fail = fail + 1 }
+    else {
+        if r8[1] != src8 {
+            eprintln("FAIL 8b noop byte-eq: " + r8[1]); fail = fail + 1
+        }
+    }
+
+    // filter mutate: repos[name=hive].mirrors
+    n = n + 1
+    let src9 = "repos:\n  - name: hive\n    mirrors:\n      - ubu\n      - ubu2\n  - name: nexus\n    mirrors:\n      - ubu\n"
+    let new_mirrors = []
+    new_mirrors.push("ubu"); new_mirrors.push("ubu2")
+    let r9 = yaml_mutate(src9, "repos[name=hive].mirrors", new_mirrors)
+    if !r9[0] { eprintln("FAIL 9 filter mutate"); fail = fail + 1 }
+    else {
+        let pp = yaml_parse_safe(r9[1])
+        if !pp[0] { eprintln("FAIL 9b reparse"); fail = fail + 1 }
+        else {
+            let v = pp[1]
+            if len(v["repos"]) != 2 || v["repos"][0]["name"] != "hive"
+               || len(v["repos"][0]["mirrors"]) != 2 {
+                eprintln("FAIL 9c filter result"); fail = fail + 1
+            }
+        }
+    }
+
+    // block scalar literal `|`
+    n = n + 1
+    let r10 = yaml_parse_safe("text: |\n  line1\n  line2\nnext: x\n")
+    if !r10[0] { eprintln("FAIL 10 block scalar"); fail = fail + 1 }
+    else {
+        let v = r10[1]
+        if v["text"] != "line1\nline2\n" || v["next"] != "x" {
+            eprintln("FAIL 10b block scalar: " + v["text"]); fail = fail + 1
+        }
+    }
+
+    if fail == 0 {
+        println("__YAML_SELFTEST__ PASS n=" + to_string(n) + " fail=0")
+    } else {
+        println("__YAML_SELFTEST__ FAIL n=" + to_string(n) + " fail=" + to_string(fail))
+    }
+}
+
+// Real-world fixture byte-eq round-trip.
+fn _yml_selftest_fixture(fixture_path) {
+    let src = read_file(fixture_path)
+    if len(src) == 0 {
+        println("__YAML_BYTE_EQ__ FAIL reason=fixture_missing path=" + fixture_path)
+        exit(1)
+    }
+    let pr = yaml_parse_safe(src)
+    if !pr[0] {
+        println("__YAML_BYTE_EQ__ FAIL reason=parse_failed")
+        exit(1)
+    }
+    let v = pr[1]
+    let cur = v["schema"]
+    let r = yaml_mutate(src, "schema", cur)
+    if !r[0] {
+        println("__YAML_BYTE_EQ__ FAIL reason=locate_failed path=schema")
+        exit(1)
+    }
+    if r[1] == src {
+        println("__YAML_BYTE_EQ__ PASS bytes=" + to_string(len(src)))
+        println("BYTE_EQ_PASS")
+        exit(0)
+    }
+    println("__YAML_BYTE_EQ__ FAIL reason=byte_diff in_len=" + to_string(len(src)) + " out_len=" + to_string(len(r[1])))
+    let il = src.split("\n")
+    let ol = r[1].split("\n")
+    let mut i = 0
+    let mut shown = 0
+    while i < len(il) && shown < 3 {
+        let a = il[i]
+        let mut b = ""
+        if i < len(ol) { b = ol[i] }
+        if a != b {
+            eprintln("DIFF L" + to_string(i + 1) + " in=<" + a + "> out=<" + b + ">")
+            shown = shown + 1
+        }
+        i = i + 1
+    }
+    exit(1)
+}
+
+let _yml_argv = args()
+let mut _yml_selftest_flag = false
+let mut _yml_fixture_flag = false
+let mut _yml_fixture_path = ""
+let mut _yml_ai = 0
+while _yml_ai < len(_yml_argv) {
+    let a = _yml_argv[_yml_ai]
+    if a == "--selftest-yaml" { _yml_selftest_flag = true }
+    if a == "--selftest" { _yml_selftest_flag = true }
+    if a == "--selftest-fixture" {
+        _yml_fixture_flag = true
+        if _yml_ai + 1 < len(_yml_argv) { _yml_fixture_path = _yml_argv[_yml_ai + 1] }
+    }
+    _yml_ai = _yml_ai + 1
+}
+if _yml_selftest_flag { _yml_selftest() }
+if _yml_fixture_flag { _yml_selftest_fixture(_yml_fixture_path) }

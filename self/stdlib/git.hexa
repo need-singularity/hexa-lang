@@ -1,0 +1,493 @@
+// @resolver-bypass(reason="git stdlib shells out to local git binary — darwin-native exec")
+// self/stdlib/git.hexa — typed git wrapper (hexa upstream gap #8)
+//
+// @module(slug="stdlib-git", desc="typed git surface — head/fetch/status/fast-forward")
+// @usage(use "self/stdlib/git"; let st = git_status("/path/to/repo"))
+//
+// Source spec: docs/hexa_url_complete_support_upstream_spec_2026_05_05.ai.md §2.7.
+//
+// PROBLEM
+//   hive/sync/{pull,push,status,rsync}.hexa today shell-escape git via
+//   exec("git -C <path> ..."). Per arch.002 (mac canonical, fast-forward
+//   only, conflict reject) the sync handler must distinguish three cases:
+//     · fast-forward — local strictly behind remote → safe to advance
+//     · diverged    — local has commits not in remote → REJECT with
+//                     __HEXA_MIRROR_DIVERGED__
+//     · noop        — local == remote → no work
+//   Parsing this from shell exit codes is brittle. This module exposes
+//   a typed value surface so the three-way distinction is a struct field
+//   rather than a fragile shell-parse.
+//
+// CONTRACT (raw#10 honest C3)
+//   The module shells out internally via exec() / exec_with_status().
+//   The typed surface — return values shaped {ok, sha, ...} — is the
+//   stable boundary. Callers should never re-derive the same
+//   information by re-parsing git stdout — go through these helpers.
+//
+//   raw#159 (upstream-proposal-mandate): hive sync verbs migrate to
+//   `use "self/stdlib/git"` and never shell out to git directly.
+//
+//   raw#9 (hexa-only-strict): no C runtime change. Pure stdlib wrapper
+//   over `exec_with_status` builtin. Cost: forks a /bin/sh per call.
+//   Acceptable for sync verbs (run a few times per cycle).
+//
+// EXPORTS
+//   git_head(path)
+//     -> {ok: bool, sha: str}
+//     run `git -C <path> rev-parse HEAD`. ok=false on error (not a repo,
+//     detached/empty repo, path missing). sha="" on error.
+//
+//   git_fetch(path, remote)
+//     -> {ok: bool, output: str}
+//     run `git -C <path> fetch <remote>`. output is stdout+stderr merged.
+//     ok=true iff exit==0. Caller decides whether to retry / surface.
+//
+//   git_status(path)
+//     -> {head_sha: str, ahead: int, behind: int, diverged: bool, dirty: bool}
+//     ahead/behind are vs the configured upstream of HEAD. If no upstream
+//     is configured, ahead/behind both 0 and diverged=false (callers can
+//     re-probe explicitly via git_fast_forward against an explicit remote).
+//     dirty=true iff `git status --porcelain` emits any line.
+//     diverged=(ahead > 0 && behind > 0).
+//
+//   git_fast_forward(path, remote, branch)
+//     -> {ok: bool, before: str, after: str, kind: "fast-forward"|"noop"|"diverged"|"error"}
+//     ATTEMPT to fast-forward `path` so HEAD matches `remote/branch`.
+//     Three-way distinction (per arch.002):
+//       · noop         : HEAD == remote/branch already
+//       · fast-forward : HEAD is ancestor of remote/branch (advance OK)
+//       · diverged     : HEAD has commits not reachable from remote/branch
+//                        (REFUSE — arch.002 conflict reject)
+//       · error        : couldn't probe (not a repo, no remote, etc.)
+//     Implementation uses `git merge-base --is-ancestor HEAD remote/branch`
+//     and the symmetric probe for the diverged case. The actual advance
+//     uses `git merge --ff-only remote/branch` — refuses to merge if not
+//     a clean fast-forward (so the typed `kind` and the on-disk effect
+//     never disagree).
+//     `before` / `after` are HEAD shas before and after the operation.
+//     For kind=noop / diverged / error, before == after.
+//
+//   git_diverged(local_path, remote_path, host)
+//     -> bool
+//     OPTIONAL cross-host probe. If `host` is empty (""), both paths are
+//     local — compares HEADs by sha and asserts ancestry locally. If
+//     `host` is non-empty, this would use `self/stdlib/ssh` to probe
+//     the remote-host head sha — TODO: gap-7 ssh stdlib not yet landed
+//     in hexa-lang upstream (2026-05-05). Cross-host calls currently
+//     return `true` conservatively (treat unknown as diverged) and emit
+//     a stderr warning.
+
+use "self/stdlib/proc"
+use "self/stdlib/shell_escape"
+
+// ── _git_run ───────────────────────────────────────────────────────
+// Run a git command at `path`, return [stdout_string, exit_code].
+// All paths/args are shell-escaped. We always use `git -C <path>` to
+// avoid changing process cwd (matters because hexa exec() forks /bin/sh
+// — no chdir leakage — but the argument shape stays uniform).
+//
+// stderr is merged into stdout via `2>&1` because the typed surface
+// only needs the exit code for control flow; output is for diagnostics.
+fn _git_run(path: string, argv_tail: string) -> [any] {
+    let cmd = "git -C " + shell_escape(path) + " " + argv_tail + " 2>&1"
+    let pair = exec_with_status(cmd)
+    let body = to_string(pair[0])
+    let rc = pair[1]
+    return [body, rc]
+}
+
+// ── _git_run_lines ─────────────────────────────────────────────────
+// Same as _git_run but returns [lines: [string], rc: int]. Used when
+// we need to inspect each line (status --porcelain, rev-list --count).
+fn _git_run_lines(path: string, argv_tail: string) -> [any] {
+    let pair = _git_run(path, argv_tail)
+    let body = to_string(pair[0])
+    let rc = pair[1]
+    let parts = split(body, "\n")
+    let n = len(parts)
+    if n > 0 && parts[n - 1] == "" {
+        let mut trimmed = []
+        let mut i = 0
+        while i < n - 1 {
+            trimmed.push(parts[i])
+            i = i + 1
+        }
+        return [trimmed, rc]
+    }
+    return [parts, rc]
+}
+
+// ── git_head ───────────────────────────────────────────────────────
+fn git_head(path: string) {
+    let pair = _git_run(path, "rev-parse HEAD")
+    let body = to_string(pair[0])
+    let rc = pair[1]
+    let mut out = {}
+    if rc != 0 {
+        out["ok"] = false
+        out["sha"] = ""
+        return out
+    }
+    out["ok"] = true
+    out["sha"] = body.trim()
+    return out
+}
+
+// ── git_fetch ──────────────────────────────────────────────────────
+fn git_fetch(path: string, remote: string) {
+    let pair = _git_run(path, "fetch " + shell_escape(remote))
+    let body = to_string(pair[0])
+    let rc = pair[1]
+    let mut out = {}
+    out["ok"] = rc == 0
+    out["output"] = body
+    return out
+}
+
+// ── _git_count_revs ────────────────────────────────────────────────
+// Internal: `git rev-list --count <range>` returning int (0 on error or
+// when the range cannot be evaluated, e.g. unknown ref). The "ok" signal
+// is folded into the count itself; callers that need to distinguish
+// "0 commits" from "no upstream" should probe upstream existence via
+// the rev-parse @{u} idiom first.
+fn _git_count_revs(path: string, range_arg: string) -> int {
+    let pair = _git_run(path, "rev-list --count " + range_arg)
+    let body = to_string(pair[0])
+    let rc = pair[1]
+    if rc != 0 { return 0 }
+    let trimmed = body.trim()
+    if len(trimmed) == 0 { return 0 }
+    // rev-list --count emits a single integer line.
+    return to_int(trimmed)
+}
+
+// ── _git_has_upstream ──────────────────────────────────────────────
+// True iff HEAD has an `@{u}` (configured upstream branch).
+fn _git_has_upstream(path: string) -> bool {
+    let pair = _git_run(path, "rev-parse --abbrev-ref --symbolic-full-name @{u}")
+    let rc = pair[1]
+    return rc == 0
+}
+
+// ── git_status ─────────────────────────────────────────────────────
+fn git_status(path: string) {
+    let mut out = {}
+    out["head_sha"] = ""
+    out["ahead"] = 0
+    out["behind"] = 0
+    out["diverged"] = false
+    out["dirty"] = false
+
+    // HEAD sha
+    let h = git_head(path)
+    if h["ok"] == false {
+        return out
+    }
+    out["head_sha"] = h["sha"]
+
+    // Dirty: any porcelain line means dirty.
+    let dpair = _git_run_lines(path, "status --porcelain")
+    let dlines = dpair[0]
+    let drc = dpair[1]
+    if drc == 0 && len(dlines) > 0 {
+        out["dirty"] = true
+    }
+
+    // ahead / behind vs upstream (if configured).
+    if _git_has_upstream(path) {
+        // ahead = commits in HEAD not in @{u}; behind = commits in @{u}
+        // not in HEAD. The two-dot range is left..right, so:
+        //   ahead  = rev-list --count @{u}..HEAD
+        //   behind = rev-list --count HEAD..@{u}
+        let ahead = _git_count_revs(path, "@{u}..HEAD")
+        let behind = _git_count_revs(path, "HEAD..@{u}")
+        out["ahead"] = ahead
+        out["behind"] = behind
+        if ahead > 0 && behind > 0 {
+            out["diverged"] = true
+        }
+    }
+
+    return out
+}
+
+// ── _git_is_ancestor ──────────────────────────────────────────────
+// True iff `ancestor_ref` is an ancestor of `descendant_ref` (or equal).
+// Uses `git merge-base --is-ancestor` which returns:
+//   0  → ancestor
+//   1  → not ancestor
+//   >1 → error (unknown ref, broken repo, ...)
+fn _git_is_ancestor(path: string, ancestor_ref: string, descendant_ref: string) -> [any] {
+    let cmd = "merge-base --is-ancestor " + shell_escape(ancestor_ref) + " " + shell_escape(descendant_ref)
+    let pair = _git_run(path, cmd)
+    let rc = pair[1]
+    // rc=0 → ancestor; rc=1 → not ancestor (still a successful probe);
+    // rc>1 → error. We surface as [ok: bool, is_ancestor: bool].
+    let mut out = []
+    if rc == 0 {
+        out.push(true)   // ok
+        out.push(true)   // is_ancestor
+    } else {
+        if rc == 1 {
+            out.push(true)   // ok (clean "not ancestor")
+            out.push(false)
+        } else {
+            out.push(false)  // error
+            out.push(false)
+        }
+    }
+    return out
+}
+
+// ── git_fast_forward ──────────────────────────────────────────────
+fn git_fast_forward(path: string, remote: string, branch: string) {
+    let mut out = {}
+    out["ok"] = false
+    out["before"] = ""
+    out["after"] = ""
+    out["kind"] = "error"
+
+    let h0 = git_head(path)
+    if h0["ok"] == false {
+        return out
+    }
+    let before = h0["sha"]
+    out["before"] = before
+    out["after"] = before
+
+    let target = remote + "/" + branch
+    // Resolve target sha — if it doesn't exist in object DB, kind=error.
+    let tpair = _git_run(path, "rev-parse " + shell_escape(target))
+    let trc = tpair[1]
+    if trc != 0 {
+        return out
+    }
+    let target_sha = to_string(tpair[0]).trim()
+
+    // noop: HEAD == target
+    if before == target_sha {
+        out["ok"] = true
+        out["kind"] = "noop"
+        return out
+    }
+
+    // fast-forward candidate: HEAD is ancestor of target
+    let anc1 = _git_is_ancestor(path, before, target_sha)
+    if anc1[0] == false {
+        return out
+    }
+    if anc1[1] == true {
+        // HEAD is ancestor of target → fast-forward is safe.
+        // Use `git merge --ff-only` so the runtime double-checks for us:
+        // if a race makes the merge non-ff between our probe and the
+        // attempt, git refuses, and we surface kind=error.
+        let mpair = _git_run(path, "merge --ff-only " + shell_escape(target))
+        let mrc = mpair[1]
+        if mrc != 0 {
+            // Race or local edit blocked the ff. Treat as error so the
+            // caller doesn't assume HEAD moved.
+            return out
+        }
+        let h1 = git_head(path)
+        if h1["ok"] == false {
+            return out
+        }
+        out["ok"] = true
+        out["kind"] = "fast-forward"
+        out["after"] = h1["sha"]
+        return out
+    }
+
+    // Not an ancestor → either target is ancestor of HEAD (we're ahead;
+    // arch.002 still treats this as "no advance needed but local is
+    // strictly ahead" — kind=diverged because the typed surface only
+    // promises three: noop / fast-forward / diverged) OR neither — true
+    // divergence. Either way, arch.002 says reject.
+    out["kind"] = "diverged"
+    out["ok"] = false
+    return out
+}
+
+// ── git_diverged ──────────────────────────────────────────────────
+// Cross-host probe (optional, gap-7 ssh stdlib pending). If `host` is
+// empty, both paths are treated as local. Otherwise the remote half is
+// resolved via ssh — TODO until self/stdlib/ssh.hexa lands.
+fn git_diverged(local_path: string, remote_path: string, host: string) -> bool {
+    if len(host) == 0 {
+        // Local-vs-local: cheapest correct check is "both heads known
+        // and are mutual ancestors of each other" → equal → not diverged.
+        // Anything else (including unreachable refs) is diverged.
+        let a = git_head(local_path)
+        let b = git_head(remote_path)
+        if a["ok"] == false || b["ok"] == false { return true }
+        if a["sha"] == b["sha"] { return false }
+        // Different shas — check both directions of ancestry inside the
+        // local_path object DB. (We assume the two paths are clones of
+        // the same upstream so objects are reachable.)
+        let aa = _git_is_ancestor(local_path, a["sha"], b["sha"])
+        if aa[0] && aa[1] { return false }   // local is ancestor of remote → ff possible
+        let bb = _git_is_ancestor(local_path, b["sha"], a["sha"])
+        if bb[0] && bb[1] { return false }   // remote is ancestor of local → ff possible (other direction)
+        return true   // neither side is ancestor → genuine divergence
+    }
+    // TODO(gap-7): cross-host probe via self/stdlib/ssh.hexa
+    //   let probe = ssh_exec(host, "git -C " + shell_escape(remote_path) +
+    //                              " rev-parse HEAD")
+    //   compare with git_head(local_path) + ancestry probe inside local
+    //   object DB (best effort).
+    // Until ssh stdlib lands, conservatively report diverged so callers
+    // refuse the advance rather than silently corrupting a mirror.
+    eprintln("git_diverged: cross-host probe (host=" + host + ") unsupported — gap-7 ssh stdlib not yet landed; treating as diverged (raw#91 honest)")
+    return true
+}
+
+// ── --selftest dispatcher ─────────────────────────────────────────
+//
+// `hexa run self/stdlib/git.hexa --selftest` exercises the typed surface
+// against a synthetic /tmp scratch git repo. We DO NOT run against the
+// hexa-lang repo itself in --selftest because the workspace state is
+// not under our control; the dedicated self/test/git_*.hexa fixtures
+// use the hexa-lang repo for read-only assertions.
+fn _git_selftest_main() {
+    let mut n = 0
+    let mut fail = 0
+
+    let pid = to_string(exec("echo $$")).trim()
+    let scratch = "/tmp/_hexa_git_selftest_" + pid
+    let _drop1 = exec("rm -rf " + shell_escape(scratch))
+    let _setup1 = exec("mkdir -p " + shell_escape(scratch))
+
+    // Build a fresh repo with two commits so we have something to probe.
+    let r = scratch + "/repo"
+    let setup = "set -e; " +
+        "mkdir -p " + shell_escape(r) + "; " +
+        "cd " + shell_escape(r) + "; " +
+        "git init -q -b main; " +
+        "git config user.email selftest@example.invalid; " +
+        "git config user.name selftest; " +
+        "echo a > a.txt; git add a.txt; git commit -q -m c1; " +
+        "echo b > b.txt; git add b.txt; git commit -q -m c2"
+    let _setup2 = exec(setup + " 2>&1")
+
+    // Case 1: git_head returns ok=true and a 40-char sha
+    n = n + 1
+    let h = git_head(r)
+    if h["ok"] != true || len(h["sha"]) != 40 {
+        fail = fail + 1
+        eprintln("[git.selftest] FAIL case1 head: " + to_string(h))
+    }
+
+    // Case 2: git_status on clean repo (no upstream) — dirty=false,
+    // ahead=0, behind=0, diverged=false.
+    n = n + 1
+    let st = git_status(r)
+    if st["dirty"] != false || st["ahead"] != 0 || st["behind"] != 0 || st["diverged"] != false {
+        fail = fail + 1
+        eprintln("[git.selftest] FAIL case2 status clean: " + to_string(st))
+    }
+
+    // Case 3: dirty after edit
+    n = n + 1
+    let _dirty = exec("cd " + shell_escape(r) + " && echo c >> a.txt")
+    let st2 = git_status(r)
+    if st2["dirty"] != true {
+        fail = fail + 1
+        eprintln("[git.selftest] FAIL case3 status dirty: " + to_string(st2))
+    }
+    // restore clean
+    let _restore = exec("cd " + shell_escape(r) + " && git checkout -q -- a.txt")
+
+    // Case 4: git_head on bogus path → ok=false
+    n = n + 1
+    let h2 = git_head(scratch + "/nonexistent")
+    if h2["ok"] != false {
+        fail = fail + 1
+        eprintln("[git.selftest] FAIL case4 head on bogus: " + to_string(h2))
+    }
+
+    // Case 5: git_fast_forward against a synthetic remote where
+    // remote/branch == HEAD → kind=noop. We fake the remote ref by
+    // writing a packed-refs-style alias via `git update-ref`.
+    n = n + 1
+    let head_sha = h["sha"]
+    let _alias = exec("cd " + shell_escape(r) + " && git update-ref refs/remotes/origin/main " + head_sha)
+    let ff = git_fast_forward(r, "origin", "main")
+    if ff["kind"] != "noop" || ff["before"] != head_sha || ff["after"] != head_sha {
+        fail = fail + 1
+        eprintln("[git.selftest] FAIL case5 ff noop: " + to_string(ff))
+    }
+
+    // Case 6: git_fast_forward where origin/main is BEHIND head →
+    //   target is ancestor of HEAD → not "HEAD ancestor of target" →
+    //   kind=diverged per arch.002 (we already have what they don't).
+    n = n + 1
+    // Step origin/main back to first commit.
+    let first_sha = to_string(exec("cd " + shell_escape(r) + " && git rev-list --max-parents=0 HEAD")).trim()
+    let _alias2 = exec("cd " + shell_escape(r) + " && git update-ref refs/remotes/origin/main " + first_sha)
+    let ff2 = git_fast_forward(r, "origin", "main")
+    if ff2["kind"] != "diverged" {
+        fail = fail + 1
+        eprintln("[git.selftest] FAIL case6 ff diverged: " + to_string(ff2))
+    }
+
+    // Case 7: git_fast_forward where origin/main is AHEAD by a commit
+    // → kind=fast-forward (HEAD is ancestor of target). Build the ahead
+    // commit via a side branch + advance origin/main alias.
+    n = n + 1
+    let setup7 = "set -e; cd " + shell_escape(r) + "; " +
+        "git update-ref refs/remotes/origin/main " + head_sha + "; " +
+        "git branch -f side " + head_sha + "; " +
+        "git checkout -q side; echo c > c.txt; git add c.txt; git commit -q -m c3; " +
+        "ahead=$(git rev-parse HEAD); " +
+        "git update-ref refs/remotes/origin/main $ahead; " +
+        "git checkout -q main"
+    let _setup7 = exec(setup7 + " 2>&1")
+    let ff3 = git_fast_forward(r, "origin", "main")
+    if ff3["kind"] != "fast-forward" || ff3["after"] == head_sha {
+        fail = fail + 1
+        eprintln("[git.selftest] FAIL case7 ff advance: " + to_string(ff3))
+    }
+
+    // Case 8: git_diverged local-vs-local — clone repo, probe.
+    n = n + 1
+    let r2 = scratch + "/clone"
+    let _clone = exec("git clone -q " + shell_escape(r) + " " + shell_escape(r2) + " 2>&1")
+    let dv = git_diverged(r, r2, "")
+    if dv != false {
+        fail = fail + 1
+        eprintln("[git.selftest] FAIL case8 diverged false: got " + to_string(dv))
+    }
+
+    // teardown
+    let _drop2 = exec("rm -rf " + shell_escape(scratch))
+
+    let status = if fail == 0 { "PASS" } else { "FAIL" }
+    println("__GIT_SELFTEST__ " + status + " n=" + to_string(n) + " fail=" + to_string(fail))
+    if fail != 0 { exit(1) }
+}
+
+// argv-tail dispatch — same pattern as proc.hexa: fire on `--selftest`
+// unconditionally (the AOT exe's argv[1] is the cache path, not the
+// original script, so an `ends_with("/stdlib/git.hexa")` guard is
+// unreliable — see anatomical note in proc.hexa). This means importing
+// git.hexa into a host script that itself uses `--selftest` will run
+// git's selftest as a side effect; that mirrors proc.hexa's documented
+// behavior. Host scripts wanting to suppress should use `--selftest-X`
+// suffixed flags. raw#10 honest C3 disclosure.
+let __git_args = args()
+let mut __git_selftest = false
+let mut __git_i = 0
+while __git_i < len(__git_args) {
+    if __git_args[__git_i] == "--selftest-git" {
+        __git_selftest = true
+        break
+    }
+    if __git_args[__git_i] == "--selftest" {
+        __git_selftest = true
+        break
+    }
+    __git_i = __git_i + 1
+}
+if __git_selftest {
+    _git_selftest_main()
+}
