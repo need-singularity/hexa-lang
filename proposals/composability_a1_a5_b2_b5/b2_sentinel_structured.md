@@ -13,7 +13,7 @@
 
 Today `@sentinel` is **two unrelated things**:
 1. A comment-form *documentation marker* with ad-hoc payload `__NAME__ <PASS|FAIL>
-   mode=selftest` (see all `core/attr_format/*.hexa` headers).
+   mode=selftest` (see all `attr_format/core/*.hexa` headers).
 2. A printed-form *runtime breadcrumb* `println("__NAME__ PASS")` matched by external
    ledger scrapers (e.g. `tool/parallel_scheduler.hexa:293` checks for sentinel
    failure markers in subprocess stdout).
@@ -138,7 +138,7 @@ matches a declared `@sentinel(...)` attr in the same module OR catalog.
 
 ## §4 Impl plan (additive, no migration)
 
-**Attr registry side** (`hexa-lang/modules/attr_format/attr_v3.hexa` or sister extension):
+**Attr registry side** (`hexa-lang/attr_format/module/attr_v3.hexa` or sister extension):
 - Add `sentinel` to the typed-attr schema set:
   ```
   attr sentinel {
@@ -219,4 +219,4 @@ catalog round-trip, comment-form silent-ignore, scraper round-trip.
 
 - Effort: spec ~3h. Impl ~2 days (stdlib + lint + 1-2 catalog buckets).
 - Retire when: §6 fixture passes 4 sessions AND at least 2 existing tools opt in
-  (candidates: `tool/parallel_scheduler.hexa`, `core/grammar_format/grammar_format_main.hexa`).
+  (candidates: `tool/parallel_scheduler.hexa`, `grammar_format/core/grammar_format_main.hexa`).

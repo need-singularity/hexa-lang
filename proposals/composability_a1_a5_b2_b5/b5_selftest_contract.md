@@ -127,7 +127,7 @@ implementation can be a regular fn, attr is sugar.
 
 ## §4 Impl plan (additive, no migration)
 
-**Attr registry side** (`hexa-lang/modules/attr_format/attr_v3.hexa` extension):
+**Attr registry side** (`hexa-lang/attr_format/module/attr_v3.hexa` extension):
 - Add `selftest` to the typed-attr schema set:
   ```
   attr selftest {
@@ -211,5 +211,5 @@ composition), aggregator empty-module, aggregator multi-fn.
 
 - Effort: spec ~3h. Impl ~2-3 days (stdlib + aggregator + lint warn).
 - Retire when: §6 fixture passes 4 sessions AND at least one existing aggregator
-  (candidate: `core/attr_format/attr_format_main.hexa`'s 6-category checker) opts
+  (candidate: `attr_format/core/attr_format_main.hexa`'s 6-category checker) opts
   in to `@selftest` enforcement.

@@ -53,7 +53,7 @@ ssot_predecessor: /Users/<user>/core/hexa-lang/.roadmap.hexa-lang  (sha256 9ec15
 
 기존 SSOT 측 cluster:
 - `.roadmap.hexa-lang` (peer/main, 1082 bytes, sha256 9ec150d3…) — cond.1 (core+parser+lexer+codegen) + cond.2 (stdlib basics) + 4 excludes (sdk permanent / external_bindings permanent / sister_lang_interop permanent / tui deferred)
-- `core/grammar_format/` + `core/attr_format/` — Level 3a recursive dogfooding (각 4-core file pattern, modules/ 측 5 versions stub-from-spec) — 2026-05-02 land ledger marker 측 존재 (`grammar_format_core_module_dogfooding_landed.marker`, `attr_format_core_module_dogfooding_landed.marker`).
+- `grammar_format/core/` + `attr_format/core/` — Level 3a recursive dogfooding (각 4-core file pattern, modules/ 측 5 versions stub-from-spec) — 2026-05-02 land ledger marker 측 존재 (`grammar_format_core_module_dogfooding_landed.marker`, `attr_format_core_module_dogfooding_landed.marker`).
 
 ## §2 Phase 2 — `.roadmap.<domain>` 신규 후보 (peer SSOT scaffold, additive only)
 
@@ -117,8 +117,8 @@ ssot_predecessor: /Users/<user>/core/hexa-lang/.roadmap.hexa-lang  (sha256 9ec15
 
 | triplet ID | scope | current state | proposed action | 마이그레이션 | est LoC |
 |---|---|---|---|---|---|
-| **T-arch-1** | `core/grammar_format/` + `modules/grammar_format/` | 측 LANDED 측 4-core file 측 (source/registry/router/grammar_format_main) + README.ai.md + 5 versions stub-from-spec (마커 `grammar_format_core_module_dogfooding_landed.marker` 8499 bytes) | 측 별도 액션 측 없음 측 — 측 compliance 측 LANDED 측 측 단지 측 cross-link 측 본 doc 측 attest | NO | 0 |
-| **T-arch-2** | `core/attr_format/` + `modules/attr_format/` | 측 LANDED 측 4-core file 측 + 5 attr_v* + README.ai.md (마커 `attr_format_core_module_dogfooding_landed.marker`) | 측 별도 액션 측 없음 측 — 측 compliance 측 LANDED 측 측 본 doc cross-link only | NO | 0 |
+| **T-arch-1** | `grammar_format/core/` + `grammar_format/module/` | 측 LANDED 측 4-core file 측 (source/registry/router/grammar_format_main) + README.ai.md + 5 versions stub-from-spec (마커 `grammar_format_core_module_dogfooding_landed.marker` 8499 bytes) | 측 별도 액션 측 없음 측 — 측 compliance 측 LANDED 측 측 단지 측 cross-link 측 본 doc 측 attest | NO | 0 |
+| **T-arch-2** | `attr_format/core/` + `attr_format/module/` | 측 LANDED 측 4-core file 측 + 5 attr_v* + README.ai.md (마커 `attr_format_core_module_dogfooding_landed.marker`) | 측 별도 액션 측 없음 측 — 측 compliance 측 LANDED 측 측 본 doc cross-link only | NO | 0 |
 | **T-arch-3** | `self/runtime/` + `self/rt/` + `self/native/` 측 측 README.ai.md 측 측 audit | 측 README.ai.md 측 측 self/ 측 sub-cluster 측 측 부재 측 측 다수 (audit 측 미수행) | 측 RT1/RT2 측 (.roadmap.runtime) 측 + CG2 (.roadmap.codegen) 측 측 측 README.ai.md 측 추가 측 — additive only, 측 lint warn 측 측 측 자발적 측 compliance | NO | ~30-50 per README × 3 = ~90-150 |
 
 triplet 측 측 핵심 측 — T-arch-3 측 측 lint warn ramp 측 (warn-to-block-by 2026-08-02) 측 측 측 측 측 시점 측 측 측 measured 측 measured (measure pre-emptively in additive-only frame).
@@ -154,7 +154,7 @@ triplet 측 측 핵심 측 — T-arch-3 측 측 lint warn ramp 측 (warn-to-bloc
 ## §6 cross-link
 
 - `.roadmap.hexa-lang` (main, cond.1+cond.2 측 mirror)
-- `core/grammar_format/`, `core/attr_format/` (Level 3a 측 LANDED 측 dogfood, raw 270 mk2 arch.001 측 compliance)
+- `grammar_format/core/`, `attr_format/core/` (Level 3a 측 LANDED 측 dogfood, raw 270 mk2 arch.001 측 compliance)
 - hive `.raw.mk2` `arch.001` (collapsed canonical, 2026-05-02 land)
 - `.gitignore` 측 측 untouched (additive only — 측 본 5 SSOT 측 측 git tracked 측 측 측 권장)
 

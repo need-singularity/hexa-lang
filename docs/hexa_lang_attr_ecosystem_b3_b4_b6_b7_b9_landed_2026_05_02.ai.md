@@ -19,8 +19,8 @@ budget:
   migration_count: 0
 status: LANDED_FIVE_ATTR_ECOSYSTEM
 ssot_predecessors:
-  attr_format_dogfood: hexa-lang/core/attr_format/  (Level 3b WRAPPED — sister axis, format evolution v1..v5)
-  attr_format_modules: hexa-lang/modules/attr_format/ (5 versions)
+  attr_format_dogfood: hexa-lang/attr_format/core/  (Level 3b WRAPPED — sister axis, format evolution v1..v5)
+  attr_format_modules: hexa-lang/attr_format/module/ (5 versions)
   catalog_ssot:        hexa-lang/self/attrs/attrs.json (24-attr existing catalog)
   self_mk2_handoff:    hexa-lang/docs/hexa_lang_self_mk2_tuning_landed_2026_05_02.ai.md
 ---
@@ -44,7 +44,7 @@ ssot_predecessors:
 - **observable 검증** — present check only (free-form string, v2 측 typed schema 측 후속).
 - **action_on_fail 검증** — `warn|block|quarantine`. else error.
 - **runtime** — 측 본 attr 측 attr enforcer 측 (parse + validate + emit) 측 only. action_on_fail dispatch 측 sister lint pipeline 측 owns.
-- **module** — `modules/attr_ecosystem/attr_falsifier.hexa` (376 LoC).
+- **module** — `attr_ecosystem/module/attr_falsifier.hexa` (376 LoC).
 - **selftest** — 9 fixtures (meta + parse 0 / 1 / 2-decl / bad action / missing keys / invalid id / emit / empty source).
 
 ### B4 `@sister(path[, relation])`
@@ -54,7 +54,7 @@ ssot_predecessors:
 - **path 검증** — required + repo-relative (absolute path 측 reject — caller machine 측 hard-couple 방지) + non-empty.
 - **relation 검증** — `spec|impl|doc|test`. 측 absent 측 default "doc" 측 (no error).
 - **fs verify** — `attr_sister_validate_with_fs(decls, repo_root)` 측 측 lint pipeline 측 inject 측. `exec("test -e")` 측 read-only check.
-- **module** — `modules/attr_ecosystem/attr_sister.hexa` (384 LoC).
+- **module** — `attr_ecosystem/module/attr_sister.hexa` (384 LoC).
 - **selftest** — 10 fixtures (meta + parse 0 / 1 valid / abs path reject / bad relation / missing path / default relation / fs PASS docs / fs FAIL bogus / emit).
 
 ### B6 `@user-verbatim-record-exempt(reason)`
@@ -63,7 +63,7 @@ ssot_predecessors:
 - **semantics** — 측 측 BR-NO-USER-VERBATIM lint 측 측 측 형식화 측 exemption marker. 측 BG-8 record JSON lint introduced 측 측 정식화. reason 측 length floor (12 chars) 측 측 측 reflexive use 측 deter.
 - **reason 검증** — required + non-empty + `>= 12 chars` (else error).
 - **applies window** — `attr_user_verbatim_record_exempt_applies(decls, hit_line, window)` 측 측 candidate verbatim hit 측 측 측 측 가까운 exemption decl 측 측 측 측 cover 측 측 측 lint pipeline 측 측 dispatch.
-- **module** — `modules/attr_ecosystem/attr_user_verbatim_record_exempt.hexa` (364 LoC).
+- **module** — `attr_ecosystem/module/attr_user_verbatim_record_exempt.hexa` (364 LoC).
 - **selftest** — 10 fixtures (meta + parse 0 / dashed valid / underscore valid / missing reason / short reason / empty reason / applies window in / applies window out / emit).
 
 ### B7 `@migration-quarantine(reason, scope[, path])`
@@ -73,7 +73,7 @@ ssot_predecessors:
 - **reason 검증** — required + `>= 10 chars`.
 - **scope 검증** — `file|fn|decl|repo`. else error. `repo` 측 측 path missing 측 warn (not error) 측 — recommended convention.
 - **covers semantics** — `attr_migration_quarantine_covers(decls, target_line, total_lines)` 측 측 lint pipeline 측 측 candidate site 측 측 측 측 cover 측 측 측 (file/repo blanket / fn 200-line window / decl 30-line window).
-- **module** — `modules/attr_ecosystem/attr_migration_quarantine.hexa` (419 LoC).
+- **module** — `attr_ecosystem/module/attr_migration_quarantine.hexa` (419 LoC).
 - **selftest** — 13 fixtures (meta + parse 0 / dashed file / underscore fn / missing reason / missing scope / bad scope / short reason / scope=repo no path warn / scope=repo with path no warn / covers file blanket / covers fn in-window / covers fn out-window / emit).
 
 ### B9 `@env_required(name[, fallback])`
@@ -83,28 +83,28 @@ ssot_predecessors:
 - **name 검증** — `[A-Z][A-Z0-9_]{1,63}` (POSIX). lowercase / hyphen / leading digit 측 reject.
 - **fallback 검증** — optional, free-form string.
 - **resolve fn** — `attr_env_required_resolve(decl)` 측 측 `EnvResolveResult { ok, name, value, used_fallback, message }` 측 emit. portable `printenv` 측 사용 (env_var() 측 not always available 측 stage0).
-- **module** — `modules/attr_ecosystem/attr_env_required.hexa` (425 LoC).
+- **module** — `attr_ecosystem/module/attr_env_required.hexa` (425 LoC).
 - **selftest** — 12 fixtures (meta + parse 0 / underscore valid / dashed valid / missing name / lowercase name reject / hyphen name reject / resolve PATH (always set on darwin) / resolve missing → fallback / resolve missing no-fallback → hard error / resolve_all multi / emit).
 
 ## §2 산출물 (8 신규 file, additive only)
 
-### 5 신규 module file (modules/attr_ecosystem/)
+### 5 신규 module file (attr_ecosystem/module/)
 
 | code | module | sha256 | LoC |
 |------|--------|--------|-----|
-| **B3** | `modules/attr_ecosystem/attr_falsifier.hexa` | `9145512610d36a6e2125d358615a500ba23922361d8fee53d78bcfa3c1166e80` | 376 |
-| **B4** | `modules/attr_ecosystem/attr_sister.hexa` | `8f419982b2ccc565af41506efa1f01b5a34db6b7bf56169743d573e8bbfab769` | 384 |
-| **B6** | `modules/attr_ecosystem/attr_user_verbatim_record_exempt.hexa` | `6caa3182fcd409f3faff3e2359ea18b8fb1765de35376e13dcc67d3fe600b616` | 364 |
-| **B7** | `modules/attr_ecosystem/attr_migration_quarantine.hexa` | `55f1f23028ab32907854660f48ee8342bde8afe475c242e8f5d374ecd8432061` | 419 |
-| **B9** | `modules/attr_ecosystem/attr_env_required.hexa` | `eeabbc2ca11392db89f2123ab144e4c54d50246a76ba632408ed2bfe8dd2c02b` | 425 |
+| **B3** | `attr_ecosystem/module/attr_falsifier.hexa` | `9145512610d36a6e2125d358615a500ba23922361d8fee53d78bcfa3c1166e80` | 376 |
+| **B4** | `attr_ecosystem/module/attr_sister.hexa` | `8f419982b2ccc565af41506efa1f01b5a34db6b7bf56169743d573e8bbfab769` | 384 |
+| **B6** | `attr_ecosystem/module/attr_user_verbatim_record_exempt.hexa` | `6caa3182fcd409f3faff3e2359ea18b8fb1765de35376e13dcc67d3fe600b616` | 364 |
+| **B7** | `attr_ecosystem/module/attr_migration_quarantine.hexa` | `55f1f23028ab32907854660f48ee8342bde8afe475c242e8f5d374ecd8432061` | 419 |
+| **B9** | `attr_ecosystem/module/attr_env_required.hexa` | `eeabbc2ca11392db89f2123ab144e4c54d50246a76ba632408ed2bfe8dd2c02b` | 425 |
 
-### 3 신규 core file (core/attr_ecosystem/)
+### 3 신규 core file (attr_ecosystem/core/)
 
 | role | file | sha256 | LoC |
 |------|------|--------|-----|
-| interface | `core/attr_ecosystem/source.hexa` | `633c52c3765d14c979f894df57ed63c4e315db722eb59ab1023ca33bb1a3f5a9` | 133 |
-| registry | `core/attr_ecosystem/registry.hexa` | `d6e5af759a90c68eb4df62e06670f2c2dfd191b67613e03c420c7ee942243c21` | 155 |
-| aggregator | `core/attr_ecosystem/attr_ecosystem_main.hexa` | `ed43f2fcead0fa8b0f6486754f0780a8855827ceed12770f65a9caf7ff7c24e1` | 136 |
+| interface | `attr_ecosystem/core/source.hexa` | `633c52c3765d14c979f894df57ed63c4e315db722eb59ab1023ca33bb1a3f5a9` | 133 |
+| registry | `attr_ecosystem/core/registry.hexa` | `d6e5af759a90c68eb4df62e06670f2c2dfd191b67613e03c420c7ee942243c21` | 155 |
+| aggregator | `attr_ecosystem/core/attr_ecosystem_main.hexa` | `ed43f2fcead0fa8b0f6486754f0780a8855827ceed12770f65a9caf7ff7c24e1` | 136 |
 
 Total **8 file / 2392 LoC** new. **0 file 측 modified**. **0 file 측 deleted**. Migration count = 0.
 
@@ -124,9 +124,9 @@ Total **8 file / 2392 LoC** new. **0 file 측 modified**. **0 file 측 deleted**
 
 | file | result | sentinel |
 |------|--------|----------|
-| `core/attr_ecosystem/source.hexa` | PASS | `__ATTR_ECOSYSTEM_SOURCE__ PASS mode=selftest` |
-| `core/attr_ecosystem/registry.hexa` | PASS | `__ATTR_ECOSYSTEM_REGISTRY__ PASS mode=selftest` |
-| `core/attr_ecosystem/attr_ecosystem_main.hexa` | PASS | `__ATTR_ECOSYSTEM_MAIN__ PASS mode=selftest` |
+| `attr_ecosystem/core/source.hexa` | PASS | `__ATTR_ECOSYSTEM_SOURCE__ PASS mode=selftest` |
+| `attr_ecosystem/core/registry.hexa` | PASS | `__ATTR_ECOSYSTEM_REGISTRY__ PASS mode=selftest` |
+| `attr_ecosystem/core/attr_ecosystem_main.hexa` | PASS | `__ATTR_ECOSYSTEM_MAIN__ PASS mode=selftest` |
 
 ### Aggregator (7/7) — byte-identical 2-run
 
@@ -144,12 +144,12 @@ Aggregator stdout (with hexa-resolver line stripped) sha256 (2 runs identical):
 
 ## §4 Cross-link
 
-- **sister core dogfood**: `core/attr_format/` (Level 3b WRAPPED v1..v5, format evolution axis).
-- **sister modules**: `modules/attr_format/attr_v1.hexa..attr_v5.hexa` (5-version cluster).
+- **sister core dogfood**: `attr_format/core/` (Level 3b WRAPPED v1..v5, format evolution axis).
+- **sister modules**: `attr_format/module/attr_v1.hexa..attr_v5.hexa` (5-version cluster).
 - **catalog SSOT**: `self/attrs/attrs.json` 측 **untouched** (24 entries 측 보존 — additive frame).
 - **attr enforcer SSOT**: `self/attrs/_registry.hexa` 측 **untouched** — 측 측 5 신규 attr 측 측 측 별개 ecosystem cluster 측 측 측 추가 측 단지 모니터링/lint 측 측 sister tool 측 측 consume 측. 측 본 register 측 추가 측 measured 후속 cycle 측 측 (raw#10 caveat-c).
 - **handoff sister**: `docs/hexa_lang_self_mk2_tuning_landed_2026_05_02.ai.md` (peer .roadmap.<domain> SSOT scaffold land).
-- **format-evolution sister handoff**: `core/attr_format/attr_format_main.hexa` doc-comment header.
+- **format-evolution sister handoff**: `attr_format/core/attr_format_main.hexa` doc-comment header.
 
 ## §5 raw#10 honest caveats
 
@@ -159,7 +159,7 @@ Aggregator stdout (with hexa-resolver line stripped) sha256 (2 runs identical):
 
 (c) **`self/parser.hexa` 측 untouched** — comment-form `// @<name>(...)` 측 측 stage0 parser 측 측 측 comment 측 측 측 측 측 — 측 본 5 attr 측 측 측 lint/scan 측 측 측 측 측 측 측 본 module 측 측 측 측 measured. 측 측 measured 측 측 측 v2 (AST first-class) 측 측 측 land 측 측 측 측 (Phase β L1).
 
-(d) **5 module 측 struct mirror** — 측 5 module 측 측 측 측 AttrFormatMeta / AttrDecl / AttrParseResult / AttrIssue / AttrValidateResult 측 측 mirror 측 측 측 측 (no shared `use` import) 측 — 측 측 hexa-lang stage0 측 module-load 측 측 측 측 측 측 측 측 stratified import 측 측 측 측 측 측 측 측 측 한계 측 측 측. SSOT 측 `core/attr_ecosystem/source.hexa` 측 정의 측 측 측 — 측 mirror drift 측 측 SSOT violation. 측 v2 측 측 측 single-import 측 측 측 측 측.
+(d) **5 module 측 struct mirror** — 측 5 module 측 측 측 측 AttrFormatMeta / AttrDecl / AttrParseResult / AttrIssue / AttrValidateResult 측 측 mirror 측 측 측 측 (no shared `use` import) 측 — 측 측 hexa-lang stage0 측 module-load 측 측 측 측 측 측 측 측 stratified import 측 측 측 측 측 측 측 측 측 한계 측 측 측. SSOT 측 `attr_ecosystem/core/source.hexa` 측 정의 측 측 측 — 측 mirror drift 측 측 SSOT violation. 측 v2 측 측 측 single-import 측 측 측 측 측.
 
 (e) **fs verify 측 mac-local** — B4 sister fs verify 측 측 darwin `test -e` 측 측 측 측 측 — 측 측 측 측 측 측 BSD `test` 측 측 측 측 (Linux 측 측 측 측 측 측 same syntax 측 측 측 측). 측 측 측 측 측 측 측 측 cross-platform helper 측 측 측 측 측.
 

@@ -1,0 +1,419 @@
+#!hexa strict
+// @tool(slug="attr_migration_quarantine", desc="hexa-lang @migration-quarantine(reason, scope) — auto-exclude target from lint/build chain (mk1 residue isolation)")
+// @sentinel(__ATTR_MIGRATION_QUARANTINE__ <PASS|FAIL> mode=<selftest>)
+// @usage(hexa hexa-lang/attr_ecosystem/module/attr_migration_quarantine.hexa)
+// @resolver-bypass(reason="local module selftest, no network/heavy compute")
+//
+// hexa-lang/attr_ecosystem/module/attr_migration_quarantine.hexa
+//   B7 @migration-quarantine(reason, scope)
+//
+// SPEC (signature)
+//   @migration-quarantine(reason="<rationale>", scope="<file|fn|decl|repo>")
+//
+// SEMANTICS
+//   Marks an artifact (file / fn / decl / repo-rooted subtree) as
+//   migration residue that must be EXCLUDED from the active lint
+//   + build pipelines while it remains in-tree.
+//
+//   This is the formalized successor to ad-hoc `// MIGRATION:` /
+//   `// LEGACY:` comments. Lint pipelines that recognize this attr
+//   skip the marked target instead of reporting noise. Builds
+//   skip compilation but preserve the file on disk.
+//
+//   Both keys are REQUIRED:
+//     reason — short rationale (>= 10 chars)
+//     scope  — one of {file, fn, decl, repo}
+//
+// LINT INTEGRATION
+//   Lint pipelines:
+//     1. Read parsed quarantine decls.
+//     2. For scope=file → skip whole file.
+//     3. For scope=fn|decl → skip the single fn/decl below the attr.
+//     4. For scope=repo → skip all files under a repo subdir
+//        provided as additional path= key (defaults to nearest
+//        package).
+//
+// RAW#10 CAVEATS
+//   (1) `scope=repo` requires an additional `path=` key (not enforced
+//       by validate yet — recommended convention only). The validate
+//       fn warns when scope=repo without path.
+//   (2) Quarantine is opt-in additive: the attr never DELETES files,
+//       only excludes them.
+//   (3) Sister tooling (lint pipeline) consumes parse output. This
+//       module is the attr enforcer (parse + validate + emit) only.
+
+// ── Mirror shapes ────────────────────────────────────────────
+
+struct AttrFormatMeta {
+    name:                 str,
+    version:              int,
+    form:                 str,
+    phase:                str,
+    status:               str,
+    supports_composition: int,
+    supports_typing:      int,
+    catalog_size:         int,
+    spec_doc:             str,
+    notes:                str
+}
+
+struct AttrDecl {
+    name:         str,
+    params:       [str],
+    line:         int,
+    col:          int,
+    mode:         str,
+    form_version: str
+}
+
+struct AttrParseResult {
+    ok:       int,
+    n_decls:  int,
+    decls:    [AttrDecl],
+    message:  str
+}
+
+struct AttrIssue {
+    severity:  str,
+    attr_name: str,
+    line:      int,
+    msg:       str
+}
+
+struct AttrValidateResult {
+    ok:        int,
+    n_issues:  int,
+    issues:    [AttrIssue],
+    message:   str
+}
+
+// ── Helpers ──────────────────────────────────────────────────
+
+fn _mq_decl(params: [str], line: int) -> AttrDecl {
+    return AttrDecl {
+        name: "migration_quarantine",
+        params: params,
+        line: line,
+        col: 1,
+        mode: "decl",
+        form_version: "ecosystem_b7"
+    }
+}
+
+fn _mq_issue(sev: str, line: int, msg: str) -> AttrIssue {
+    return AttrIssue { severity: sev, attr_name: "migration_quarantine", line: line, msg: msg }
+}
+
+fn _mq_index(haystack: str, needle: str) -> int {
+    let mut i = 0
+    while i + len(needle) <= len(haystack) {
+        if haystack.substring(i, i + len(needle)) == needle { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn _mq_extract_payload_for(trimmed: str, marker: str) -> str {
+    let idx = _mq_index(trimmed, marker)
+    if idx < 0 { return "" }
+    let after = trimmed.substring(idx + len(marker), len(trimmed))
+    let mut depth = 1
+    let mut j = 0
+    while j < len(after) {
+        let c = after.substring(j, j + 1)
+        if c == "(" { depth = depth + 1 }
+        if c == ")" {
+            depth = depth - 1
+            if depth == 0 { return after.substring(0, j) }
+        }
+        j = j + 1
+    }
+    return ""
+}
+
+fn _mq_split_kv(payload: str) -> [str] {
+    let mut out = []
+    let mut cur = ""
+    let mut in_str = 0
+    let mut i = 0
+    while i < len(payload) {
+        let c = payload.substring(i, i + 1)
+        if c == "\"" {
+            if in_str == 1 { in_str = 0 } else { in_str = 1 }
+            cur = cur + c
+        } else if c == "," {
+            if in_str == 0 {
+                let t = cur.trim()
+                if len(t) > 0 { out = out.push(t) }
+                cur = ""
+            } else {
+                cur = cur + c
+            }
+        } else {
+            cur = cur + c
+        }
+        i = i + 1
+    }
+    let t2 = cur.trim()
+    if len(t2) > 0 { out = out.push(t2) }
+    return out
+}
+
+fn _mq_kv_key(pair: str) -> str {
+    let eq = pair.index_of("=")
+    if eq < 0 { return pair.trim() }
+    return pair.substring(0, eq).trim()
+}
+
+fn _mq_kv_value(pair: str) -> str {
+    let eq = pair.index_of("=")
+    if eq < 0 { return "" }
+    let mut v = pair.substring(eq + 1, len(pair)).trim()
+    if len(v) >= 2 {
+        let first = v.substring(0, 1)
+        let last  = v.substring(len(v) - 1, len(v))
+        if first == "\"" {
+            if last == "\"" { v = v.substring(1, len(v) - 1) }
+        }
+    }
+    return v
+}
+
+fn _mq_scope_ok(s: str) -> int {
+    if s == "file" { return 1 }
+    if s == "fn"   { return 1 }
+    if s == "decl" { return 1 }
+    if s == "repo" { return 1 }
+    return 0
+}
+
+// ── Public API ───────────────────────────────────────────────
+
+fn attr_migration_quarantine_meta() -> AttrFormatMeta {
+    return AttrFormatMeta {
+        name:                 "migration_quarantine",
+        version:              1,
+        form:                 "comment",
+        phase:                "ecosystem_mk2",
+        status:               "WRAPPED",
+        supports_composition: 0,
+        supports_typing:      1,
+        catalog_size:         1,
+        spec_doc:             "hexa-lang/docs/hexa_lang_attr_ecosystem_b3_b4_b6_b7_b9_landed_2026_05_02.ai.md",
+        notes:                "B7 @migration-quarantine(reason, scope) — auto-exclude lint/build target"
+    }
+}
+
+fn attr_migration_quarantine_parse(src: str) -> AttrParseResult {
+    if len(src) < 1 {
+        return AttrParseResult { ok: 0, n_decls: 0, decls: [], message: "empty source" }
+    }
+    let lines = src.split("\n")
+    let mut decls = []
+    let m1 = "@migration-quarantine("
+    let m2 = "@migration_quarantine("
+    let mut i = 0
+    while i < len(lines) {
+        let trimmed = lines[i].trim()
+        let mut payload = ""
+        let mut hit = 0
+        if trimmed.contains(m1) {
+            payload = _mq_extract_payload_for(trimmed, m1)
+            hit = 1
+        }
+        if hit == 0 {
+            if trimmed.contains(m2) {
+                payload = _mq_extract_payload_for(trimmed, m2)
+                hit = 1
+            }
+        }
+        if hit == 1 {
+            let pairs = _mq_split_kv(payload)
+            decls = decls.push(_mq_decl(pairs, i + 1))
+        }
+        i = i + 1
+    }
+    return AttrParseResult { ok: 1, n_decls: len(decls), decls: decls, message: "mq: " + str(len(decls)) + " decl(s)" }
+}
+
+fn attr_migration_quarantine_validate(decls: [AttrDecl]) -> AttrValidateResult {
+    let mut issues = []
+    let mut i = 0
+    while i < len(decls) {
+        let d = decls[i]
+        let mut have_reason = 0
+        let mut have_scope = 0
+        let mut have_path = 0
+        let mut short_reason = ""
+        let mut bad_scope = ""
+        let mut scope_value = ""
+        let mut k = 0
+        while k < len(d.params) {
+            let key = _mq_kv_key(d.params[k])
+            let val = _mq_kv_value(d.params[k])
+            if key == "reason" {
+                have_reason = 1
+                if len(val) < 10 { short_reason = val }
+            }
+            if key == "scope" {
+                have_scope = 1
+                scope_value = val
+                if _mq_scope_ok(val) == 0 { bad_scope = val }
+            }
+            if key == "path" { have_path = 1 }
+            k = k + 1
+        }
+        if have_reason == 0 {
+            issues = issues.push(_mq_issue("error", d.line, "missing required key `reason`"))
+        }
+        if have_scope == 0 {
+            issues = issues.push(_mq_issue("error", d.line, "missing required key `scope`"))
+        }
+        if len(short_reason) > 0 {
+            issues = issues.push(_mq_issue("error", d.line, "reason `" + short_reason + "` too short — require >= 10 chars"))
+        }
+        if len(bad_scope) > 0 {
+            issues = issues.push(_mq_issue("error", d.line, "scope `" + bad_scope + "` not in {file, fn, decl, repo}"))
+        }
+        if scope_value == "repo" {
+            if have_path == 0 {
+                issues = issues.push(_mq_issue("warn", d.line, "scope=repo without `path=` — defaults to nearest package (recommended: pin path explicitly)"))
+            }
+        }
+        i = i + 1
+    }
+    let mut any_error = 0
+    let mut e = 0
+    while e < len(issues) {
+        if issues[e].severity == "error" { any_error = 1 }
+        e = e + 1
+    }
+    let okv = if any_error == 1 { 0 } else { 1 }
+    return AttrValidateResult { ok: okv, n_issues: len(issues), issues: issues, message: "mq: " + str(len(issues)) + " issue(s)" }
+}
+
+// Returns 1 when a target line is covered by an active quarantine
+// decl in `decls`. Lint pipelines call this per candidate site.
+fn attr_migration_quarantine_covers(decls: [AttrDecl], target_line: int, total_lines: int) -> int {
+    let mut i = 0
+    while i < len(decls) {
+        let d = decls[i]
+        let mut q_scope = ""
+        let mut k = 0
+        while k < len(d.params) {
+            let key = _mq_kv_key(d.params[k])
+            if key == "scope" { q_scope = _mq_kv_value(d.params[k]) }
+            k = k + 1
+        }
+        if q_scope == "file" {
+            return 1
+        }
+        if q_scope == "repo" {
+            return 1
+        }
+        if q_scope == "fn" {
+            // small heuristic: cover next 200 lines
+            if target_line >= d.line {
+                if target_line <= d.line + 200 { return 1 }
+            }
+        }
+        if q_scope == "decl" {
+            if target_line >= d.line {
+                if target_line <= d.line + 30 { return 1 }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn attr_migration_quarantine_emit(pr: AttrParseResult) -> str {
+    let mut parts = []
+    parts = parts.push("@migration-quarantine emit: " + str(pr.n_decls) + " decl(s)")
+    let mut i = 0
+    while i < len(pr.decls) {
+        let d = pr.decls[i]
+        parts = parts.push("  L" + str(d.line) + " params=" + str(len(d.params)))
+        i = i + 1
+    }
+    return parts.join("\n")
+}
+
+// ── Selftest ─────────────────────────────────────────────────
+
+fn _selftest() -> int {
+    // 1. meta
+    let m = attr_migration_quarantine_meta()
+    if m.name != "migration_quarantine" { return 0 }
+    // 2. parse 0
+    let pr0 = attr_migration_quarantine_parse("// nothing\n")
+    if pr0.n_decls != 0 { return 0 }
+    // 3. parse dashed valid (file scope)
+    let s1 = "// @migration-quarantine(reason=\"mk1 residue legacy\", scope=\"file\")\n"
+    let pr1 = attr_migration_quarantine_parse(s1)
+    if pr1.n_decls != 1 { return 0 }
+    let vr1 = attr_migration_quarantine_validate(pr1.decls)
+    if vr1.ok != 1 { return 0 }
+    // 4. underscore variant + fn scope
+    let s2 = "// @migration_quarantine(reason=\"deprecated impl path\", scope=\"fn\")\nfn legacy_fn() {}\n"
+    let pr2 = attr_migration_quarantine_parse(s2)
+    if pr2.n_decls != 1 { return 0 }
+    let vr2 = attr_migration_quarantine_validate(pr2.decls)
+    if vr2.ok != 1 { return 0 }
+    // 5. missing reason
+    let s3 = "// @migration-quarantine(scope=\"file\")\n"
+    let pr3 = attr_migration_quarantine_parse(s3)
+    let vr3 = attr_migration_quarantine_validate(pr3.decls)
+    if vr3.ok != 0 { return 0 }
+    // 6. missing scope
+    let s4 = "// @migration-quarantine(reason=\"good rationale here\")\n"
+    let pr4 = attr_migration_quarantine_parse(s4)
+    let vr4 = attr_migration_quarantine_validate(pr4.decls)
+    if vr4.ok != 0 { return 0 }
+    // 7. bad scope
+    let s5 = "// @migration-quarantine(reason=\"good rationale here\", scope=\"galaxy\")\n"
+    let pr5 = attr_migration_quarantine_parse(s5)
+    let vr5 = attr_migration_quarantine_validate(pr5.decls)
+    if vr5.ok != 0 { return 0 }
+    // 8. short reason
+    let s6 = "// @migration-quarantine(reason=\"short\", scope=\"file\")\n"
+    let pr6 = attr_migration_quarantine_parse(s6)
+    let vr6 = attr_migration_quarantine_validate(pr6.decls)
+    if vr6.ok != 0 { return 0 }
+    // 9. scope=repo without path → warn-only (still ok)
+    let s7 = "// @migration-quarantine(reason=\"deprecated subtree\", scope=\"repo\")\n"
+    let pr7 = attr_migration_quarantine_parse(s7)
+    let vr7 = attr_migration_quarantine_validate(pr7.decls)
+    if vr7.ok != 1 { return 0 }
+    if vr7.n_issues != 1 { return 0 }
+    if vr7.issues[0].severity != "warn" { return 0 }
+    // 10. scope=repo with path → no warn
+    let s8 = "// @migration-quarantine(reason=\"deprecated subtree\", scope=\"repo\", path=\"old/\")\n"
+    let pr8 = attr_migration_quarantine_parse(s8)
+    let vr8 = attr_migration_quarantine_validate(pr8.decls)
+    if vr8.ok != 1 { return 0 }
+    if vr8.n_issues != 0 { return 0 }
+    // 11. covers — file scope blanket
+    let cov_file = attr_migration_quarantine_covers(pr1.decls, 5000, 10000)
+    if cov_file != 1 { return 0 }
+    // 12. covers — fn scope window
+    let cov_fn_in  = attr_migration_quarantine_covers(pr2.decls, 50, 1000)
+    if cov_fn_in != 1 { return 0 }
+    let cov_fn_out = attr_migration_quarantine_covers(pr2.decls, 5000, 10000)
+    if cov_fn_out != 0 { return 0 }
+    // 13. emit non-empty
+    let em = attr_migration_quarantine_emit(pr1)
+    if len(em) < 10 { return 0 }
+    return 1
+}
+
+fn main() {
+    println("[attr_ecosystem/migration-quarantine] B7 reason+scope guard")
+    if _selftest() == 1 {
+        println("[attr_ecosystem/migration-quarantine] SELFTEST PASS")
+        println("__ATTR_MIGRATION_QUARANTINE__ PASS mode=selftest")
+    } else {
+        println("[attr_ecosystem/migration-quarantine] SELFTEST FAIL")
+        println("__ATTR_MIGRATION_QUARANTINE__ FAIL mode=selftest")
+    }
+}
