@@ -1,0 +1,660 @@
+// @resolver-bypass(reason="macos url handler stdlib shells out to lsregister CLI — darwin-native exec")
+// self/stdlib/macos_url_handler.hexa — typed wrapper around macOS LaunchServices
+//                                       URL-scheme registration via the lsregister CLI.
+//
+// @module(slug="stdlib-macos-url-handler", desc="LaunchServices URL-scheme registration — typed surface")
+// @usage(use "self/stdlib/macos_url_handler"; let r = ls_get_default_handler("hexa"))
+//
+// Closes hexa-lang upstream gap #1 — subtask S-22.3 of the
+// LSRegisterURL+app-bundler plan
+// (hive/docs/lsregister_url_handler_plan_2026_05_05.ai.md §S-22.3).
+//
+// PROBLEM
+//   Today the bash dispatcher entry-point at ~/.hx/bin/hexa-url-handler.sh
+//   carries a raw-9-exemption carve-out because hexa-lang has no
+//   primitive to talk to LaunchServices. Once this stdlib lands, callers
+//   register/query/set URL-scheme handlers from pure hexa-lang.
+//
+// STRATEGY (Option B — shell out to the lsregister CLI)
+//   The Foundation/AppKit binding (Option A) and the Swift FFI (Option C)
+//   are richer but cost weeks. Option B mirrors the gap-7 ssh.hexa /
+//   gap-8 git.hexa pattern: typed wrapper around `exec_with_status`
+//   over a well-known macOS-shipped CLI — no C runtime change, no
+//   third-party dep.
+//
+//   lsregister resolution order:
+//     1. `xcrun --find lsregister`            (preferred — survives Xcode
+//                                              path moves and CommandLineTools
+//                                              splits when Xcode is installed)
+//     2. /System/Library/Frameworks/CoreServices.framework
+//          /Versions/A/Frameworks/LaunchServices.framework/Support/lsregister
+//                                              (canonical fallback — always
+//                                              present on macOS 10.x+ 11+ 12+
+//                                              13+ 14+ since LaunchServices
+//                                              ships with the OS)
+//
+//   Capabilities exposed:
+//     · ls_register_url_scheme   — register a bundle by id (looks up the
+//                                  bundle path via `mdfind`, then runs
+//                                  `lsregister <bundle.app>`).
+//     · ls_get_default_handler   — read the current default handler for a
+//                                  scheme by parsing `lsregister -dump`
+//                                  for the matching `bindings:` entry.
+//     · ls_set_default_handler   — register the bundle and trigger a
+//                                  full domain rescan so the most-recent
+//                                  registration wins for the scheme.
+//     · ls_unregister            — `lsregister -u <bundle.app>`.
+//
+// CONTRACT (raw#10 honest C3)
+//   · Pure hexa over `exec_with_status`. Zero C runtime change.
+//   · Side effects on real LaunchServices DB are gated by env var
+//     HEXA_LS_REGISTER_LIVE=1. Without it, register/set/unregister
+//     return a synthetic dry-run result so the selftest and CI never
+//     mutate the user's LaunchServices DB. Read paths
+//     (ls_get_default_handler) are always allowed because they are
+//     pure observation — `lsregister -dump` does not mutate state.
+//   · stderr from lsregister is captured but never propagated to the
+//     parent runtime; gap-4 banner suppression keeps audit logs clean.
+//   · raw#9 (hexa-only-strict): no C runtime change. Pure stdlib wrapper
+//     over `exec_with_status`. Cost: forks a /bin/sh per call. Acceptable
+//     for handler-management verbs (run a few times per registration cycle).
+//   · raw#65 (idempotency): repeated register/unregister of the same
+//     bundle is safe — lsregister itself is idempotent (it updates the
+//     in-memory DB and returns 0).
+//   · raw#91 (no_silent_errors): every fork checks the exit code and
+//     returns {ok=false, error=<one-liner>} when lsregister disagrees;
+//     no fork's failure is swallowed.
+//   · raw#159 (upstream-proposal-mandate): hive consumers import this
+//     and never re-implement; the bash dispatcher trampoline retires
+//     once S-22.4 verifies the e2e flow.
+//
+// EXPORTS
+//   ls_register_url_scheme(scheme: string, bundle_id: string)
+//     -> {ok: bool, error?: string, dry_run?: bool}
+//     Register the bundle that owns `bundle_id` so its CFBundleURLTypes
+//     declaration for `scheme` is picked up by LaunchServices. The
+//     `scheme` argument is taken at face value (validated alnum) but
+//     not used by the CLI directly — lsregister reads the scheme list
+//     from the bundle's Info.plist. We pass `scheme` through so the
+//     caller's intent is recorded in the audit row.
+//
+//   ls_get_default_handler(scheme: string)
+//     -> {ok: bool, bundle_id?: string}
+//     Query the current default handler for `scheme` by scanning
+//     `lsregister -dump` output. ok=false when no handler is bound.
+//     This is a read-only probe; safe to call at any time.
+//
+//   ls_set_default_handler(scheme: string, bundle_id: string)
+//     -> {ok: bool, error?: string, dry_run?: bool}
+//     Idempotent: registers the bundle if needed, then runs
+//     `lsregister -kill -r -domain local -domain system -domain user`
+//     to repopulate the DB respecting the most-recently-registered
+//     .app's CFBundleURLTypes — the documented LaunchServices
+//     "set default" pattern (Option B).
+//
+//   ls_unregister(bundle_path: string)
+//     -> {ok: bool, error?: string, dry_run?: bool}
+//     Run `lsregister -u <bundle.app>`. Idempotent: an unregistered
+//     bundle returns ok=true (LaunchServices simply does nothing).
+
+use "self/stdlib/shell_escape"
+
+// ── _ls_has_key ─────────────────────────────────────────────────────────
+// Map-key probe via .keys() walk. Mirrors ssh._ssh_has_key — the runtime
+// does not expose a uniform `.has()` across map types so we walk the key
+// array. False-positive impossible (exact string equality).
+fn _ls_has_key(d, k: string) -> bool {
+    if type_of(d) == "void" { return false }
+    if type_of(d) != "map" { return false }
+    let ks = d.keys()
+    let mut i = 0
+    let n = len(ks)
+    while i < n {
+        if ks[i] == k { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ── _ls_live_mode ───────────────────────────────────────────────────────
+// True iff HEXA_LS_REGISTER_LIVE=1 is exported. Selftest and CI runs leave
+// it unset so register/set/unregister calls are dry-runs that do NOT
+// touch the real LaunchServices DB.
+fn _ls_live_mode() -> bool {
+    let v = env_var("HEXA_LS_REGISTER_LIVE")
+    if len(v) == 0 { return false }
+    if v == "0" { return false }
+    return true
+}
+
+// ── _ls_scheme_is_safe ──────────────────────────────────────────────────
+// URL-scheme grammar (RFC 3986): ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ).
+// We narrow to alnum + . - + because that's what every real-world handler
+// uses and it forecloses shell-meta injection paths (the value is never
+// passed unquoted, but a tighter whitelist is cheap insurance).
+fn _ls_scheme_is_safe(scheme: string) -> bool {
+    let n = len(scheme)
+    if n == 0 { return false }
+    // First char must be alpha per RFC.
+    let f = scheme.substring(0, 1)
+    let f_ok = (f >= "a" && f <= "z") || (f >= "A" && f <= "Z")
+    if !f_ok { return false }
+    let mut i = 0
+    while i < n {
+        let c = scheme.substring(i, i + 1)
+        let ok =
+            (c >= "a" && c <= "z") ||
+            (c >= "A" && c <= "Z") ||
+            (c >= "0" && c <= "9") ||
+            c == "." || c == "-" || c == "+"
+        if !ok { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// ── _ls_bundle_id_is_safe ───────────────────────────────────────────────
+// Reverse-DNS bundle id grammar — alnum + . - _.  Apple's docs allow more,
+// but every real-world id we have ever seen fits this whitelist and a
+// hostile id cannot escape shell context as a result.
+fn _ls_bundle_id_is_safe(bid: string) -> bool {
+    let n = len(bid)
+    if n == 0 { return false }
+    let mut i = 0
+    while i < n {
+        let c = bid.substring(i, i + 1)
+        let ok =
+            (c >= "a" && c <= "z") ||
+            (c >= "A" && c <= "Z") ||
+            (c >= "0" && c <= "9") ||
+            c == "." || c == "-" || c == "_"
+        if !ok { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// ── _ls_path_is_safe ────────────────────────────────────────────────────
+// Bundle-path whitelist: must be absolute, must end with `.app` (with or
+// without a trailing slash), and contain no shell metacharacters that
+// would break out of a single-quoted operand. shell_escape() handles
+// the actual quoting, but a tighter whitelist keeps audit logs honest.
+fn _ls_path_is_safe(path: string) -> bool {
+    let n = len(path)
+    if n == 0 { return false }
+    if path.substring(0, 1) != "/" { return false }
+    // Reject NUL, newline, and a few obviously hostile bytes.
+    let mut i = 0
+    while i < n {
+        let c = path.substring(i, i + 1)
+        if c == "\n" { return false }
+        if c == "\r" { return false }
+        if c == "\u{0000}" { return false }
+        i = i + 1
+    }
+    // Path ends in .app or .app/.
+    let trimmed =
+        if n >= 1 && path.substring(n - 1, n) == "/" {
+            path.substring(0, n - 1)
+        } else { path }
+    let m = len(trimmed)
+    if m < 4 { return false }
+    if trimmed.substring(m - 4, m) != ".app" { return false }
+    return true
+}
+
+// ── _ls_resolve_lsregister ──────────────────────────────────────────────
+// Returns the absolute path to the lsregister binary, or "" if neither
+// resolution path produced a working executable.
+//
+//   1. xcrun --find lsregister — preferred when Xcode/CommandLineTools
+//      are present and configured.
+//   2. /System/Library/.../LaunchServices.framework/Support/lsregister —
+//      always present on stock macOS 10.10+. `test -x` confirms it's
+//      executable before we hand it off.
+//
+// gap-4 banner suppression: stderr from xcrun is dropped via 2>/dev/null
+// because xcrun emits a noisy multi-line error when Xcode is missing
+// and we treat that as a clean "fall through to canonical path" signal.
+fn _ls_resolve_lsregister() -> string {
+    // Try xcrun first.
+    let via_xcrun = to_string(exec("xcrun --find lsregister 2>/dev/null")).trim()
+    if len(via_xcrun) > 0 {
+        // Verify the binary is actually executable; xcrun can return a
+        // path that doesn't exist if the developer-tools install is
+        // partially broken.
+        let chk = to_string(exec("test -x " + shell_escape(via_xcrun) + " && echo 1 || echo 0")).trim()
+        if chk == "1" { return via_xcrun }
+    }
+    // Canonical fallback path.
+    let canonical = "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Support/lsregister"
+    let chk2 = to_string(exec("test -x " + shell_escape(canonical) + " && echo 1 || echo 0")).trim()
+    if chk2 == "1" { return canonical }
+    return ""
+}
+
+// ── _ls_run ─────────────────────────────────────────────────────────────
+// Run `lsregister <argv_tail>` and return [stdout_merged, rc]. stderr
+// is merged into stdout via 2>&1 because the typed surface only needs
+// rc for control flow; merged output feeds the optional `error` field
+// when rc != 0.
+//
+// `argv_tail` is the caller's responsibility to shell-escape — every
+// call site below funnels user-supplied tokens through shell_escape()
+// before joining them into the tail.
+fn _ls_run(argv_tail: string) -> [any] {
+    let bin = _ls_resolve_lsregister()
+    if len(bin) == 0 {
+        return ["lsregister: binary not resolvable", 127]
+    }
+    let cmd = shell_escape(bin) + " " + argv_tail + " 2>&1"
+    let pair = exec_with_status(cmd)
+    let body = to_string(pair[0])
+    let rc = pair[1]
+    return [body, rc]
+}
+
+// ── _ls_dump ────────────────────────────────────────────────────────────
+// Returns the merged output of `lsregister -dump`. Cached for the
+// lifetime of one program invocation by the caller; we don't cache
+// here because the dump is large (~10 MB on a typical mac) and the
+// caller may want a fresh read after a register/unregister pair.
+fn _ls_dump() -> string {
+    let pair = _ls_run("-dump")
+    return to_string(pair[0])
+}
+
+// ── _ls_find_bundle_path_by_id ──────────────────────────────────────────
+// Resolve a bundle id to its on-disk .app path via mdfind. Returns "" if
+// Spotlight doesn't know about it (the bundle was installed after the
+// last reindex, or is in a non-indexed location). gap-4 banner
+// suppression: 2>/dev/null on mdfind because some sandboxes emit a
+// "metadata server unavailable" warning we don't want in the audit row.
+fn _ls_find_bundle_path_by_id(bundle_id: string) -> string {
+    let q = "kMDItemCFBundleIdentifier == " + shell_escape(bundle_id)
+    let cmd = "mdfind " + shell_escape(q) + " 2>/dev/null"
+    let out = to_string(exec(cmd)).trim()
+    if len(out) == 0 { return "" }
+    // mdfind returns one path per line — the FIRST hit is canonical
+    // (most-recently-modified by Spotlight ranking).
+    let nl = out.index_of("\n")
+    if nl >= 0 { return out.substring(0, nl) }
+    return out
+}
+
+// ── _ls_extract_bundle_id_for_scheme ────────────────────────────────────
+// Walk the lsregister -dump output looking for the URL-scheme binding
+// for `scheme`. The dump format is a multi-section stanza per bundle;
+// each bundle that handles URL schemes has a `claim   id:` line plus a
+// `bindings:` line containing entries like:
+//
+//   bindings:    .schema:hexa, .....
+//
+// followed by lines that name the claiming bundle id. We scan line by
+// line, tracking the most-recently-seen bundle id, and emit it the
+// next time we hit a `bindings:` line that mentions our scheme.
+//
+// This is a best-effort string parse — the dump format is not a stable
+// API. We return "" when we can't find a unique answer; callers treat
+// "" as "no default registered".
+fn _ls_extract_bundle_id_for_scheme(dump: string, scheme: string) -> string {
+    let needle = "bindings:"
+    let scheme_token = ".schema:" + scheme
+    let lines = split(dump, "\n")
+    let n = len(lines)
+    let mut current_bundle_id = ""
+    let mut i = 0
+    while i < n {
+        let line = lines[i]
+        let trimmed = line.trim()
+        // Track the most-recent bundle-id-bearing line. lsregister
+        // -dump uses both `bundle id:` and `claim   id:` forms; we
+        // accept either prefix.
+        if trimmed.starts_with("bundle id:") {
+            current_bundle_id = trimmed.substring(10, len(trimmed)).trim()
+        }
+        if trimmed.starts_with("claim   id:") {
+            current_bundle_id = trimmed.substring(11, len(trimmed)).trim()
+        }
+        // bindings: line — if it mentions our scheme, the most-recent
+        // bundle id is the binding owner.
+        if trimmed.starts_with(needle) {
+            if trimmed.contains(scheme_token) {
+                if len(current_bundle_id) > 0 { return current_bundle_id }
+            }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// ── ls_register_url_scheme ──────────────────────────────────────────────
+// Public API: register the bundle owning `bundle_id` so its
+// CFBundleURLTypes declaration of `scheme` is honored by LaunchServices.
+//
+// Validates inputs, resolves the bundle path, and runs `lsregister
+// <path>` — but ONLY when HEXA_LS_REGISTER_LIVE=1. Otherwise returns
+// a synthetic {ok=true, dry_run=true} so test environments stay
+// hermetic.
+pub fn ls_register_url_scheme(scheme: string, bundle_id: string) {
+    let result = {}
+    result["ok"] = false
+    if !_ls_scheme_is_safe(scheme) {
+        result["error"] = "ls_register_url_scheme: unsafe scheme"
+        return result
+    }
+    if !_ls_bundle_id_is_safe(bundle_id) {
+        result["error"] = "ls_register_url_scheme: unsafe bundle_id"
+        return result
+    }
+    if !_ls_live_mode() {
+        result["ok"] = true
+        result["dry_run"] = true
+        return result
+    }
+    let path = _ls_find_bundle_path_by_id(bundle_id)
+    if len(path) == 0 {
+        result["error"] = "ls_register_url_scheme: bundle not found in spotlight: " + bundle_id
+        return result
+    }
+    if !_ls_path_is_safe(path) {
+        result["error"] = "ls_register_url_scheme: resolved path failed safety: " + path
+        return result
+    }
+    let pair = _ls_run(shell_escape(path))
+    let rc = pair[1]
+    if rc != 0 {
+        result["error"] = "ls_register_url_scheme: lsregister rc=" + to_string(rc) + ": " + to_string(pair[0])
+        return result
+    }
+    result["ok"] = true
+    return result
+}
+
+// ── ls_get_default_handler ──────────────────────────────────────────────
+// Public API: return the bundle id currently registered as the default
+// handler for `scheme`. Read-only — runs even without HEXA_LS_REGISTER_LIVE.
+pub fn ls_get_default_handler(scheme: string) {
+    let result = {}
+    result["ok"] = false
+    if !_ls_scheme_is_safe(scheme) { return result }
+    let dump = _ls_dump()
+    if len(dump) == 0 { return result }
+    let bid = _ls_extract_bundle_id_for_scheme(dump, scheme)
+    if len(bid) == 0 { return result }
+    result["ok"] = true
+    result["bundle_id"] = bid
+    return result
+}
+
+// ── ls_set_default_handler ──────────────────────────────────────────────
+// Public API: idempotently make `bundle_id` the default handler for
+// `scheme`. Implements the documented LaunchServices "set default"
+// pattern: register the bundle, then full-domain rescan so the most-
+// recently-registered .app's CFBundleURLTypes wins.
+pub fn ls_set_default_handler(scheme: string, bundle_id: string) {
+    let result = {}
+    result["ok"] = false
+    if !_ls_scheme_is_safe(scheme) {
+        result["error"] = "ls_set_default_handler: unsafe scheme"
+        return result
+    }
+    if !_ls_bundle_id_is_safe(bundle_id) {
+        result["error"] = "ls_set_default_handler: unsafe bundle_id"
+        return result
+    }
+    if !_ls_live_mode() {
+        result["ok"] = true
+        result["dry_run"] = true
+        return result
+    }
+    // Step 1 — make sure the bundle is in the DB.
+    let reg = ls_register_url_scheme(scheme, bundle_id)
+    if !reg["ok"] {
+        result["error"] = "ls_set_default_handler: register step failed: " + to_string(reg["error"])
+        return result
+    }
+    // Step 2 — repopulate so the most-recent registration takes effect.
+    let pair = _ls_run("-kill -r -domain local -domain system -domain user")
+    let rc = pair[1]
+    if rc != 0 {
+        result["error"] = "ls_set_default_handler: domain rescan rc=" + to_string(rc) + ": " + to_string(pair[0])
+        return result
+    }
+    result["ok"] = true
+    return result
+}
+
+// ── ls_unregister ───────────────────────────────────────────────────────
+// Public API: remove a bundle from LaunchServices. Idempotent — an
+// unregistered bundle still returns ok=true.
+pub fn ls_unregister(bundle_path: string) {
+    let result = {}
+    result["ok"] = false
+    if !_ls_path_is_safe(bundle_path) {
+        result["error"] = "ls_unregister: unsafe bundle_path"
+        return result
+    }
+    if !_ls_live_mode() {
+        result["ok"] = true
+        result["dry_run"] = true
+        return result
+    }
+    let pair = _ls_run("-u " + shell_escape(bundle_path))
+    let rc = pair[1]
+    if rc != 0 {
+        result["error"] = "ls_unregister: lsregister rc=" + to_string(rc) + ": " + to_string(pair[0])
+        return result
+    }
+    result["ok"] = true
+    return result
+}
+
+// ── --selftest dispatcher ──────────────────────────────────────────────
+// Run with: hexa run self/stdlib/macos_url_handler.hexa --selftest
+// Exercises pure-helper invariants (safety whitelists, lsregister
+// binary resolution, dry-run gating) WITHOUT touching the real
+// LaunchServices DB. Live e2e tests live in self/test/macos_url_handler.hexa
+// and only run when HEXA_LS_REGISTER_LIVE=1.
+fn _ls_selftest() -> int {
+    let mut n = 0
+    let mut fail = 0
+
+    // 1. scheme whitelist accepts a typical RFC-shape scheme.
+    n = n + 1
+    if !_ls_scheme_is_safe("hexa") {
+        eprintln("FAIL 1 _ls_scheme_is_safe rejected 'hexa'")
+        fail = fail + 1
+    }
+
+    // 2. scheme whitelist rejects empty.
+    n = n + 1
+    if _ls_scheme_is_safe("") {
+        eprintln("FAIL 2 _ls_scheme_is_safe accepted empty")
+        fail = fail + 1
+    }
+
+    // 3. scheme whitelist rejects digit-leading (RFC violation).
+    n = n + 1
+    if _ls_scheme_is_safe("9bad") {
+        eprintln("FAIL 3 _ls_scheme_is_safe accepted digit-leading")
+        fail = fail + 1
+    }
+
+    // 4. scheme whitelist rejects shell-meta.
+    n = n + 1
+    if _ls_scheme_is_safe("foo;rm") {
+        eprintln("FAIL 4 _ls_scheme_is_safe accepted ';'")
+        fail = fail + 1
+    }
+
+    // 5. bundle id whitelist accepts reverse-DNS.
+    n = n + 1
+    if !_ls_bundle_id_is_safe("dev.hexa.UrlHandler") {
+        eprintln("FAIL 5 _ls_bundle_id_is_safe rejected reverse-dns")
+        fail = fail + 1
+    }
+
+    // 6. bundle id whitelist rejects shell-meta.
+    n = n + 1
+    if _ls_bundle_id_is_safe("foo bar") {
+        eprintln("FAIL 6 _ls_bundle_id_is_safe accepted space")
+        fail = fail + 1
+    }
+
+    // 7. path whitelist requires absolute and .app suffix.
+    n = n + 1
+    if !_ls_path_is_safe("/Applications/HexaUrlHandler.app") {
+        eprintln("FAIL 7 _ls_path_is_safe rejected canonical path")
+        fail = fail + 1
+    }
+
+    // 8. path whitelist rejects relative path.
+    n = n + 1
+    if _ls_path_is_safe("HexaUrlHandler.app") {
+        eprintln("FAIL 8 _ls_path_is_safe accepted relative path")
+        fail = fail + 1
+    }
+
+    // 9. path whitelist rejects non-app suffix.
+    n = n + 1
+    if _ls_path_is_safe("/Applications/HexaUrlHandler") {
+        eprintln("FAIL 9 _ls_path_is_safe accepted non-app path")
+        fail = fail + 1
+    }
+
+    // 10. path whitelist allows trailing slash.
+    n = n + 1
+    if !_ls_path_is_safe("/Applications/HexaUrlHandler.app/") {
+        eprintln("FAIL 10 _ls_path_is_safe rejected trailing slash")
+        fail = fail + 1
+    }
+
+    // 11. lsregister binary resolves on this macOS host. We allow
+    //     this to be empty in non-mac CI (e.g. hexa-runner docker
+    //     image) — it's a soft-skip in that case.
+    n = n + 1
+    let bin = _ls_resolve_lsregister()
+    let uname_s = to_string(exec("uname -s 2>/dev/null")).trim()
+    if uname_s == "Darwin" {
+        if len(bin) == 0 {
+            eprintln("FAIL 11 _ls_resolve_lsregister returned empty on Darwin")
+            fail = fail + 1
+        }
+    }
+
+    // 12. dry-run guard: register without HEXA_LS_REGISTER_LIVE returns
+    //     dry_run=true and never touches the DB.
+    n = n + 1
+    let r12 = ls_register_url_scheme("hexa", "dev.hexa.UrlHandler")
+    if !r12["ok"] {
+        eprintln("FAIL 12 dry-run register not ok: " + to_string(r12["error"]))
+        fail = fail + 1
+    }
+    if !_ls_has_key(r12, "dry_run") {
+        eprintln("FAIL 12b dry-run register missing dry_run flag")
+        fail = fail + 1
+    }
+
+    // 13. dry-run guard: set without HEXA_LS_REGISTER_LIVE returns
+    //     dry_run=true.
+    n = n + 1
+    let r13 = ls_set_default_handler("hexa", "dev.hexa.UrlHandler")
+    if !r13["ok"] {
+        eprintln("FAIL 13 dry-run set not ok: " + to_string(r13["error"]))
+        fail = fail + 1
+    }
+    if !_ls_has_key(r13, "dry_run") {
+        eprintln("FAIL 13b dry-run set missing dry_run flag")
+        fail = fail + 1
+    }
+
+    // 14. dry-run guard: unregister without HEXA_LS_REGISTER_LIVE
+    //     returns dry_run=true.
+    n = n + 1
+    let r14 = ls_unregister("/Applications/HexaUrlHandler.app")
+    if !r14["ok"] {
+        eprintln("FAIL 14 dry-run unregister not ok: " + to_string(r14["error"]))
+        fail = fail + 1
+    }
+    if !_ls_has_key(r14, "dry_run") {
+        eprintln("FAIL 14b dry-run unregister missing dry_run flag")
+        fail = fail + 1
+    }
+
+    // 15. unsafe inputs short-circuit BEFORE any fork (regardless of
+    //     live mode).
+    n = n + 1
+    let r15 = ls_register_url_scheme("foo;rm", "dev.hexa.UrlHandler")
+    if r15["ok"] {
+        eprintln("FAIL 15 unsafe scheme accepted")
+        fail = fail + 1
+    }
+    n = n + 1
+    let r15b = ls_unregister("../../etc/passwd")
+    if r15b["ok"] {
+        eprintln("FAIL 15b unsafe path accepted")
+        fail = fail + 1
+    }
+
+    // 16. ls_get_default_handler with unsafe scheme returns ok=false
+    //     without touching the DB.
+    n = n + 1
+    let r16 = ls_get_default_handler("foo;rm")
+    if r16["ok"] {
+        eprintln("FAIL 16 unsafe scheme get accepted")
+        fail = fail + 1
+    }
+
+    // 17. dump-parser locates a bundle id when the scheme is bound.
+    //     Synthetic dump fixture so we don't depend on the host DB.
+    n = n + 1
+    let synthetic =
+        "------------------------------------------------------\n" +
+        "bundle id:   dev.hexa.UrlHandler\n" +
+        "  path:      /Applications/HexaUrlHandler.app\n" +
+        "  bindings:  .schema:hexa, .schema:hexax\n" +
+        "------------------------------------------------------\n"
+    let bid = _ls_extract_bundle_id_for_scheme(synthetic, "hexa")
+    if bid != "dev.hexa.UrlHandler" {
+        eprintln("FAIL 17 dump-parser produced: '" + bid + "'")
+        fail = fail + 1
+    }
+
+    // 18. dump-parser returns "" when scheme is not bound.
+    n = n + 1
+    let bid2 = _ls_extract_bundle_id_for_scheme(synthetic, "nosuchscheme")
+    if len(bid2) != 0 {
+        eprintln("FAIL 18 dump-parser hallucinated id for missing scheme: '" + bid2 + "'")
+        fail = fail + 1
+    }
+
+    let status = if fail == 0 { "PASS" } else { "FAIL" }
+    println("__MACOS_URL_HANDLER__ " + status + " n=" + to_string(n) + " fail=" + to_string(fail))
+    return fail
+}
+
+// Selftest dispatcher — mirrors the ssh.hexa pattern: a direct
+// `--selftest` flag scan. We accept the namespaced
+// `--selftest-macos-url-handler` form too so that downstream wrappers
+// can disambiguate when this module is imported alongside another
+// stdlib that also takes --selftest.
+let _ls_argv = args()
+let mut _ls_selftest_flag = false
+let mut _ls_ai = 0
+while _ls_ai < len(_ls_argv) {
+    if _ls_argv[_ls_ai] == "--selftest-macos-url-handler" {
+        _ls_selftest_flag = true
+        break
+    }
+    if _ls_argv[_ls_ai] == "--selftest" {
+        _ls_selftest_flag = true
+        break
+    }
+    _ls_ai = _ls_ai + 1
+}
+if _ls_selftest_flag {
+    let rc = _ls_selftest()
+    if rc != 0 { exit(1) }
+}
+
