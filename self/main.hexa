@@ -1535,6 +1535,50 @@ fn runtime_tmpname(prefix) {
 // globals which the post-call cleanup consumes.
 let mut __hexa_run_stream_buf = ""
 
+// Locate the start-index of a trailing `__HEXA_RC=<digits>` sentinel
+// within `s`. Returns -1 when no such trailing sentinel is present.
+//
+// Rationale (2026-05-05 sub-gap fix, see RFC-001 popen_lines + raw#159):
+// when a child's last stdout emit ENDS without a trailing `\n`, fgets
+// concatenates the child's tail with the shell-wrapper's appended
+// `; echo __HEXA_RC=$?\n` into a SINGLE fgets line shaped
+// `<prefix>__HEXA_RC=<digits>\n`. The legacy `s.starts_with("__HEXA_RC=")`
+// check fails for this shape and the sentinel leaks into user stdout.
+// This helper scans backward from end-of-line, skipping the optional
+// trailing `\n`, then a non-empty digit run, then the literal `__HEXA_RC=`
+// — confirming the substring sits flush against EOF (no chars after).
+//
+// Conservative match: returns -1 unless the digit run is non-empty AND
+// the prefix `__HEXA_RC=` is immediately before it. Mid-stream lines
+// like `foo __HEXA_RC=1 bar\n` are NOT matched (extra text after digits).
+fn __hexa_find_trailing_rc_sentinel(s) {
+    let mark = "__HEXA_RC="
+    let ml = len(mark)
+    let sl = len(s)
+    if sl < ml + 1 { return -1 }
+    let mut end = sl
+    // Skip the optional trailing newline (fgets keeps it; `echo` always
+    // appends one to the sentinel line).
+    if s.substring(end - 1, end) == "\n" { end = end - 1 }
+    // Walk back across the digit run.
+    let mut i = end
+    while i > 0 {
+        let c = s.substring(i - 1, i)
+        if c == "0" || c == "1" || c == "2" || c == "3" || c == "4" ||
+           c == "5" || c == "6" || c == "7" || c == "8" || c == "9" {
+            i = i - 1
+        } else {
+            break
+        }
+    }
+    let digits_start = i
+    if digits_start == end { return -1 }   // no digits
+    if digits_start < ml { return -1 }     // not enough room for the prefix
+    let prefix_start = digits_start - ml
+    if s.substring(prefix_start, digits_start) != mark { return -1 }
+    return prefix_start
+}
+
 fn __hexa_run_stream_on_line(s) {
     // Sentinel-aware streaming: forward every non-sentinel-pattern line
     // immediately (preserves sub-fgets streaming), and only buffer lines
@@ -1555,6 +1599,18 @@ fn __hexa_run_stream_on_line(s) {
     // the buffer). Our streaming variant has the SAME guarantee: any
     // earlier `__HEXA_RC=` line gets flushed when a subsequent line
     // arrives, only the truly-last one is consumed as the sentinel.
+    //
+    // 2026-05-05 sub-gap fix (Agent O routing-disparity investigation):
+    // detect the embedded-sentinel shape `<prefix>__HEXA_RC=<digits>\n`
+    // produced when the child's last emit lacks a trailing `\n`. We
+    // split the line: print the user-prefix immediately (preserving
+    // streaming), buffer just the bare `__HEXA_RC=N\n` portion so the
+    // EOF-side rc parser in run_stream_with_sentinel still recovers rc
+    // via its existing starts_with(mark) path. See RFC-001 (proposals/
+    // rfc_001_popen_lines.md) for the streaming-subprocess design and
+    // raw#159 for the `--no-sentinel` / HEXA_NO_SENTINEL=1 escape hatch
+    // that this fix complements (default sentinel mode is now correct
+    // even when children skip the trailing newline).
     let mark = "__HEXA_RC="
     if len(__hexa_run_stream_buf) > 0 {
         // A previously-suspected sentinel got followed by another line
@@ -1567,10 +1623,20 @@ fn __hexa_run_stream_on_line(s) {
         // Buffer for EOF-time sentinel decision in run_stream_with_sentinel.
         __hexa_run_stream_buf = s
     } else {
-        // Definitely not a sentinel — forward immediately. printf("%s", s)
-        // preserves the trailing \n from fgets, triggering _IOLBF flush
-        // when stdout is piped (runtime.c constructor sets _IOLBF).
-        print(s)
+        let cut = __hexa_find_trailing_rc_sentinel(s)
+        if cut > 0 {
+            // Embedded trailing sentinel: print the user-prefix now,
+            // buffer the bare sentinel for EOF rc capture.
+            let prefix = s.substring(0, cut)
+            let tail = s.substring(cut, len(s))
+            print(prefix)
+            __hexa_run_stream_buf = tail
+        } else {
+            // Definitely not a sentinel — forward immediately. printf("%s", s)
+            // preserves the trailing \n from fgets, triggering _IOLBF flush
+            // when stdout is piped (runtime.c constructor sets _IOLBF).
+            print(s)
+        }
     }
 }
 

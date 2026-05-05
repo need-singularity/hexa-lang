@@ -1,0 +1,196 @@
+// self/test/run_stream_no_trailing_newline.hexa
+// ─────────────────────────────────────────────────────────────────────────
+// Regression test: `hexa run` must NOT leak the `__HEXA_RC=N` sentinel
+// into user stdout when the child's last emit lacks a trailing `\n`.
+//
+// Bug shape (Agent O routing-disparity investigation, 2026-05-05):
+//   Child emits  `print("hello")`  (NO trailing newline).
+//   Shell wrapper appends         `; echo __HEXA_RC=$?\n`.
+//   Parent fgets() returns one line shaped:
+//                                  `hello__HEXA_RC=0\n`
+//   Pre-fix `__hexa_run_stream_on_line` only checked
+//   `s.starts_with("__HEXA_RC=")`, which is FALSE for the embedded shape,
+//   so the whole line printed verbatim and the sentinel leaked through
+//   to user stdout — breaking JSON.parse(stdout) callers (hive
+//   `fake-{anima,hexa,pi-rpc}.mjs` fixtures).
+//
+// Fix-site: self/main.hexa::__hexa_find_trailing_rc_sentinel +
+//           self/main.hexa::__hexa_run_stream_on_line (embedded-sentinel split).
+//
+// Cross-link: proposals/rfc_001_popen_lines.md (streaming subprocess RFC),
+//             raw#159 (`--no-sentinel` / HEXA_NO_SENTINEL=1 escape).
+//
+// This test:
+//   1. Spawn a probe `.hexa` whose body is a single `printf("hello")` —
+//      NO trailing newline emitted by the child.
+//   2. `hexa run` the probe via the parent dispatcher (legacy default
+//      sentinel mode — NOT --no-sentinel).
+//   3. Capture combined stdout with a sentinel trailer.
+//   4. Assert: stdout is exactly "hello" (sentinel stripped).
+//   5. Assert: child rc propagates as 0.
+
+fn _resolve_hexa() {
+    let hl = env_var("HEXA_LANG")
+    if hl != "" {
+        let p = hl + "/hexa"
+        if file_exists(p) { return p }
+    }
+    if file_exists("./hexa") { return "./hexa" }
+    let pwd = exec("pwd").trim()
+    if pwd != "" {
+        let p = pwd + "/hexa"
+        if file_exists(p) { return p }
+    }
+    return "hexa"
+}
+
+fn _exec_capture(cmd) {
+    return exec(cmd + " 2>/dev/null; echo __OUTER_RC=$?")
+}
+
+fn _split_outer_rc(out) {
+    // Find the trailing `__OUTER_RC=N` we appended ourselves and split
+    // it from user stdout. This sentinel is parent-managed (this test),
+    // independent of the inner `__HEXA_RC=` sentinel under examination.
+    //
+    // NOTE: this same shape (no-trailing-newline child concatenated with
+    // shell-echo'd sentinel) is precisely the inner bug we're testing,
+    // so we cannot rely on `\n`-split + `starts_with` here either. We
+    // scan-then-trim: find `__OUTER_RC=` substring at the END of the
+    // buffer (after optional trailing `\n`), parse the digits, peel off
+    // the sentinel, return the leading user-stdout block.
+    let mark = "__OUTER_RC="
+    let ml = len(mark)
+    let mut s = out
+    let mut sl = len(s)
+    if sl > 0 && s.substring(sl - 1, sl) == "\n" {
+        s = s.substring(0, sl - 1)
+        sl = len(s)
+    }
+    // Walk back across digits.
+    let mut i = sl
+    while i > 0 {
+        let c = s.substring(i - 1, i)
+        if c == "0" || c == "1" || c == "2" || c == "3" || c == "4" ||
+           c == "5" || c == "6" || c == "7" || c == "8" || c == "9" {
+            i = i - 1
+        } else {
+            break
+        }
+    }
+    let digits_start = i
+    if digits_start == sl { return ["", -1] }
+    if digits_start < ml { return ["", -1] }
+    let prefix_start = digits_start - ml
+    if s.substring(prefix_start, digits_start) != mark { return ["", -1] }
+    let rc = to_int(s.substring(digits_start, sl))
+    let user = s.substring(0, prefix_start)
+    return [user, rc]
+}
+
+fn test_no_trailing_newline_strips_sentinel() {
+    let probe = "/tmp/hexa_run_stream_no_nl_probe.hexa"
+    // `print()` emits without a trailing `\n` (vs println which appends
+    // one) — exactly the bug-trigger shape: the child's last stdout byte
+    // is NOT `\n`, so the shell wrapper's `; echo __HEXA_RC=$?` runs into
+    // it and fgets returns `hello__HEXA_RC=0\n` as a single line.
+    let body = "print(\"hello\")\n"
+    write_file(probe, body)
+    let hexa = _resolve_hexa()
+    // HEXA_LOCAL=1 bypasses the darwin shim's container routing, ensuring
+    // the in-tree dispatcher (run_stream_with_sentinel) is exercised.
+    let cmd = "HEXA_LOCAL=1 '" + hexa + "' run '" + probe + "'"
+    let out = _exec_capture(cmd)
+    let split = _split_outer_rc(out)
+    let user = split[0]
+    let outer_rc = split[1]
+    if outer_rc != 0 {
+        eprintln("FAIL: hexa run exited non-zero: outer_rc=" + to_string(outer_rc))
+        eprintln("      raw output:")
+        eprintln(out)
+        exit(1)
+    }
+    if user.contains("__HEXA_RC=") {
+        eprintln("FAIL: __HEXA_RC sentinel leaked into user stdout!")
+        eprintln("      expected: 'hello'")
+        eprintln("      got:      '" + user + "'")
+        exit(1)
+    }
+    if user != "hello" {
+        eprintln("FAIL: user stdout mismatch")
+        eprintln("      expected: 'hello'")
+        eprintln("      got:      '" + user + "'")
+        exit(1)
+    }
+    println("PASS: __HEXA_RC sentinel correctly stripped when child emit lacks trailing \\n")
+}
+
+fn test_with_trailing_newline_still_works() {
+    // Regression-guard: the legacy clean-newline shape must continue to
+    // strip the sentinel cleanly (pre-fix path: starts_with(mark) match).
+    // NOTE: println emits `hello\n`, so user-stdout INCLUDES the trailing
+    // newline — we trim before equality.
+    let probe = "/tmp/hexa_run_stream_with_nl_probe.hexa"
+    let body = "println(\"hello\")\n"
+    write_file(probe, body)
+    let hexa = _resolve_hexa()
+    let cmd = "HEXA_LOCAL=1 '" + hexa + "' run '" + probe + "'"
+    let out = _exec_capture(cmd)
+    let split = _split_outer_rc(out)
+    let user = split[0]
+    let outer_rc = split[1]
+    if outer_rc != 0 {
+        eprintln("FAIL (regression): with-newline probe outer_rc=" + to_string(outer_rc))
+        eprintln(out)
+        exit(1)
+    }
+    if user.contains("__HEXA_RC=") {
+        eprintln("FAIL (regression): __HEXA_RC leaked in clean-newline shape")
+        eprintln("      got: '" + user + "'")
+        exit(1)
+    }
+    let trimmed = user.trim()
+    if trimmed != "hello" {
+        eprintln("FAIL (regression): expected 'hello' (after trim), got '" + user + "'")
+        exit(1)
+    }
+    println("PASS: legacy clean-newline shape still strips sentinel cleanly")
+}
+
+fn test_no_sentinel_escape_still_works() {
+    // The raw#159 escape hatch must remain — opt-out via env var.
+    let probe = "/tmp/hexa_run_stream_no_nl_probe.hexa"
+    let body = "print(\"hello\")\n"
+    write_file(probe, body)
+    let hexa = _resolve_hexa()
+    let cmd = "HEXA_NO_SENTINEL=1 HEXA_LOCAL=1 '" + hexa + "' run '" + probe + "'"
+    let out = _exec_capture(cmd)
+    let split = _split_outer_rc(out)
+    let user = split[0]
+    let outer_rc = split[1]
+    if outer_rc != 0 {
+        eprintln("FAIL: --no-sentinel mode regressed: outer_rc=" + to_string(outer_rc))
+        eprintln(out)
+        exit(1)
+    }
+    if user.contains("__HEXA_RC=") {
+        eprintln("FAIL: --no-sentinel mode leaked __HEXA_RC")
+        eprintln("      got: '" + user + "'")
+        exit(1)
+    }
+    if user != "hello" {
+        eprintln("FAIL: --no-sentinel mode user-stdout mismatch")
+        eprintln("      expected: 'hello'")
+        eprintln("      got:      '" + user + "'")
+        exit(1)
+    }
+    println("PASS: HEXA_NO_SENTINEL=1 escape hatch preserved (raw#159 still works)")
+}
+
+fn main() {
+    println("== self/test/run_stream_no_trailing_newline ==")
+    test_no_trailing_newline_strips_sentinel()
+    test_with_trailing_newline_still_works()
+    test_no_sentinel_escape_still_works()
+    println("ALL PASS")
+}

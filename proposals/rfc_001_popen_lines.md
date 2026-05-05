@@ -27,6 +27,38 @@
   capture use case (the dominant pattern). NOT closed for the
   `electrode_adjustment_helper.hexa --live` per-tick streaming case.
 
+## Sub-gap fix (2026-05-05) — embedded `__HEXA_RC=` sentinel leak
+
+Agent O routing-disparity investigation surfaced a parser oversight in
+`self/main.hexa::run_stream_with_sentinel` (and its
+`__hexa_run_stream_on_line` callback). When a child's last stdout emit
+lacks a trailing `\n` (e.g. `print("hello")` with no newline), fgets
+concatenates the child tail with the shell wrapper's appended
+`; echo __HEXA_RC=$?\n` into a SINGLE line shaped
+`hello__HEXA_RC=0\n`. The pre-fix `s.starts_with("__HEXA_RC=")` check
+returned false for this shape and the sentinel leaked through to user
+stdout — breaking `JSON.parse(stdout)` callers (hive `fake-*.mjs`
+fixtures spawned from .ts tests).
+
+**Direction chosen**: Option A (parser fix) over Option B (promote
+no-sentinel mode to default). Sentinel is structurally simpler than a
+sidechannel rc file, and the bug is a parser oversight not a design
+flaw. The raw#159 `--no-sentinel` / `HEXA_NO_SENTINEL=1` escape hatch
+remains supported as opt-out.
+
+**Fix**: new helper `__hexa_find_trailing_rc_sentinel(s)` in
+`self/main.hexa` does a backward scan from end-of-line: skip optional
+trailing `\n`, then a non-empty digit run, then verify the literal
+`__HEXA_RC=` sits flush against the digits. The on-line callback splits
+the matched line into `(user_prefix, sentinel_tail)`, prints the prefix
+immediately (preserving streaming), buffers just the sentinel for the
+EOF rc parser to consume via its existing `starts_with(mark)` path.
+
+**Test**: `self/test/run_stream_no_trailing_newline.hexa` covers
+3 cases — bug-trigger (`print("hello")` no `\n`), legacy regression
+(`println("hello")` clean `\n`), and the no-sentinel escape. All PASS
+on rebuilt dispatcher.
+
 ## Problem
 
 hexa `exec(cmd)` blocks until the subprocess exits and captures all stdout into a single buffer. There is no way to consume stdout line-by-line as the subprocess emits it. No `popen_lines()` iterator. No Process handle exposing `stdout.read_line()`.
