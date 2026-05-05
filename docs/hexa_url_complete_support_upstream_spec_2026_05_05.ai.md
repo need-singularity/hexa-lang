@@ -86,6 +86,13 @@ Same observation in `tool/raw_mk2_loader.hexa` selftest output every run starts 
 - `--quiet-resolver` CLI flag on `hexa run` / `hexa parse`.
 - Dedicated banner channel (stderr-only with category prefix) so callers can route them via `2>/dev/null` without losing real stderr.
 
+**Status (2026-05-05)**: contract landed at `docs/runtime_banners.ai.md`.
+Interp-shim (`tool/install_interp_shim.hexa::iss_fallback_shim_content`) honors
+`HEXA_QUIET_RESOLVER=1` + `--quiet-resolver` and emits with `[resolver-banner] `
+prefix when not quiet — re-run `hexa tool/install_interp_shim.hexa` to
+regenerate `build/hexa_interp`. Resolver layer (`~/.hx/bin/hexa`) is release-
+distributed and adopts the contract on next upstream deploy.
+
 ### 2.4 Exit code propagation through void functions in AOT
 
 **Symptom**: Per Agent B's report, also confirmed in this cycle's smoke tests:

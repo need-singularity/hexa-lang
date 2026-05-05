@@ -72,6 +72,7 @@ if resolver_in_container() {
 | `HEXA_LOCAL=1`                       | emergency Mac-local exec, skip all probes     |
 | `HEXA_RESOLVER_IN_CONTAINER=1`       | (container ↔ child contract; do not set on host) |
 | `HEXA_SHIM_NO_DARWIN_LANDING=1`      | interp-shim only: skip darwin landing rule    |
+| `HEXA_QUIET_RESOLVER=1`              | suppress resolver/shim routing banners (see `docs/runtime_banners.ai.md`) |
 
 ## Authoring rule
 
@@ -95,6 +96,11 @@ hexa-resolver: route=docker reason=mac_safe_landing image=hexa-runner:latest …
 ```
 
 Filter with `2>&1 | grep '^hexa-resolver:'` for routing audit.
+
+To **suppress** banner output for downstream parser hygiene, set
+`HEXA_QUIET_RESOLVER=1` or pass `--quiet-resolver` on the `hexa` argv. See
+`docs/runtime_banners.ai.md` for the full contract (env propagation, flag
+stripping, stderr category prefix, layer-by-layer status).
 
 ## See also
 

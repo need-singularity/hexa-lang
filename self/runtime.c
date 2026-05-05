@@ -5600,15 +5600,14 @@ HexaVal rt_str_trim_end(HexaVal s) {
     return hexa_str_own_with_len(strndup(HX_STR(s), len), (size_t)len);
 }
 
-// Byte-based slice: [start, end) clamped to length
+// hexa-lang upstream gap #2 (2026-05-05): canonical name is `substring`;
+// `slice` is now a byte-identical alias delegating to hexa_str_substring.
+// Previously this had its own implementation (int-truncated bounds + strndup);
+// when hexa_array_slice was strict-array, string `.slice(...)` returned empty.
+// Conformance lock: self/test/string_slice_substring_conformance.hexa.
+// Byte-based slice: [start, end) clamped to length — alias of substring.
 HexaVal hexa_str_slice(HexaVal s, HexaVal start, HexaVal end) {
-    if (!HX_IS_STR(s)) return hexa_str("");
-    int len = (int)HX_STRLEN(s);
-    int a = (int)HX_INT(start), b = (int)HX_INT(end);
-    if (a < 0) a = 0;
-    if (b > len) b = len;
-    if (a > b) a = b;
-    return hexa_str_own_with_len(strndup(HX_STR(s) + a, b - a), (size_t)(b - a));
+    return hexa_str_substring(s, start, end);
 }
 
 // hexa_array_slice — polymorphic at runtime. Codegen emits this symbol
