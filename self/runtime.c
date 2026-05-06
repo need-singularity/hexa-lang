@@ -4015,7 +4015,7 @@ HexaVal hexa_exec_stream_impl(HexaVal cmd, HexaVal on_line) {
         fp = popen(HX_STR(cmd), "r");
         if (!fp) return hexa_int(127);
     }
-    hexa_pipe_buf_enlarge_full(fp);  // TL;DR #4: F_SETPIPE_SZ Linux + setvbuf 256K
+    hexa_pipe_buf_enlarge_full(fp);  // TL;DR #4: F_SETPIPE_SZ Linux + setvbuf 256K (fgets streaming)
     char buf[4096];
     while (fgets(buf, sizeof(buf), fp)) {
         // Construct a fresh hexa string per line (the buffer is reused).
