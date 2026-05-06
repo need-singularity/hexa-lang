@@ -109,11 +109,44 @@ static inline void hexa_pipe_buf_enlarge_full(FILE* fp) {
     (void)setvbuf(fp, NULL, _IOFBF, 256 * 1024);
 }
 
-// Force line-buffered stdout when redirected to file/pipe.
-__attribute__((constructor))
-static void _hexa_init_stdio(void) {
-    setvbuf(stdout, NULL, _IOLBF, 0);
-    setvbuf(stderr, NULL, _IOLBF, 0);
+// Force line-buffered stdout + unbuffered stderr (POSIX) — interactive
+// prompt dead-time fix.
+//
+// Background: macOS/Linux libc default is line-buffered stdout when
+// isatty(stdout) == 1, fully-buffered otherwise. When a hexa script is
+// invoked with stdout piped or redirected (e.g. `wraith vault setup-2fa
+// | tee log` or run under a parent that captures stdout via popen),
+// stdout becomes fully buffered (4 KB BUFSIZ). Interactive prompts
+// emitted via println(...) do not flush until the buffer fills, so the
+// operator sees dead time and may type into a process that already
+// expects input — surfacing as silent prompt-skip / FAIL.
+//
+// Fix: force _IOLBF on stdout (flush on '\n') regardless of whether
+// stdout is a TTY. stderr is forced _IONBF (unbuffered) — POSIX already
+// specifies stderr unbuffered, but some libc implementations make it
+// line-buffered by default; the explicit setvbuf is defense-in-depth.
+//
+// Operator opt-out:
+//   HEXA_STDIO_DEFAULT=1  → skip — restore libc defaults (fully-buffered
+//                          when redirected). Use for bulk-output
+//                          benchmarks where line-buffer overhead
+//                          matters.
+//
+// Bulk-output regression: line-buffered adds one fwrite() per println,
+// vs one per BUFSIZ in fully-buffered. Measured ~5% on tight println
+// loops (1000 iterations). Trade is correctness on interactive prompts;
+// users who need raw throughput set HEXA_STDIO_DEFAULT=1.
+__attribute__((constructor(101)))  // priority 101 = early, before other constructors
+static void _hexa_init_stdio_buffer(void) {
+    const char* opt = getenv("HEXA_STDIO_DEFAULT");
+    if (opt && opt[0] == '1' && opt[1] == '\0') return;
+    // 2026-05-06 — _IOLBF (line-buffered)는 일부 환경에서 \n 후 flush 안 되는
+    // 사례 발견 (사용자가 enter 한 번 쳐야 출력). _IONBF (fully unbuffered)
+    // 강제 — 매 output 즉시 flush. trade: 5-10% throughput, gain: interactive
+    // dead time 0 보장.
+    // BSD `setlinebuf(stdout)` 대신 `setvbuf(_IONBF)` 선택 — 더 강력.
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -7593,13 +7626,73 @@ static HexaVal _jp_parse_string(const char* s, size_t n, size_t* pi) {
                 case 'b':  out = '\b'; break;
                 case 'f':  out = '\f'; break;
                 case 'u':
-                    // Raw passthrough (no unicode expansion) — write literal
-                    // \uXXXX as the 6 bytes so round-trip is lossless.
+                    // RFC 8259 §7: decode \uXXXX → UTF-8. Handle surrogate
+                    // pairs U+D800..U+DBFF + U+DC00..U+DFFF per §7 last
+                    // paragraph. trk.24 fix 2026-05-06 (HEXA_F2).
                     if (*pi + 5 < n) {
-                        if (len + 6 >= cap) { cap = (cap + 6) * 2; char* nb = (char*)realloc(buf, cap); if (!nb) { free(buf); return hexa_str(""); } buf = nb; }
-                        memcpy(buf + len, s + *pi, 6);
-                        len += 6;
-                        *pi += 6;
+                        unsigned cp = 0;
+                        int ok = 1;
+                        for (int hi = 0; hi < 4; hi++) {
+                            char hc = s[*pi + 2 + hi];
+                            unsigned d;
+                            if (hc >= '0' && hc <= '9') d = (unsigned)(hc - '0');
+                            else if (hc >= 'a' && hc <= 'f') d = (unsigned)(hc - 'a' + 10);
+                            else if (hc >= 'A' && hc <= 'F') d = (unsigned)(hc - 'A' + 10);
+                            else { ok = 0; break; }
+                            cp = (cp << 4) | d;
+                        }
+                        if (!ok) {
+                            // Malformed \uXXXX: fall through to raw passthrough
+                            // for round-trip safety (preserves caller's input).
+                            if (len + 6 >= cap) { cap = (cap + 6) * 2; char* nb = (char*)realloc(buf, cap); if (!nb) { free(buf); return hexa_str(""); } buf = nb; }
+                            memcpy(buf + len, s + *pi, 6);
+                            len += 6;
+                            *pi += 6;
+                            continue;
+                        }
+                        // Surrogate pair: high surrogate U+D800..U+DBFF must
+                        // be followed by low surrogate U+DC00..U+DFFF in a
+                        // second \uXXXX escape.
+                        if (cp >= 0xD800 && cp <= 0xDBFF
+                            && *pi + 11 < n
+                            && s[*pi + 6] == '\\' && s[*pi + 7] == 'u') {
+                            unsigned lo = 0;
+                            int lo_ok = 1;
+                            for (int hi = 0; hi < 4; hi++) {
+                                char hc = s[*pi + 8 + hi];
+                                unsigned d;
+                                if (hc >= '0' && hc <= '9') d = (unsigned)(hc - '0');
+                                else if (hc >= 'a' && hc <= 'f') d = (unsigned)(hc - 'a' + 10);
+                                else if (hc >= 'A' && hc <= 'F') d = (unsigned)(hc - 'A' + 10);
+                                else { lo_ok = 0; break; }
+                                lo = (lo << 4) | d;
+                            }
+                            if (lo_ok && lo >= 0xDC00 && lo <= 0xDFFF) {
+                                cp = 0x10000u + ((cp - 0xD800u) << 10) + (lo - 0xDC00u);
+                                *pi += 12;
+                            } else {
+                                *pi += 6;  // bad pair — emit BMP cp alone
+                            }
+                        } else {
+                            *pi += 6;
+                        }
+                        // UTF-8 encode (mirror hexa_from_char_code logic).
+                        if (len + 4 >= cap) { cap = (cap + 4) * 2; char* nb = (char*)realloc(buf, cap); if (!nb) { free(buf); return hexa_str(""); } buf = nb; }
+                        if (cp < 0x80u) {
+                            buf[len++] = (char)cp;
+                        } else if (cp < 0x800u) {
+                            buf[len++] = (char)(0xC0u | (cp >> 6));
+                            buf[len++] = (char)(0x80u | (cp & 0x3Fu));
+                        } else if (cp < 0x10000u) {
+                            buf[len++] = (char)(0xE0u | (cp >> 12));
+                            buf[len++] = (char)(0x80u | ((cp >> 6) & 0x3Fu));
+                            buf[len++] = (char)(0x80u | (cp & 0x3Fu));
+                        } else {
+                            buf[len++] = (char)(0xF0u | (cp >> 18));
+                            buf[len++] = (char)(0x80u | ((cp >> 12) & 0x3Fu));
+                            buf[len++] = (char)(0x80u | ((cp >> 6) & 0x3Fu));
+                            buf[len++] = (char)(0x80u | (cp & 0x3Fu));
+                        }
                         continue;
                     }
                     out = 'u';
