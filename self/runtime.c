@@ -7520,6 +7520,64 @@ HexaVal hexa_utc_iso_now(void) {
     return hexa_str(buf);
 }
 
+// G4-ISO8601 2026-05-06 (.roadmap.stdlib.G4) — format/parse mirrors of
+// utc_iso_now() so witness rows in hexa-bio _python_bridge can drop
+// datetime.now(timezone.utc).isoformat() (45 callsites).
+
+// utc_iso_format(epoch_sec): epoch sec → "YYYY-MM-DDTHH:MM:SSZ".
+HexaVal hexa_utc_iso_format(HexaVal epoch_v) {
+    int64_t e = HX_IS_INT(epoch_v) ? HX_INT(epoch_v) : (int64_t)_hexa_f(epoch_v);
+    time_t t = (time_t)e;
+    struct tm g;
+    gmtime_r(&t, &g);
+    char buf[32];
+    strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &g);
+    return hexa_str(buf);
+}
+
+// utc_iso_parse(s): "YYYY-MM-DDTHH:MM:SS[.fff][Z|+HH:MM|-HH:MM]" → epoch sec.
+// Tolerant of fractional seconds (truncated) and timezone offset suffix
+// (offset interpreted; non-UTC offsets shift the returned epoch).
+HexaVal hexa_utc_iso_parse(HexaVal s_v) {
+    if (!HX_IS_STR(s_v)) return hexa_int(0);
+    const char* s = HX_STR(s_v);
+    if (!s) return hexa_int(0);
+    int Y=0, M=0, D=0, h=0, m=0, sec=0;
+    int n = sscanf(s, "%d-%d-%dT%d:%d:%d", &Y, &M, &D, &h, &m, &sec);
+    if (n < 6) return hexa_int(0);
+    struct tm g;
+    memset(&g, 0, sizeof(g));
+    g.tm_year = Y - 1900;
+    g.tm_mon  = M - 1;
+    g.tm_mday = D;
+    g.tm_hour = h;
+    g.tm_min  = m;
+    g.tm_sec  = sec;
+    int64_t epoch = (int64_t)timegm(&g);
+    // Optional tz offset suffix: scan from end of string for [+-]HH:MM or [+-]HHMM.
+    size_t L = strlen(s);
+    if (L >= 5) {
+        for (ssize_t i = (ssize_t)L - 1; i > 0; i--) {
+            char c = s[i];
+            if (c == '+' || c == '-') {
+                int sign = (c == '+') ? 1 : -1;
+                int oh = 0, om = 0;
+                const char* off = s + i + 1;
+                if (sscanf(off, "%d:%d", &oh, &om) == 2 ||
+                    sscanf(off, "%2d%2d", &oh, &om) == 2) {
+                    epoch -= sign * (oh * 3600 + om * 60);
+                }
+                break;
+            }
+            if (c == 'Z' || c == 'z') break;
+            if (c >= '0' && c <= '9') continue;
+            if (c == ':' || c == '.') continue;
+            break;
+        }
+    }
+    return hexa_int(epoch);
+}
+
 // utc_compact_now(): compact "YYYYMMDDHHMMSS" UTC (checkpoint filename).
 HexaVal hexa_utc_compact_now(void) {
     int64_t pin = hexa_pinned_epoch();
