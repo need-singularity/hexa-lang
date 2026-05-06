@@ -1695,14 +1695,29 @@ fn try_cache_exec(file, extra_args) {
     if len(ld_pass) > 0 { ffi_env = ffi_env + "LD_LIBRARY_PATH='" + ld_pass + "' " }
     let vm_env = if cmd_run_vm_mode { "HEXA_VM=1 " } else { "" }
     let watch = " ) & C=$!; ( while kill -0 $C 2>/dev/null; do [ $PPID -eq 1 ] && { kill -9 $C 2>/dev/null; exit; }; kill -0 $PPID 2>/dev/null || { kill -9 $C 2>/dev/null; exit; }; sleep 0.05; done ) & wait $C"
-    let stderr_tmp = runtime_tmpname("cache_err")
+    // FIXED 2026-05-06 — interactive-stderr-buffering: when parent stderr
+    // is a TTY (interactive shell), redirecting child stderr to a temp file
+    // holds prompts/progress invisible until child exit — wraith vault
+    // setup-2fa passphrase prompt was completely buffered behind a
+    // pending child `read </dev/tty`. Detect TTY via `[ -t 2 ]` and let
+    // the child inherit parent stderr directly (PTY → immediate user
+    // visibility). Non-TTY (CI/hooks/pipes) keep the temp-redirect path
+    // so silent_fallback_eprint regression coverage is preserved (parent
+    // stderr is captured and re-emitted byte-for-byte through eprint()).
+    // HEXA_FORCE_STDERR_TEMP=1 forces the legacy temp path even on TTY
+    // (debugging escape hatch). Probe-confirmed: probe_split / probe_prompt
+    // / wraith setup-2fa all PASS on PTY; non-TTY regression preserved.
+    let force_temp = env_var("HEXA_FORCE_STDERR_TEMP") == "1"
+    let parent_stderr_tty = !force_temp && exec("[ -t 2 ] && printf yes || printf no").trim() == "yes"
+    let stderr_tmp = if parent_stderr_tty { "" } else { runtime_tmpname("cache_err") }
+    let stderr_redirect = if parent_stderr_tty { "" } else { " 2>'" + stderr_tmp + "'" }
     // raw 159: --no-sentinel / HEXA_NO_SENTINEL=1 splits the rc out of
     // stdout into a sidechannel file. Default keeps legacy stdout
     // sentinel for backward compatibility.
     let no_sent = no_sentinel_active()
     let rc_tmp = if no_sent { runtime_tmpname("cache_rc") } else { "" }
     let rc_inject = if no_sent { "; echo $? > '" + rc_tmp + "'" } else { "; echo __HEXA_RC=$?" }
-    let cmd = "exec 3<&0; ( " + ffi_env + vm_env + "'" + cached + "'" + arg_tail + " <&3 2>'" + stderr_tmp + "'" + watch + rc_inject
+    let cmd = "exec 3<&0; ( " + ffi_env + vm_env + "'" + cached + "'" + arg_tail + " <&3" + stderr_redirect + watch + rc_inject
     // 2026-04-25 streaming refactor: popen-read line-by-line via
     // exec_stream() instead of exec()-then-split. Forwarded lines flush
     // per-newline (runtime.c _IOLBF stdout) so children that emit
@@ -1710,10 +1725,12 @@ fn try_cache_exec(file, extra_args) {
     // legacy "all output appears at process exit" stall.
     // AOT-cache parity: identical helper used in cmd_run below.
     let rc = if no_sent { run_stream_no_sentinel(cmd, rc_tmp) } else { run_stream_with_sentinel(cmd) }
-    if file_exists(stderr_tmp) {
-        let err_buf = read_file(stderr_tmp)
-        if len(err_buf) > 0 { eprint(err_buf) }
-        exec("rm -f '" + stderr_tmp + "'")
+    if !parent_stderr_tty {
+        if file_exists(stderr_tmp) {
+            let err_buf = read_file(stderr_tmp)
+            if len(err_buf) > 0 { eprint(err_buf) }
+            exec("rm -f '" + stderr_tmp + "'")
+        }
     }
     return rc
 }
@@ -2246,7 +2263,25 @@ fn cmd_run(file, extra_args) {
     //   `2>&1` 제거 — 자식 stderr 는 전용 temp 파일로 redirect.
     //   stdout 만 popen 으로 캡처 → __HEXA_RC 샌티넬 복원.
     //   stderr temp 파일은 exec 완료 후 eprint() 로 부모 stderr 로 재방출.
-    let stderr_tmp = runtime_tmpname("run_err")
+    // FIXED 2026-05-06 — interactive-stderr-buffering: temp-file redirect
+    //   was buffering interactive prompts (wraith vault setup-2fa
+    //   passphrase, confirmation eprintln() calls before a child
+    //   `read </dev/tty`) for the entire child lifetime — user saw a hung
+    //   cursor with no visible prompt. Probe split test confirmed [B][D]
+    //   stderr lines only surfaced after child exit while [A][C][E]
+    //   stdout printed live. Fix: detect parent stderr TTY via `[ -t 2 ]`.
+    //   Interactive path inherits child stderr to parent's PTY directly
+    //   (immediate visibility, no buffering, no re-emit). Non-TTY path
+    //   (CI / hooks / `2>&1 | cat` / `< /dev/null`) keeps the temp-redirect
+    //   / eprint() re-emit so the silent_fallback_eprint regression test
+    //   still captures and surfaces stderr correctly.
+    //   HEXA_FORCE_STDERR_TEMP=1 forces the legacy temp path on TTY
+    //   (debugging escape hatch — never set by callers in normal flow).
+    //   Mirror of try_cache_exec TTY branch (line ~1698) for AOT parity.
+    let force_temp = env_var("HEXA_FORCE_STDERR_TEMP") == "1"
+    let parent_stderr_tty = !force_temp && exec("[ -t 2 ] && printf yes || printf no").trim() == "yes"
+    let stderr_tmp = if parent_stderr_tty { "" } else { runtime_tmpname("run_err") }
+    let stderr_redirect = if parent_stderr_tty { "" } else { " 2>'" + stderr_tmp + "'" }
     // raw 159: --no-sentinel / HEXA_NO_SENTINEL=1 keeps stdout byte-clean
     // by routing rc through a sidechannel file. Default behavior
     // preserves the legacy `__HEXA_RC=N` stdout sentinel (backward
@@ -2255,7 +2290,7 @@ fn cmd_run(file, extra_args) {
     let no_sent = no_sentinel_active()
     let rc_tmp = if no_sent { runtime_tmpname("run_rc") } else { "" }
     let rc_inject = if no_sent { "; echo $? > '" + rc_tmp + "'" } else { "; echo __HEXA_RC=$?" }
-    let cmd = "exec 3<&0; ( " + ffi_env + vm_env + "'" + interp + "' '" + script + "'" + arg_tail + " <&3 2>'" + stderr_tmp + "'" + watch + rc_inject
+    let cmd = "exec 3<&0; ( " + ffi_env + vm_env + "'" + interp + "' '" + script + "'" + arg_tail + " <&3" + stderr_redirect + watch + rc_inject
     // 2026-04-25 streaming refactor:
     //   was `let out = exec(cmd)` (popen → full-buffer → split → print),
     //   which forced sub-200ms-event-latency tools (hive subagent
@@ -2272,10 +2307,13 @@ fn cmd_run(file, extra_args) {
     // 순서를 완벽히 보존할 수는 없어도 "stderr=stderr / stdout=stdout"
     // 라우팅은 복원. (스트리밍 전환 후에도 stderr 는 여전히 temp 파일에
     // 누적되었다가 자식 종료 후 일괄 방출 — interleaving 강화는 별건.)
-    if file_exists(stderr_tmp) {
-        let err_buf = read_file(stderr_tmp)
-        if len(err_buf) > 0 { eprint(err_buf) }
-        exec("rm -f '" + stderr_tmp + "'")
+    // 2026-05-06: TTY path skips re-emit (child stderr inherited directly).
+    if !parent_stderr_tty {
+        if file_exists(stderr_tmp) {
+            let err_buf = read_file(stderr_tmp)
+            if len(err_buf) > 0 { eprint(err_buf) }
+            exec("rm -f '" + stderr_tmp + "'")
+        }
     }
     // ω-hexa-batch (2026-04-26): when running under `hexa batch ...`,
     // a non-zero rc must NOT abort the dispatcher — the batch driver
