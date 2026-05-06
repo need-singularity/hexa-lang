@@ -4270,7 +4270,14 @@ void hexa_print_val(HexaVal v) {
     }
 }
 
-void hexa_println(HexaVal v) { hexa_print_val(v); printf("\n"); }
+void hexa_println(HexaVal v) {
+    hexa_print_val(v); printf("\n");
+    // 2026-05-06 — auto-fflush. setvbuf constructor가 일부 환경 (macOS Tahoe
+    // Terminal, qrencode subprocess와 interactive prompt 혼재 등)에서 무력
+    // 화 case 발견. 매 println 후 명시 fflush로 dead time 0 보장.
+    // opt-out: HEXA_NO_AUTOFLUSH=1 (bulk-output benchmark용).
+    if (!getenv("HEXA_NO_AUTOFLUSH")) fflush(stdout);
+}
 
 // P7-6 builtin (2026-04-18): stderr counterpart to hexa_println. Used
 // by user code that needs to emit diagnostics without polluting stdout
@@ -4317,6 +4324,8 @@ HexaVal hexa_eprintln(HexaVal v) {
         }
         default: fprintf(stderr, "<value>\n"); break;
     }
+    // 2026-05-06 — auto-fflush stderr (mirror hexa_println 정합).
+    if (!getenv("HEXA_NO_AUTOFLUSH")) fflush(stderr);
     return hexa_void();
 }
 
