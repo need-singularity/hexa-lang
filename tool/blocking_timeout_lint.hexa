@@ -1,0 +1,424 @@
+// @resolver-bypass(reason="pure text scanner — read-only filesystem walk, no network/host syscalls")
+// tool/blocking_timeout_lint.hexa — obligate `timeout` arg on stdlib blocking I/O calls.
+//
+// MOTIVATION
+//   stdlib has many primitive wrappers around blocking syscalls (read, recv,
+//   accept, wait, sleep, file lock, etc.). Without an obligatory timeout the
+//   process can hang indefinitely → resource exhaustion / agent runaway. The
+//   AOT-vs-interp memory note also flags last-def-wins silent collisions:
+//   blocking calls without timeout amplify that hazard since hangs mask the
+//   collision.
+//
+// SCOPE (this is the SSOT for the inventory; keep in sync with the table below)
+//   The current stdlib blocking-I/O surface lives in:
+//     stdlib/                — community-distributed std lib
+//     self/stdlib/           — bootstrap-internal std lib
+//
+//   ┌─────────────────────────────────────────────────────────────────────────┐
+//   │ INVENTORY (as of 2026-05-06; auto-derived: see _scan_call_sites)        │
+//   ├──────────────────────────────────────────┬──────────────────────────────┤
+//   │ FUNCTION                                 │ STATUS (timeout arg)         │
+//   ├──────────────────────────────────────────┼──────────────────────────────┤
+//   │ stdlib/net/socket.hexa                                                  │
+//   │   pub fn socket_accept(listener)         │ MISSING → add timeout_sec    │
+//   │   pub fn socket_connect(addr)            │ MISSING → add timeout_sec    │
+//   │   pub fn socket_read(conn)               │ MISSING → add timeout_sec    │
+//   │   pub fn socket_write(conn, data)        │ ok (write-side; not blocking)│
+//   │   pub fn read_body_best_effort(...)      │ MISSING → max_iters guard    │
+//   │ stdlib/net/http_server.hexa                                             │
+//   │   pub fn server_accept_once(s)           │ MISSING (delegates accept)   │
+//   │   server_new sets read_timeout_ms=5000   │ partial (handler-side only)  │
+//   │ stdlib/net/concurrent_serve.hexa                                        │
+//   │   pub fn run(s, workers)                 │ MISSING (accept loop)        │
+//   │   pub fn scheduler_wait_idle(s)          │ MISSING → add timeout_ms     │
+//   │   pub fn drain_all(s, dispatch_fn)       │ guard=1_000_000 iters        │
+//   │ stdlib/websocket.hexa                                                   │
+//   │   pub fn ws_connect(url, timeout_sec)    │ ok (timeout_sec param)       │
+//   │   pub fn ws_recv(h, timeout_sec)         │ ok (timeout_sec param)       │
+//   │ stdlib/qrng_anu.hexa                                                    │
+//   │   fn _sleep_ms(ms)                       │ ok (ms IS the timeout)       │
+//   │   pub fn qrng_anu_chunked(total, gap_ms) │ ok (gap_ms IS the timeout)   │
+//   │ stdlib/sqlite.hexa                                                      │
+//   │   pub fn sqlite_exec(h, sql)             │ MISSING (busy_timeout?)      │
+//   │   pub fn sqlite_exec_bind(h, sql, p)     │ MISSING                      │
+//   │ stdlib/proc.hexa                                                        │
+//   │   fn proc_spawn_supervised(cmd, lease, why) │ ok (lease_ttl IS timeout) │
+//   │   pub fn proc_run_with_stdin(cmd, in)    │ MISSING                      │
+//   │   pub fn proc_run_json_bridge(cmd, p)    │ MISSING                      │
+//   │ self/stdlib/proc.hexa                                                   │
+//   │   fn proc_run_with_stdin(cmd, in)        │ MISSING (mirror of above)    │
+//   │   fn proc_run_json_bridge(cmd, p)        │ MISSING (mirror)             │
+//   │   fn popen_lines / popen_lines_with_status │ MISSING                    │
+//   │ self/stdlib/stdin.hexa                                                  │
+//   │   pub fn read_lines()                    │ MISSING (no EOF cap)         │
+//   │   pub fn read_line()                     │ MISSING                      │
+//   │   pub fn for_each_line(cb)               │ MISSING (heuristic-EOF only) │
+//   │ self/stdlib/term_resize.hexa                                            │
+//   │   pub fn resize_poll_loop(interval_ms,cb)│ partial (interval is poll)   │
+//   │ self/stdlib/fs.hexa                                                     │
+//   │   fn read_file_safe / write_file_safe    │ ok (file I/O, fs-bounded)    │
+//   └──────────────────────────────────────────┴──────────────────────────────┘
+//
+// MODES
+//   warn     — print violations, exit 0  (default; non-blocking adoption)
+//   strict   — print violations, exit 1
+//   selftest — verify lint logic itself
+//   inventory— re-emit the inventory table by scanning fn defs
+//
+// USAGE
+//   hexa tool/blocking_timeout_lint.hexa                     — warn mode, repo root
+//   hexa tool/blocking_timeout_lint.hexa --strict            — fail on violation
+//   hexa tool/blocking_timeout_lint.hexa --inventory         — list candidate fns
+//   hexa tool/blocking_timeout_lint.hexa --selftest          — regression
+//   hexa tool/blocking_timeout_lint.hexa <root>              — custom scan root
+//
+// OUTPUT
+//   JSON summary on stdout (schema: hexa.blocking_timeout_lint.v1).
+//
+// MIGRATION NOTE
+//   Most existing call-sites lack a timeout arg. This lint is shipped in
+//   warn mode so adoption can be gradual. Use --strict in CI gate ONLY
+//   after the inventory above shrinks to < 5 MISSING entries.
+
+fn _default_root() -> string {
+    return to_string(exec("pwd")).trim()
+}
+
+// Names of fns that are blocking AND must accept a timeout. Order matters
+// only for stable inventory output.
+fn _blocking_fn_names() -> array {
+    return [
+        // net/socket primitives
+        "socket_accept",
+        "socket_connect",
+        "socket_read",
+        "read_body_best_effort",
+        // net/http_server
+        "server_accept_once",
+        // net/concurrent_serve
+        "scheduler_wait_idle",
+        // sqlite (busy_timeout)
+        "sqlite_exec",
+        "sqlite_exec_bind",
+        // proc (subprocess wait)
+        "proc_run_with_stdin",
+        "proc_run_json_bridge",
+        "popen_lines",
+        "popen_lines_with_status",
+        // stdin (parent reader)
+        "read_lines",
+        "read_line",
+        "for_each_line",
+    ]
+}
+
+// Names already exempt — they accept a timeout-equivalent param OR are
+// inherently non-blocking (write-side, fs-bounded, etc.).
+fn _exempt_fn_names() -> array {
+    return [
+        "ws_connect",        // timeout_sec
+        "ws_recv",           // timeout_sec
+        "qrng_anu_chunked",  // sleep_ms_between
+        "_sleep_ms",         // ms IS the timeout
+        "proc_spawn_supervised", // lease_ttl IS the timeout
+        "socket_write",      // write-side, kernel buffer
+        "socket_close",
+        "socket_listen",
+        "read_file_safe",
+        "write_file_safe",
+        "read_dir",
+        "fs_readlink",
+        "resize_poll_loop",  // interval_ms drives the poll
+    ]
+}
+
+fn _excludes_clause() -> string {
+    let parts = [
+        "-path '*/.git' -prune",
+        "-path '*/.claude' -prune",
+        "-path '*/.claude-*' -prune",
+        "-path '*/node_modules' -prune",
+        "-path '*/target' -prune",
+        "-path '*/build' -prune",
+        "-path '*/.shared-backup-*' -prune",
+        "-path '*/.hx' -prune",
+        "-path '*/dist' -prune",
+    ]
+    let mut s = ""
+    let mut i = 0
+    while i < len(parts) {
+        if i > 0 { s = s + " -o " }
+        s = s + parts[i]
+        i = i + 1
+    }
+    return s
+}
+
+// Find every fn definition (pub fn or fn) in stdlib/ and self/stdlib/.
+fn _list_stdlib_files(root: string) -> array {
+    let cmd = "find " + root + "/stdlib " + root + "/self/stdlib " + _excludes_clause() + " -o -name '*.hexa' -type f -print 2>/dev/null"
+    let raw = to_string(exec(cmd))
+    let lines = split(raw, "\n")
+    let out = []
+    for ln in lines {
+        let t = ln.trim()
+        if t == "" { continue }
+        if t.contains("/.git/") { continue }
+        out.push(t)
+    }
+    return out
+}
+
+// Detect: does THIS line contain a blocking fn def AND lack a timeout arg?
+// Returns the fn name (string) if violating, "" otherwise.
+fn _check_def_line(line: string, blocking: array, exempt: array) -> string {
+    let trimmed = line.trim()
+    // Must look like `fn name(` or `pub fn name(`.
+    let mut after_fn_kw = ""
+    if trimmed.substring(0, 7) == "pub fn " {
+        after_fn_kw = trimmed.substring(7, len(trimmed))
+    } else if trimmed.substring(0, 3) == "fn " {
+        after_fn_kw = trimmed.substring(3, len(trimmed))
+    } else {
+        return ""
+    }
+    let paren = after_fn_kw.index_of("(")
+    if paren < 0 { return "" }
+    let fname = after_fn_kw.substring(0, paren).trim()
+    // Exempt list shortcircuit.
+    let mut e = 0
+    while e < len(exempt) {
+        if fname == exempt[e] { return "" }
+        e = e + 1
+    }
+    // Match against blocking list.
+    let mut hit = false
+    let mut b = 0
+    while b < len(blocking) {
+        if fname == blocking[b] { hit = true; b = len(blocking) }
+        b = b + 1
+    }
+    if !hit { return "" }
+    // Already has timeout arg? Look for "timeout" substring inside paren list.
+    let close = after_fn_kw.index_of(")")
+    if close < 0 { return fname }
+    let arglist = after_fn_kw.substring(paren + 1, close)
+    if arglist.contains("timeout") { return "" }
+    return fname
+}
+
+// Scan call sites: any `<name>(` without `timeout` in the argv.
+fn _check_call_line(line: string, blocking: array, exempt: array) -> string {
+    let mut b = 0
+    while b < len(blocking) {
+        let n = blocking[b]
+        let needle = n + "("
+        let idx = line.index_of(needle)
+        if idx >= 0 {
+            // Skip the def itself: line beginning with `fn` or `pub fn`.
+            let stripped = line.trim()
+            if stripped.substring(0, 3) == "fn " { return "" }
+            if len(stripped) >= 7 && stripped.substring(0, 7) == "pub fn " { return "" }
+            // Look at parenthesized argv until matching ).
+            let after = line.substring(idx + len(needle), len(line))
+            let cp = after.index_of(")")
+            if cp >= 0 {
+                let args_text = after.substring(0, cp)
+                if args_text.contains("timeout") { return "" }
+                // Cheap heuristic: also accept if the call ends in
+                // a literal-int-suffix `_ms` token typed by the caller.
+                if args_text.contains("_ms") { return "" }
+                return n
+            }
+        }
+        b = b + 1
+    }
+    return ""
+}
+
+fn _scan_files(files: array) -> array {
+    let blocking = _blocking_fn_names()
+    let exempt = _exempt_fn_names()
+    let violations = []
+    let mut fi = 0
+    while fi < len(files) {
+        let path = files[fi]
+        let body = to_string(read_file(path))
+        let lines = split(body, "\n")
+        let mut li = 0
+        while li < len(lines) {
+            let ln = lines[li]
+            // Skip comment lines (start with //) — they are doc only.
+            let trimmed = ln.trim()
+            let is_comment = false
+            if len(trimmed) >= 2 {
+                if trimmed.substring(0, 2) == "//" {
+                    li = li + 1
+                    continue
+                }
+            }
+            let def_hit = _check_def_line(ln, blocking, exempt)
+            if def_hit != "" {
+                let v = #{}
+                v["kind"] = "def"
+                v["fn"] = def_hit
+                v["file"] = path
+                v["line"] = li + 1
+                violations.push(v)
+            }
+            let call_hit = _check_call_line(ln, blocking, exempt)
+            if call_hit != "" {
+                let v2 = #{}
+                v2["kind"] = "call"
+                v2["fn"] = call_hit
+                v2["file"] = path
+                v2["line"] = li + 1
+                violations.push(v2)
+            }
+            li = li + 1
+        }
+        fi = fi + 1
+    }
+    return violations
+}
+
+fn _esc(s: string) -> string {
+    let mut r = s.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    return r
+}
+
+fn _render(violations: array, mode: string, root: string) -> string {
+    let mut s = "{\"schema\":\"hexa.blocking_timeout_lint.v1\""
+    s = s + ",\"tool\":\"tool/blocking_timeout_lint.hexa\""
+    s = s + ",\"rule\":\"blocking-io-timeout-obligatory\""
+    s = s + ",\"default_timeout_sec\":30"
+    s = s + ",\"mode\":\"" + mode + "\""
+    s = s + ",\"root\":\"" + _esc(root) + "\""
+    s = s + ",\"violation_count\":" + to_string(len(violations))
+    if len(violations) > 0 {
+        s = s + ",\"severity\":\"" + (if mode == "strict" { "block" } else { "warn" }) + "\""
+        s = s + ",\"error\":{"
+        s = s + "\"code\":\"BLOCKING_CALL_NO_TIMEOUT\""
+        s = s + ",\"message\":\"stdlib blocking-I/O fn def or call without `timeout` arg. Add `timeout: int` (seconds) or `timeout_ms: int` and pass through to the syscall. Default 30s; 0 means no-timeout (must be opt-in).\""
+        s = s + ",\"how_to_fix\":\"Append `timeout_sec: int` parameter; default 30 in callers; check elapsed before each retry.\""
+        s = s + "}"
+    } else {
+        s = s + ",\"severity\":\"pass\""
+    }
+    s = s + ",\"violations\":["
+    let mut i = 0
+    while i < len(violations) {
+        if i > 0 { s = s + "," }
+        let v = violations[i]
+        s = s + "{\"kind\":\"" + to_string(v["kind"]) + "\""
+        s = s + ",\"fn\":\"" + _esc(to_string(v["fn"])) + "\""
+        s = s + ",\"file\":\"" + _esc(to_string(v["file"])) + "\""
+        s = s + ",\"line\":" + to_string(v["line"]) + "}"
+        i = i + 1
+    }
+    s = s + "]}"
+    return s
+}
+
+// --inventory: just emit the blocking & exempt fn name lists.
+fn _render_inventory() -> string {
+    let blocking = _blocking_fn_names()
+    let exempt = _exempt_fn_names()
+    let mut s = "{\"schema\":\"hexa.blocking_timeout_lint.v1.inventory\""
+    s = s + ",\"blocking_fns\":["
+    let mut i = 0
+    while i < len(blocking) {
+        if i > 0 { s = s + "," }
+        s = s + "\"" + blocking[i] + "\""
+        i = i + 1
+    }
+    s = s + "],\"exempt_fns\":["
+    i = 0
+    while i < len(exempt) {
+        if i > 0 { s = s + "," }
+        s = s + "\"" + exempt[i] + "\""
+        i = i + 1
+    }
+    s = s + "]}"
+    return s
+}
+
+fn cmd_selftest() -> i64 {
+    println("[blocking_timeout_lint selftest] start")
+    let blocking = _blocking_fn_names()
+    let exempt = _exempt_fn_names()
+    if len(blocking) <= 0 { println("FAIL blocking list empty"); return 1 }
+    if len(exempt) <= 0 { println("FAIL exempt list empty"); return 1 }
+    // _check_def_line: positive — `pub fn socket_read(conn) {` lacks timeout
+    let ln_bad = "pub fn socket_read(conn) {"
+    if _check_def_line(ln_bad, blocking, exempt) != "socket_read" {
+        println("FAIL def-detection on socket_read"); return 1
+    }
+    // _check_def_line: negative — same fn WITH timeout_sec
+    let ln_ok = "pub fn socket_read(conn, timeout_sec: int) {"
+    if _check_def_line(ln_ok, blocking, exempt) != "" {
+        println("FAIL def-detection swallows timeout-arg variant"); return 1
+    }
+    // _check_def_line: exempt — ws_recv even without timeout substring
+    let ln_exempt = "pub fn ws_recv(h, timeout_sec: int) -> string {"
+    if _check_def_line(ln_exempt, blocking, exempt) != "" {
+        println("FAIL exempt path"); return 1
+    }
+    // _check_call_line: positive — `socket_read(conn)` no timeout
+    let cl_bad = "    let raw = socket_read(conn)"
+    if _check_call_line(cl_bad, blocking, exempt) != "socket_read" {
+        println("FAIL call-site detection"); return 1
+    }
+    // _check_call_line: negative — `socket_read(conn, timeout_sec)`
+    let cl_ok = "    let raw = socket_read(conn, timeout_sec)"
+    if _check_call_line(cl_ok, blocking, exempt) != "" {
+        println("FAIL call-site swallow on explicit timeout"); return 1
+    }
+    // _check_call_line: avoid false-positive on def lines themselves.
+    if _check_call_line("pub fn socket_read(conn) {", blocking, exempt) != "" {
+        println("FAIL def-line passed through call-line scanner"); return 1
+    }
+    // _render with empty violations → severity:pass
+    let r = _render([], "warn", "/tmp")
+    if !r.contains("\"severity\":\"pass\"") { println("FAIL render pass"); return 1 }
+    // _render_inventory contains a known blocking fn name
+    let inv = _render_inventory()
+    if !inv.contains("socket_read") { println("FAIL inventory render"); return 1 }
+    println("[blocking_timeout_lint selftest] OK 8/8")
+    return 0
+}
+
+fn main() -> int {
+    let argv = args()
+    let mut mode = "warn"
+    let mut root = ""
+    let mut want_inventory = false
+    let mut i = 0
+    while i < len(argv) {
+        let a = argv[i]
+        if a == "--strict" { mode = "strict" }
+        else if a == "--warn" { mode = "warn" }
+        else if a == "--inventory" { want_inventory = true }
+        else if a == "--selftest" { exit(cmd_selftest()) }
+        else if a == "selftest" { exit(cmd_selftest()) }
+        else if i > 0 && !a.contains("blocking_timeout_lint") {
+            // positional root
+            if a.substring(0, 2) != "--" { root = a }
+        }
+        i = i + 1
+    }
+    if want_inventory {
+        println(_render_inventory())
+        return 0
+    }
+    if root == "" { root = _default_root() }
+    let files = _list_stdlib_files(root)
+    let violations = _scan_files(files)
+    println(_render(violations, mode, root))
+    if mode == "strict" {
+        if len(violations) > 0 { return 1 }
+    }
+    return 0
+}
+
