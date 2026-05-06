@@ -164,6 +164,8 @@ HexaVal hexa_pipe_spawn(HexaVal cmd_val) {
         return hexa_int(-1);
     }
 
+    // 2026-05-06 — POSIX fork buffer flush (parent stdio inherited by child)
+    fflush(NULL);
     pid_t pid = fork();
     if (pid < 0) {
         close(in_pipe[0]);  close(in_pipe[1]);

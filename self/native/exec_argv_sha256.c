@@ -103,6 +103,8 @@ static HexaVal _hxa_exec_argv_core(HexaVal argv_val, int want_status) {
         return hexa_str("");
     }
 
+    // 2026-05-06 — POSIX fork buffer flush (parent stdio inherited by child)
+    fflush(NULL);
     pid_t pid = fork();
     if (pid < 0) {
         close(pipefd[0]); close(pipefd[1]);

@@ -289,6 +289,9 @@ int term_pty_spawn(const char *const argv[], int rows, int cols, int *out_pid) {
     ws.ws_row = (unsigned short)(rows > 0 ? rows : 24);
     ws.ws_col = (unsigned short)(cols > 0 ? cols : 80);
     int mfd = -1;
+    // 2026-05-06 — POSIX fork buffer flush (forkpty = fork + open pty;
+    // parent stdio is inherited by child until execvp swaps it out)
+    fflush(NULL);
     pid_t pid = forkpty(&mfd, NULL, NULL, &ws);
     if (pid < 0) return -1;
     if (pid == 0) {

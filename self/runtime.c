@@ -4081,6 +4081,8 @@ HexaVal hexa_exec_with_status(HexaVal cmd) {
         arr = hexa_array_push(arr, hexa_int(127));
         return arr;
     }
+    // 2026-05-06 — POSIX fork buffer flush (mirror hexa_exec / hexa_exec_stream_impl)
+    fflush(NULL);
     // TL;DR #2 fast path: posix_spawnp when env enabled + shell-meta-free.
     FILE* spawn_fp = NULL;
     pid_t spawn_pid = hexa_spawn_no_shell(HX_STR(cmd), &spawn_fp);
@@ -7254,6 +7256,8 @@ HexaVal hexa_exec_capture(HexaVal cmd) {
         arr = hexa_array_push(arr, hexa_int(127));
         return arr;
     }
+    // 2026-05-06 — POSIX fork buffer flush (parent stdio inherited by child)
+    fflush(NULL);
     pid_t pid = fork();
     if (pid < 0) {
         close(out_pipe[0]); close(out_pipe[1]);
@@ -7540,6 +7544,8 @@ HexaVal hexa_http_get(HexaVal url) {
     char cmd[4096];
     int k = snprintf(cmd, sizeof(cmd), "curl -fsSL --max-time 30 '%s' 2>/dev/null", u);
     if (k < 0 || (size_t)k >= sizeof(cmd)) return hexa_str("");
+    // 2026-05-06 — POSIX fork buffer flush before popen (mirrors hexa_exec)
+    fflush(NULL);
     FILE* fp = popen(cmd, "r");
     if (!fp) return hexa_str("");
     size_t cap = 4096, len = 0;
@@ -8549,6 +8555,8 @@ HexaVal hexa_exec_stream_async_impl(HexaVal cmd) {
         if (!_hexa_stream_slots[slot].buf) return hexa_int((int64_t)-1);
         _hexa_stream_slots[slot].buf_cap = HEXA_STREAM_LINE_BUF_INITIAL;
     }
+    // 2026-05-06 — POSIX fork buffer flush before popen (mirrors hexa_exec)
+    fflush(NULL);
     FILE* fp = popen(cmd_s, "r");
     if (!fp) return hexa_int((int64_t)-1);
     int fd = fileno(fp);

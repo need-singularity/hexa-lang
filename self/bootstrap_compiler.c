@@ -1472,6 +1472,8 @@ int main(int argc, char** argv) {
         sprintf(cmd, "as %s -o %s 2>/dev/null", asm_file, obj_file2);
         if (system(cmd) == 0) {
             char sdk2[512] = "";
+            // 2026-05-06 — POSIX fork buffer flush before popen
+            fflush(NULL);
             FILE* p2 = popen("xcrun --show-sdk-path 2>/dev/null", "r");
             if (p2) { fgets(sdk2, sizeof(sdk2), p2); pclose(p2); sdk2[strcspn(sdk2,"\n")] = 0; }
             if (strlen(sdk2) > 0)
