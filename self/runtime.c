@@ -3957,6 +3957,12 @@ static int hexa_spawn_reap(pid_t pid) {
 // end, removing the runtime-layer truncation cliff.
 HexaVal hexa_exec(HexaVal cmd) {
     if (!HX_IS_STR(cmd)) return hexa_str("");
+    // 2026-05-06 — POSIX 정합: fork() 전 부모 buffer flush 강제. popen()는
+    // fork+exec 호출 — 부모의 stdio buffer가 자식에게 inherit. 자식 sh가
+    // read </dev/tty 같은 syscall 대기시 부모 stderr/stdout buffer가
+    // flush 안 되면 사용자에게 prompt 안 보임. setup_2fa.hexa 대화형 prompt
+    // 무반응 case 진단됨 (T4 probe).
+    fflush(NULL);
     // TL;DR #2 fast path: posix_spawnp when env enabled + shell-meta-free.
     FILE* spawn_fp = NULL;
     pid_t spawn_pid = hexa_spawn_no_shell(HX_STR(cmd), &spawn_fp);
@@ -4005,6 +4011,8 @@ HexaVal hexa_exec(HexaVal cmd) {
 HexaVal hexa_exec_stream_impl(HexaVal cmd, HexaVal on_line) {
     if (!HX_IS_STR(cmd)) return hexa_int(127);
     if (!HX_IS_FN(on_line) && !HX_IS_CLOSURE(on_line)) return hexa_int(127);
+    // 2026-05-06 — POSIX fork buffer flush (mirror hexa_exec)
+    fflush(NULL);
     // TL;DR #2 fast path: posix_spawnp when env enabled + shell-meta-free.
     FILE* spawn_fp = NULL;
     pid_t spawn_pid = hexa_spawn_no_shell(HX_STR(cmd), &spawn_fp);
