@@ -66,19 +66,26 @@ extern char **environ; // posix_spawnp inherits parent env explicitly
 #endif
 
 // hexa_pipe_buf_enlarge — TL;DR #4 pipe buffer optimization (2026-05-06).
-// Linux: F_SETPIPE_SZ raises kernel pipe capacity to 1 MB (default 64 KB).
-//        Kernel may reject (EPERM if /proc/sys/fs/pipe-max-size exceeded,
-//        EINVAL on old kernels) — silently fall back to default, never fail
-//        the caller.
-// macOS / fallback: F_SETPIPE_SZ unsupported on Darwin (pipe kernel buf is
-//        fixed at 16 KB TYPICAL_PIPE_SIZE → 64 KB BIG_PIPE_SIZE on demand).
-//        Use setvbuf() to enlarge the userland FILE* buffer to 256 KB so
-//        fread/fgets() drain the kernel pipe in fewer syscalls.
-// Both legs apply: on Linux we get kernel-side headroom AND userland buffer;
-// on macOS only the userland buffer (the realistic lever).
+// Two variants because the optimal lever differs by read pattern:
+//
+//   _kernel — Linux F_SETPIPE_SZ only (1 MB kernel pipe). No-op on macOS.
+//             Use for fread()-based bulk drain paths (hexa_exec,
+//             hexa_exec_with_status). The userland setvbuf path costs more
+//             than it saves there: caller already does fread() into a 4 KB
+//             stack buf, and macOS adds a 256 KB malloc + memcpy hop per
+//             popen with no syscall reduction (measured 2x regression on
+//             50 MB `yes | head` stream, 2026-05-06).
+//
+//   _full   — F_SETPIPE_SZ on Linux + setvbuf 256 KB userland on all
+//             platforms. Use for fgets()-based streaming paths
+//             (hexa_exec_stream_impl). Streaming reads line-at-a-time, so
+//             a large refill buffer behind fgets() amortizes the syscall.
+//
+// Linux F_SETPIPE_SZ may be rejected (EPERM if pipe-max-size exceeded,
+// EINVAL on old kernels) — silently fall back, never fail the caller.
 // Must be called immediately after popen() and before any I/O on fp —
 // setvbuf() requires a fresh stream.
-static inline void hexa_pipe_buf_enlarge(FILE* fp) {
+static inline void hexa_pipe_buf_enlarge_kernel(FILE* fp) {
     if (!fp) return;
 #ifdef __linux__
 #ifdef F_SETPIPE_SZ
@@ -89,9 +96,16 @@ static inline void hexa_pipe_buf_enlarge(FILE* fp) {
         // still works correctly, only throughput differs.
     }
 #endif
+#else
+    (void)fp;  // macOS: F_SETPIPE_SZ unsupported, leave default.
 #endif
-    // Userland FILE* buffer: 256 KB fully-buffered. Applied on all platforms
-    // (Linux benefits too — fewer fread syscalls on the userland side).
+}
+
+static inline void hexa_pipe_buf_enlarge_full(FILE* fp) {
+    if (!fp) return;
+    hexa_pipe_buf_enlarge_kernel(fp);
+    // Userland FILE* buffer: 256 KB fully-buffered. Helps fgets() amortize
+    // the read() syscall over many lines.
     (void)setvbuf(fp, NULL, _IOFBF, 256 * 1024);
 }
 
@@ -3953,7 +3967,7 @@ HexaVal hexa_exec(HexaVal cmd) {
         fp = popen(HX_STR(cmd), "r");
         if (!fp) return hexa_str("");
     }
-    hexa_pipe_buf_enlarge(fp);  // TL;DR #4: F_SETPIPE_SZ Linux + setvbuf 256K
+    hexa_pipe_buf_enlarge_kernel(fp);  // TL;DR #4: F_SETPIPE_SZ Linux only (fread bulk drain)
     char buf[4096]; size_t total = 0;
     size_t cap = 4096;
     char* result = (char*)malloc(cap); result[0] = '\0';
@@ -4001,7 +4015,7 @@ HexaVal hexa_exec_stream_impl(HexaVal cmd, HexaVal on_line) {
         fp = popen(HX_STR(cmd), "r");
         if (!fp) return hexa_int(127);
     }
-    hexa_pipe_buf_enlarge(fp);  // TL;DR #4: F_SETPIPE_SZ Linux + setvbuf 256K
+    hexa_pipe_buf_enlarge_full(fp);  // TL;DR #4: F_SETPIPE_SZ Linux + setvbuf 256K
     char buf[4096];
     while (fgets(buf, sizeof(buf), fp)) {
         // Construct a fresh hexa string per line (the buffer is reused).
@@ -4073,7 +4087,7 @@ HexaVal hexa_exec_with_status(HexaVal cmd) {
             return arr;
         }
     }
-    hexa_pipe_buf_enlarge(fp);  // TL;DR #4: F_SETPIPE_SZ Linux + setvbuf 256K
+    hexa_pipe_buf_enlarge_kernel(fp);  // TL;DR #4: F_SETPIPE_SZ Linux only (fread bulk drain)
     // 2026-04-26 cross-repo upstream: same fgets→fread switch as hexa_exec
     // above (see that function's comment for the embedded-NUL truncation
     // root cause and the residual string-ABI caveat).
