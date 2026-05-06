@@ -18,6 +18,8 @@
 #include <spawn.h>      // TL;DR #2: posix_spawnp shell-free fast path
 #include <errno.h>      // EINTR for waitpid retry loop in spawn reap
 #include <fcntl.h>      // TL;DR #4: F_SETPIPE_SZ on Linux for pipe enlarge
+#include <signal.h>     // 2026-05-06: SIGPIPE SIG_IGN install in stdio init
+#include <regex.h>      // G3-REGEX 2026-05-06: POSIX ERE regcomp/regexec
 extern char **environ; // posix_spawnp inherits parent env explicitly
 #if defined(__APPLE__)
 #include <execinfo.h>
@@ -109,11 +111,21 @@ static inline void hexa_pipe_buf_enlarge_full(FILE* fp) {
     (void)setvbuf(fp, NULL, _IOFBF, 256 * 1024);
 }
 
-// Force line-buffered stdout when redirected to file/pipe.
+// 2026-05-06 audit closure:
+//   - stdout: _IOLBF (line-buffered) — flushes on newline when redirected to
+//     file/pipe so subprocess prompts and progress aren't held mid-line.
+//   - stderr: _IONBF (unbuffered) — POSIX default for stderr is unbuffered
+//     so diagnostics appear immediately even on partial-line writes (e.g.
+//     "loading…" without newline). Earlier _IOLBF setting was over-buffered.
+//   - SIGPIPE: SIG_IGN — when a child closes its stdin while the parent is
+//     mid-write (interactive prompts, build pipelines), the default SIGPIPE
+//     would kill the runtime. Ignoring it lets write() return EPIPE and the
+//     caller decide how to handle the broken-pipe case.
 __attribute__((constructor))
 static void _hexa_init_stdio(void) {
     setvbuf(stdout, NULL, _IOLBF, 0);
-    setvbuf(stderr, NULL, _IOLBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+    signal(SIGPIPE, SIG_IGN);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -7576,6 +7588,212 @@ HexaVal hexa_utc_iso_parse(HexaVal s_v) {
         }
     }
     return hexa_int(epoch);
+}
+
+// G3-REGEX 2026-05-06 (.roadmap.stdlib.G3) — POSIX ERE bridge.
+//
+// Surface (returns hexa values):
+//   regex_match(pat, s)           → bool      — does pat match anywhere in s?
+//   regex_match_full(pat, s)      → bool      — does pat match the whole s?
+//   regex_search(pat, s)          → array     — [start, end] of first match, [] if none
+//   regex_findall(pat, s)         → [array]   — list of [start, end] for every match
+//   regex_replace(pat, s, repl)   → string    — replace all matches with repl (no backrefs)
+//   regex_split(pat, s)           → [string]  — split s on every pat match
+//
+// Flavor: POSIX ERE (Extended Regular Expressions). Supports . [] ^ $ * + ? {n,m}
+// () |. PCRE shortcuts (\d \s \w \b) are NOT POSIX-portable — translate at the
+// hexa stdlib layer (e.g., \d → [0-9], \s → [[:space:]], \w → [[:alnum:]_]).
+// Inline flag (?i) → REG_ICASE; the wrapper strips and sets the flag.
+
+static int _hexa_re_compile(const char* pat, regex_t* out, int icase) {
+    int flags = REG_EXTENDED;
+    if (icase) flags |= REG_ICASE;
+    return regcomp(out, pat, flags);
+}
+
+// Strip a leading "(?i)" inline flag and set *icase = 1 if present.
+static const char* _hexa_re_strip_flags(const char* pat, int* icase) {
+    *icase = 0;
+    if (pat && pat[0] == '(' && pat[1] == '?' && pat[2] == 'i' && pat[3] == ')') {
+        *icase = 1;
+        return pat + 4;
+    }
+    return pat;
+}
+
+HexaVal hexa_regex_match(HexaVal pat_v, HexaVal s_v) {
+    if (!HX_IS_STR(pat_v) || !HX_IS_STR(s_v)) return hexa_bool(0);
+    const char* pat_raw = HX_STR(pat_v);
+    const char* s = HX_STR(s_v);
+    if (!pat_raw || !s) return hexa_bool(0);
+    int icase = 0;
+    const char* pat = _hexa_re_strip_flags(pat_raw, &icase);
+    regex_t re;
+    if (_hexa_re_compile(pat, &re, icase) != 0) return hexa_bool(0);
+    int ok = regexec(&re, s, 0, NULL, 0);
+    regfree(&re);
+    return hexa_bool(ok == 0 ? 1 : 0);
+}
+
+HexaVal hexa_regex_match_full(HexaVal pat_v, HexaVal s_v) {
+    if (!HX_IS_STR(pat_v) || !HX_IS_STR(s_v)) return hexa_bool(0);
+    const char* pat_raw = HX_STR(pat_v);
+    const char* s = HX_STR(s_v);
+    if (!pat_raw || !s) return hexa_bool(0);
+    int icase = 0;
+    const char* pat = _hexa_re_strip_flags(pat_raw, &icase);
+    regex_t re;
+    if (_hexa_re_compile(pat, &re, icase) != 0) return hexa_bool(0);
+    regmatch_t m;
+    int ok = regexec(&re, s, 1, &m, 0);
+    int full = (ok == 0 && m.rm_so == 0 && (size_t)m.rm_eo == strlen(s)) ? 1 : 0;
+    regfree(&re);
+    return hexa_bool(full);
+}
+
+HexaVal hexa_regex_search(HexaVal pat_v, HexaVal s_v) {
+    if (!HX_IS_STR(pat_v) || !HX_IS_STR(s_v)) return hexa_array_new();
+    const char* pat_raw = HX_STR(pat_v);
+    const char* s = HX_STR(s_v);
+    if (!pat_raw || !s) return hexa_array_new();
+    int icase = 0;
+    const char* pat = _hexa_re_strip_flags(pat_raw, &icase);
+    regex_t re;
+    if (_hexa_re_compile(pat, &re, icase) != 0) return hexa_array_new();
+    regmatch_t m;
+    HexaVal out = hexa_array_new();
+    if (regexec(&re, s, 1, &m, 0) == 0) {
+        hexa_array_push(out, hexa_int((int64_t)m.rm_so));
+        hexa_array_push(out, hexa_int((int64_t)m.rm_eo));
+    }
+    regfree(&re);
+    return out;
+}
+
+HexaVal hexa_regex_findall(HexaVal pat_v, HexaVal s_v) {
+    HexaVal out = hexa_array_new();
+    if (!HX_IS_STR(pat_v) || !HX_IS_STR(s_v)) return out;
+    const char* pat_raw = HX_STR(pat_v);
+    const char* s = HX_STR(s_v);
+    if (!pat_raw || !s) return out;
+    int icase = 0;
+    const char* pat = _hexa_re_strip_flags(pat_raw, &icase);
+    regex_t re;
+    if (_hexa_re_compile(pat, &re, icase) != 0) return out;
+    regmatch_t m;
+    size_t off = 0;
+    size_t L = strlen(s);
+    while (off <= L) {
+        if (regexec(&re, s + off, 1, &m, off > 0 ? REG_NOTBOL : 0) != 0) break;
+        if (m.rm_eo == m.rm_so) {
+            // zero-width match — advance one to avoid infinite loop
+            off += 1;
+            continue;
+        }
+        HexaVal pair = hexa_array_new();
+        hexa_array_push(pair, hexa_int((int64_t)(off + m.rm_so)));
+        hexa_array_push(pair, hexa_int((int64_t)(off + m.rm_eo)));
+        hexa_array_push(out, pair);
+        off += m.rm_eo;
+    }
+    regfree(&re);
+    return out;
+}
+
+HexaVal hexa_regex_split(HexaVal pat_v, HexaVal s_v) {
+    HexaVal out = hexa_array_new();
+    if (!HX_IS_STR(pat_v) || !HX_IS_STR(s_v)) return out;
+    const char* pat_raw = HX_STR(pat_v);
+    const char* s = HX_STR(s_v);
+    if (!pat_raw || !s) return out;
+    int icase = 0;
+    const char* pat = _hexa_re_strip_flags(pat_raw, &icase);
+    regex_t re;
+    if (_hexa_re_compile(pat, &re, icase) != 0) {
+        hexa_array_push(out, hexa_str(s));
+        return out;
+    }
+    regmatch_t m;
+    size_t off = 0;
+    size_t L = strlen(s);
+    while (off <= L) {
+        if (regexec(&re, s + off, 1, &m, off > 0 ? REG_NOTBOL : 0) != 0) break;
+        if (m.rm_eo == m.rm_so) { off += 1; continue; }
+        size_t seg_len = (size_t)m.rm_so;
+        char* seg = (char*)malloc(seg_len + 1);
+        if (!seg) break;
+        memcpy(seg, s + off, seg_len);
+        seg[seg_len] = '\0';
+        hexa_array_push(out, hexa_str(seg));
+        free(seg);
+        off += m.rm_eo;
+    }
+    // Final segment after last match.
+    if (off <= L) {
+        hexa_array_push(out, hexa_str(s + off));
+    }
+    regfree(&re);
+    return out;
+}
+
+HexaVal hexa_regex_replace(HexaVal pat_v, HexaVal s_v, HexaVal repl_v) {
+    if (!HX_IS_STR(pat_v) || !HX_IS_STR(s_v) || !HX_IS_STR(repl_v)) return s_v;
+    const char* pat_raw = HX_STR(pat_v);
+    const char* s = HX_STR(s_v);
+    const char* repl = HX_STR(repl_v);
+    if (!pat_raw || !s) return s_v;
+    if (!repl) repl = "";
+    int icase = 0;
+    const char* pat = _hexa_re_strip_flags(pat_raw, &icase);
+    regex_t re;
+    if (_hexa_re_compile(pat, &re, icase) != 0) return s_v;
+    regmatch_t m;
+    size_t off = 0;
+    size_t L = strlen(s);
+    size_t Rlen = strlen(repl);
+    // Worst-case sizing: every position is a zero-width match → impossible
+    // with our zero-width skip. Estimate cap = 4 * (L + 1) * (Rlen + 1).
+    size_t cap = (L + 1) * (Rlen + 1) * 4 + 64;
+    char* out_buf = (char*)malloc(cap);
+    if (!out_buf) { regfree(&re); return s_v; }
+    size_t op = 0;
+    while (off <= L) {
+        if (regexec(&re, s + off, 1, &m, off > 0 ? REG_NOTBOL : 0) != 0) break;
+        if (m.rm_eo == m.rm_so) {
+            // Copy one char and advance.
+            if (op + 1 >= cap) break;
+            out_buf[op++] = s[off];
+            off += 1;
+            continue;
+        }
+        // Copy unmatched prefix.
+        size_t pre = (size_t)m.rm_so;
+        if (op + pre + Rlen + 1 >= cap) {
+            cap *= 2;
+            char* nb = (char*)realloc(out_buf, cap);
+            if (!nb) break;
+            out_buf = nb;
+        }
+        memcpy(out_buf + op, s + off, pre);
+        op += pre;
+        memcpy(out_buf + op, repl, Rlen);
+        op += Rlen;
+        off += m.rm_eo;
+    }
+    // Tail.
+    size_t tail = L - off;
+    if (op + tail + 1 >= cap) {
+        cap = op + tail + 1;
+        char* nb = (char*)realloc(out_buf, cap);
+        if (nb) out_buf = nb;
+    }
+    memcpy(out_buf + op, s + off, tail);
+    op += tail;
+    out_buf[op] = '\0';
+    HexaVal result = hexa_str(out_buf);
+    free(out_buf);
+    regfree(&re);
+    return result;
 }
 
 // utc_compact_now(): compact "YYYYMMDDHHMMSS" UTC (checkpoint filename).
