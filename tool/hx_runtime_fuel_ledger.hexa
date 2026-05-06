@@ -1,0 +1,421 @@
+// tool/hx_runtime_fuel_ledger.hexa — runtime fuel-abort ledger (atlas/anima pipeline)
+// hxa-2026-05-06 fuel_abort_telemetry  (PR: fuel-emit-pipeline)
+//
+// SPEC: paired with self/runtime.c::_hx_emit_fuel_abort (native emitter).
+//       Same JSONL append-only model as tool/hx_meta_telemetry.hexa
+//       (schema "hexa-lang/runtime_fuel_abort/1").
+//
+// LEDGER PATH
+//   $HEXA_LANG/state/hx_runtime_fuel_abort.jsonl   (default)
+//   override via env HEXA_FUEL_LEDGER=<path>       (tests / dry-run)
+//
+// EVENT SHAPE  (single-line JSON, NDJSON)
+//   {
+//     "schema": "hexa-lang/runtime_fuel_abort/1",
+//     "ts": "2026-05-06T12:34:56Z",
+//     "event": "hexa.runtime.fuel_abort",
+//     "kind":  "mem"|"cpu"|"wall"|"oom",
+//     "exit_code": 77,
+//     "binary": "/path/to/binary",
+//     "args":   ["--foo", "x"],
+//     "fuel_count": -1,                  // -1 = n/a (mem cap)
+//     "rss_mb": 812,
+//     "cap_mb": 768,
+//     "top_frame": "fn parse_expr@parser.hexa:1234",
+//     "rusage": {"utime_us":..., "stime_us":..., "maxrss_kb":...}
+//   }
+//
+// CLI
+//   hexa tool/hx_runtime_fuel_ledger.hexa --selftest
+//       → emits one synthetic mem-kind event to a tmp ledger and verifies
+//   hexa tool/hx_runtime_fuel_ledger.hexa emit --kind <k> [--exit N]
+//                                              [--fuel-count N]
+//                                              [--rss-mb N] [--cap-mb N]
+//                                              [--top-frame <s>]
+//                                              [--binary <path>]
+//                                              [--args <csv>]
+//   hexa tool/hx_runtime_fuel_ledger.hexa summary [--out <path>]
+//       → groups by binary; emits avg fuel consumption + abort counts
+//   hexa tool/hx_runtime_fuel_ledger.hexa dispatcher-stats
+//       → just per-binary average (for hx_meta dispatcher consumption)
+//
+// PIPELINE INTEGRATION
+//   - native side (self/runtime.c::_hx_mem_cap_fire) writes the event
+//     directly via fopen("a") on its own ledger path before exit(77).
+//   - this tool's `emit` subcommand is the FFI fallback / interpreter hook
+//     for fuel paths that aren't yet wired through native code.
+//   - `summary` rolls events up into a per-binary stats JSON for dispatcher
+//     consumption (avg_rss_mb, abort_count, last_kind, last_ts).
+//
+// TODO(fuel-worker):
+//   - call this from interpreter fuel abort site (kind=cpu/wall) once the
+//     fuel worker lands its main implementation.
+//   - add ringbuffer rotation: ledger ≥ 50 MB → rename to .1 + truncate.
+//   - emit anomaly markers when avg_rss_mb shifts > 30% week-over-week.
+
+fn _home() -> string {
+    let h = env("HOME")
+    if len(h) > 0 { return h }
+    return to_string(exec("echo $HOME")).trim()
+}
+
+fn _root() -> string {
+    let r = env("HEXA_LANG")
+    if len(r) > 0 { return r }
+    return _home() + "/core/hexa-lang"
+}
+
+fn _default_ledger_path() -> string {
+    let override_p = env("HEXA_FUEL_LEDGER")
+    if len(override_p) > 0 { return override_p }
+    return _root() + "/state/hx_runtime_fuel_abort.jsonl"
+}
+
+fn _iso_now() -> string {
+    return to_string(exec("date -u +'%Y-%m-%dT%H:%M:%SZ'")).trim()
+}
+
+fn _arg_value(args: array, key: string, default_v: string) -> string {
+    let mut i = 0
+    while i < len(args) {
+        if args[i] == key {
+            let j = i + 1
+            if j < len(args) { return args[j] }
+        }
+        i = i + 1
+    }
+    return default_v
+}
+
+fn _json_esc(s: string) -> string {
+    let mut r = s.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", "\\n")
+    r = r.replace("\r", "")
+    r = r.replace("\t", " ")
+    return r
+}
+
+fn _sh_q(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _atoi(s: string) -> int {
+    if s == "" { return 0 }
+    return s.parse_int()
+}
+
+fn _split_lines(s: string) -> array {
+    let mut out = []
+    let mut cur = ""
+    let mut i = 0
+    while i < len(s) {
+        let c = s.substring(i, i + 1)
+        if c == "\n" {
+            if len(cur) > 0 { out.push(cur) }
+            cur = ""
+        } else {
+            cur = cur + c
+        }
+        i = i + 1
+    }
+    if len(cur) > 0 { out.push(cur) }
+    return out
+}
+
+fn _split_csv(s: string) -> array {
+    let mut out = []
+    let mut cur = ""
+    let mut i = 0
+    while i < len(s) {
+        let c = s.substring(i, i + 1)
+        if c == "," {
+            out.push(cur); cur = ""
+        } else {
+            cur = cur + c
+        }
+        i = i + 1
+    }
+    out.push(cur)
+    return out
+}
+
+fn _index_of_str(arr: array, s: string) -> int {
+    let mut i = 0
+    while i < len(arr) {
+        if arr[i] == s { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// Field-extract from a single JSONL line. Returns "" if not found.
+// Crude — same convention as tool/hx_meta_telemetry.hexa.
+fn _field_str(ln: string, key: string) -> string {
+    let tag = "\"" + key + "\":\""
+    let pos = ln.index_of(tag)
+    if pos < 0 { return "" }
+    let after = ln.substring(pos + len(tag), len(ln))
+    let q = after.index_of("\"")
+    if q < 0 { return "" }
+    return after.substring(0, q)
+}
+
+fn _field_int(ln: string, key: string) -> int {
+    let tag = "\"" + key + "\":"
+    let pos = ln.index_of(tag)
+    if pos < 0 { return 0 }
+    let after = ln.substring(pos + len(tag), len(ln))
+    let comma = after.index_of(",")
+    let brace = after.index_of("}")
+    let end = if comma >= 0 && (brace < 0 || comma < brace) { comma } else { brace }
+    if end < 0 { return 0 }
+    return _atoi(after.substring(0, end))
+}
+
+fn _emit_event(path: string,
+               kind: string,
+               exit_code: int,
+               fuel_count: int,
+               rss_mb: int,
+               cap_mb: int,
+               top_frame: string,
+               binary: string,
+               args_arr: array) -> int {
+    let ts = _iso_now()
+    let mut args_json = "["
+    let mut k = 0
+    while k < len(args_arr) {
+        if k > 0 { args_json = args_json + "," }
+        args_json = args_json + "\"" + _json_esc(args_arr[k]) + "\""
+        k = k + 1
+    }
+    args_json = args_json + "]"
+
+    let line = "{\"schema\":\"hexa-lang/runtime_fuel_abort/1\""
+             + ",\"ts\":\"" + ts + "\""
+             + ",\"event\":\"hexa.runtime.fuel_abort\""
+             + ",\"kind\":\"" + _json_esc(kind) + "\""
+             + ",\"exit_code\":" + to_string(exit_code)
+             + ",\"binary\":\"" + _json_esc(binary) + "\""
+             + ",\"args\":" + args_json
+             + ",\"fuel_count\":" + to_string(fuel_count)
+             + ",\"rss_mb\":" + to_string(rss_mb)
+             + ",\"cap_mb\":" + to_string(cap_mb)
+             + ",\"top_frame\":\"" + _json_esc(top_frame) + "\""
+             + ",\"rusage\":{\"utime_us\":0,\"stime_us\":0,\"maxrss_kb\":0}"
+             + "}"
+
+    // Ensure parent dir; ignore failure (best-effort).
+    let last_slash = path.rfind("/")
+    if last_slash > 0 {
+        let dir = path.substring(0, last_slash)
+        let _ = exec("mkdir -p " + _sh_q(dir))
+    }
+    try {
+        append_file(path, line + "\n")
+    } catch e {
+        eprintln("hx_runtime_fuel_ledger: append FAIL " + path)
+        return 1
+    }
+    return 0
+}
+
+fn _cmd_emit(args: array) -> int {
+    let kind = _arg_value(args, "--kind", "mem")
+    let exit_code = _atoi(_arg_value(args, "--exit", "77"))
+    let fuel_count = _atoi(_arg_value(args, "--fuel-count", "-1"))
+    let rss_mb = _atoi(_arg_value(args, "--rss-mb", "0"))
+    let cap_mb = _atoi(_arg_value(args, "--cap-mb", "0"))
+    let top_frame = _arg_value(args, "--top-frame", "")
+    let binary = _arg_value(args, "--binary", "")
+    let args_csv = _arg_value(args, "--args", "")
+    let mut args_arr = []
+    if len(args_csv) > 0 { args_arr = _split_csv(args_csv) }
+    let path = _arg_value(args, "--out", _default_ledger_path())
+
+    let rc = _emit_event(path, kind, exit_code, fuel_count, rss_mb, cap_mb,
+                         top_frame, binary, args_arr)
+    if rc == 0 {
+        println("hx_runtime_fuel_ledger: emitted kind=" + kind + " exit=" + to_string(exit_code) + " → " + path)
+    }
+    return rc
+}
+
+// Per-binary rollup: avg rss, abort count, last kind, last ts. Input = ledger path.
+fn _cmd_summary(args: array) -> int {
+    let path = _arg_value(args, "--in", _default_ledger_path())
+    let default_out = _root() + "/state/hx_runtime_fuel_abort_summary.json"
+    let out_path = _arg_value(args, "--out", default_out)
+    let ts = _iso_now()
+
+    let raw = to_string(exec("cat " + _sh_q(path) + " 2>/dev/null"))
+    let lines = _split_lines(raw)
+
+    let mut bins = []
+    let mut counts = []
+    let mut rss_sum = []
+    let mut last_kind = []
+    let mut last_ts = []
+
+    for ln in lines {
+        let binary = _field_str(ln, "binary")
+        if len(binary) == 0 { continue }
+        let kind = _field_str(ln, "kind")
+        let this_ts = _field_str(ln, "ts")
+        let rss = _field_int(ln, "rss_mb")
+
+        let idx = _index_of_str(bins, binary)
+        if idx < 0 {
+            bins.push(binary)
+            counts.push(1)
+            rss_sum.push(rss)
+            last_kind.push(kind)
+            last_ts.push(this_ts)
+        } else {
+            counts[idx] = counts[idx] + 1
+            rss_sum[idx] = rss_sum[idx] + rss
+            if this_ts > last_ts[idx] {
+                last_ts[idx] = this_ts
+                last_kind[idx] = kind
+            }
+        }
+    }
+
+    let mut body = "{\n  \"schema\": \"hexa-lang/runtime_fuel_abort_summary/1\",\n"
+    body = body + "  \"ts\": \"" + ts + "\",\n"
+    body = body + "  \"event_count\": " + to_string(len(lines)) + ",\n"
+    body = body + "  \"binaries\": [\n"
+    let mut first = true
+    let mut j = 0
+    while j < len(bins) {
+        let n = counts[j]
+        let avg = if n > 0 { rss_sum[j] / n } else { 0 }
+        let entry = "{\"binary\":\"" + _json_esc(bins[j])
+            + "\",\"abort_count\":" + to_string(n)
+            + ",\"avg_rss_mb\":" + to_string(avg)
+            + ",\"last_kind\":\"" + _json_esc(last_kind[j])
+            + "\",\"last_ts\":\"" + _json_esc(last_ts[j]) + "\"}"
+        if !first { body = body + ",\n" }
+        body = body + "    " + entry
+        first = false
+        j = j + 1
+    }
+    body = body + "\n  ],\n"
+    body = body + "  \"summary\": {\"distinct_binaries\": " + to_string(len(bins))
+    body = body + ", \"total_aborts\": " + to_string(len(lines)) + "}\n}\n"
+
+    try { write_file(out_path, body) } catch e {
+        eprintln("hx_runtime_fuel_ledger: write FAIL " + out_path)
+        return 1
+    }
+    println("hx_runtime_fuel_ledger: " + to_string(len(lines)) + " events, "
+          + to_string(len(bins)) + " distinct binaries → " + out_path)
+    return 0
+}
+
+// dispatcher-stats: minimal per-binary avg view (machine-consumed)
+fn _cmd_dispatcher_stats(args: array) -> int {
+    let path = _arg_value(args, "--in", _default_ledger_path())
+    let raw = to_string(exec("cat " + _sh_q(path) + " 2>/dev/null"))
+    let lines = _split_lines(raw)
+
+    let mut bins = []
+    let mut counts = []
+    let mut rss_sum = []
+    for ln in lines {
+        let binary = _field_str(ln, "binary")
+        if len(binary) == 0 { continue }
+        let rss = _field_int(ln, "rss_mb")
+        let idx = _index_of_str(bins, binary)
+        if idx < 0 {
+            bins.push(binary)
+            counts.push(1)
+            rss_sum.push(rss)
+        } else {
+            counts[idx] = counts[idx] + 1
+            rss_sum[idx] = rss_sum[idx] + rss
+        }
+    }
+    let mut j = 0
+    while j < len(bins) {
+        let n = counts[j]
+        let avg = if n > 0 { rss_sum[j] / n } else { 0 }
+        // tab-separated for pipe-friendly consumption
+        println(bins[j] + "\t" + to_string(n) + "\t" + to_string(avg))
+        j = j + 1
+    }
+    return 0
+}
+
+fn _cmd_selftest() -> int {
+    println("[hx_runtime_fuel_ledger selftest]")
+
+    // Use a tmp ledger so we never pollute the real state file.
+    let tmp = "/tmp/hx_runtime_fuel_ledger_selftest_" + to_string(exec("date +%s%N")).trim() + ".jsonl"
+    let _ = exec("rm -f " + _sh_q(tmp))
+
+    // 1) field extractors
+    let line = "{\"schema\":\"hexa-lang/runtime_fuel_abort/1\",\"binary\":\"/tmp/x\",\"kind\":\"mem\",\"rss_mb\":812,\"cap_mb\":768}"
+    if _field_str(line, "binary") != "/tmp/x" { eprintln("FAIL: _field_str binary"); return 1 }
+    if _field_str(line, "kind") != "mem" { eprintln("FAIL: _field_str kind"); return 1 }
+    if _field_int(line, "rss_mb") != 812 { eprintln("FAIL: _field_int rss_mb"); return 1 }
+    if _field_int(line, "cap_mb") != 768 { eprintln("FAIL: _field_int cap_mb"); return 1 }
+
+    // 2) emit synthetic event
+    let mut ax = []
+    ax.push("--probe"); ax.push("v1")
+    let rc = _emit_event(tmp, "mem", 77, -1, 812, 768,
+                         "fn parse_expr@parser.hexa:1234",
+                         "/path/to/hexa.real",
+                         ax)
+    if rc != 0 { eprintln("FAIL: emit rc=" + to_string(rc)); return 1 }
+
+    // 3) read it back & verify
+    let raw = to_string(exec("cat " + _sh_q(tmp) + " 2>/dev/null"))
+    let lines = _split_lines(raw)
+    if len(lines) != 1 { eprintln("FAIL: expected 1 line, got " + to_string(len(lines))); return 1 }
+    let ln0 = lines[0]
+    if _field_str(ln0, "kind") != "mem" { eprintln("FAIL: roundtrip kind"); return 1 }
+    if _field_str(ln0, "event") != "hexa.runtime.fuel_abort" { eprintln("FAIL: roundtrip event"); return 1 }
+    if _field_str(ln0, "binary") != "/path/to/hexa.real" { eprintln("FAIL: roundtrip binary"); return 1 }
+    if _field_int(ln0, "rss_mb") != 812 { eprintln("FAIL: roundtrip rss_mb"); return 1 }
+    if _field_int(ln0, "exit_code") != 77 { eprintln("FAIL: roundtrip exit_code"); return 1 }
+
+    // 4) cleanup
+    let _ = exec("rm -f " + _sh_q(tmp))
+
+    println("[hx_runtime_fuel_ledger selftest] OK")
+    return 0
+}
+
+fn main() {
+    let av = argv()
+    let mut args = []
+    let mut i = 2
+    while i < len(av) { args.push(av[i]); i = i + 1 }
+
+    if len(args) >= 1 && (args[0] == "--selftest" || args[0] == "selftest") {
+        exit(_cmd_selftest())
+    }
+    if len(args) >= 1 && args[0] == "emit" {
+        let mut rest = []
+        let mut k = 1
+        while k < len(args) { rest.push(args[k]); k = k + 1 }
+        exit(_cmd_emit(rest))
+    }
+    if len(args) >= 1 && args[0] == "summary" {
+        let mut rest = []
+        let mut k = 1
+        while k < len(args) { rest.push(args[k]); k = k + 1 }
+        exit(_cmd_summary(rest))
+    }
+    if len(args) >= 1 && (args[0] == "dispatcher-stats" || args[0] == "stats") {
+        let mut rest = []
+        let mut k = 1
+        while k < len(args) { rest.push(args[k]); k = k + 1 }
+        exit(_cmd_dispatcher_stats(rest))
+    }
+    eprintln("usage: hx_runtime_fuel_ledger <emit|summary|dispatcher-stats|--selftest> [...]")
+    exit(2)
+}
