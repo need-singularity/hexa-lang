@@ -1263,12 +1263,30 @@ const char* hexa_to_cstring(HexaVal v) {
         if (HX_VSF(v, tag_i) == TAG_STR && HX_STR(HX_VSF(v, str_val))) return HX_STR(HX_VSF(v, str_val));
         static char vbuf[64];
         if (HX_VSF(v, tag_i) == TAG_INT)   { snprintf(vbuf, 64, "%lld", (long long)HX_VSF(v, int_val)); return vbuf; }
-        if (HX_VSF(v, tag_i) == TAG_FLOAT) { snprintf(vbuf, 64, "%g", HX_VSF(v, float_val)); return vbuf; }
+        if (HX_VSF(v, tag_i) == TAG_FLOAT) {
+            // trk.27 fix 2026-05-06: preserve `.0` for whole-valued floats (Val struct fast path).
+            double f = HX_VSF(v, float_val);
+            if (isfinite(f) && f == floor(f) && f >= -1e15 && f <= 1e15) {
+                snprintf(vbuf, 64, "%.1f", f);
+            } else {
+                snprintf(vbuf, 64, "%g", f);
+            }
+            return vbuf;
+        }
         if (HX_VSF(v, tag_i) == TAG_BOOL)  return HX_VSF(v, bool_val) ? "true" : "false";
     }
     static char buf[64];
     if (HX_IS_INT(v))   { snprintf(buf, 64, "%lld", (long long)HX_INT(v)); return buf; }
-    if (HX_IS_FLOAT(v)) { snprintf(buf, 64, "%g", HX_FLOAT(v)); return buf; }
+    if (HX_IS_FLOAT(v)) {
+        // trk.27 fix 2026-05-06: preserve `.0` for whole-valued floats (HexaVal fast path).
+        double f = HX_FLOAT(v);
+        if (isfinite(f) && f == floor(f) && f >= -1e15 && f <= 1e15) {
+            snprintf(buf, 64, "%.1f", f);
+        } else {
+            snprintf(buf, 64, "%g", f);
+        }
+        return buf;
+    }
     if (HX_IS_BOOL(v))  return HX_BOOL(v) ? "true" : "false";
     // 2026-04-20 silent-fallback audit: prior code returned the literal
     // "<value>" for TAG_ARRAY / TAG_MAP / TAG_FN / TAG_CHAR / TAG_CLOSURE.
@@ -4430,7 +4448,21 @@ static HexaVal _hexa_to_string_rec(HexaVal v, int depth) {
             snprintf(buf, 64, "%lld", (long long)HX_INT(v));
             return hexa_str(buf);
         }
-        case TAG_FLOAT: snprintf(buf, 64, "%g", HX_FLOAT(v)); return hexa_str(buf);
+        case TAG_FLOAT: {
+            // trk.27 fix 2026-05-06: preserve `.0` for whole-valued floats so
+            // to_string(0.0) returns "0.0" not "0", matching python json.dumps
+            // and existing test assertions (test_lang_core.hexa:141 +
+            // test_type_coercion.hexa:35 — to_string(3.0) == "3.0"). Plain %g
+            // strips trailing zeros — use %.1f when float is integer-valued +
+            // finite + within int-representable range; %g otherwise.
+            double f = HX_FLOAT(v);
+            if (isfinite(f) && f == floor(f) && f >= -1e15 && f <= 1e15) {
+                snprintf(buf, 64, "%.1f", f);
+            } else {
+                snprintf(buf, 64, "%g", f);
+            }
+            return hexa_str(buf);
+        }
         case TAG_BOOL: return HX_BOOL(v) ? _cached_str_true : _cached_str_false;
         case TAG_STR: return v;
         case TAG_VOID: return _cached_str_void;
