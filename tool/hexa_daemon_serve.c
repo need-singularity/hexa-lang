@@ -109,6 +109,7 @@ static size_t       g_cache_cap   = HEXA_DAEMON_DEFAULT_CACHE_ENTRIES;
 static uint64_t     g_total_hits   = 0;
 static uint64_t     g_total_misses = 0;
 static uint64_t     g_total_reqs   = 0;
+static time_t       g_start_time   = 0;
 
 /* ── log ───────────────────────────────────────────────────────────────── */
 
@@ -246,10 +247,16 @@ static int parse_request(char* req, char** out_cwd, char** out_argv, int max_arg
 
 static void emit_stats(int fd) {
     char buf[1024];
+    time_t now = time(NULL);
+    long long uptime = (long long)(g_start_time > 0 ? (now - g_start_time) : 0);
+    if (uptime < 0) uptime = 0;
     int n = snprintf(buf, sizeof(buf),
         "{\"schema\":\"hexa-lang/daemon_stats/1\","
-        "\"cached\":%zu,\"cap\":%zu,\"hits\":%llu,\"misses\":%llu,\"requests\":%llu}\n"
+        "\"pid\":%ld,\"uptime_sec\":%lld,"
+        "\"cached\":%zu,\"cap\":%zu,"
+        "\"hits\":%llu,\"misses\":%llu,\"requests\":%llu}\n"
         "__HEXA_DAEMON_RC__=0\n",
+        (long)getpid(), uptime,
         g_cache_count, g_cache_cap,
         (unsigned long long)g_total_hits,
         (unsigned long long)g_total_misses,
@@ -515,6 +522,9 @@ int main(int argc, char** argv) {
     sigaction(SIGINT, &sa, NULL);
     /* SIGPIPE is silently ignored — client may close mid-write. */
     signal(SIGPIPE, SIG_IGN);
+
+    /* ── start time (for stats uptime) ── */
+    g_start_time = time(NULL);
 
     /* ── listen ── */
     int rc = listen_on(g_sock_path);
