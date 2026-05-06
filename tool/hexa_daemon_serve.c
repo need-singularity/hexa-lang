@@ -283,6 +283,11 @@ static int run_hexa_real(const char* cwd, char** child_argv, int child_argc, int
     int pipefd[2];
     if (pipe(pipefd) != 0) return -errno;
 
+    /* 2026-05-06 — POSIX fork buffer flush. Daemon serves per-request
+     * fork+exec of hexa.real; without this, any output the daemon parent
+     * buffered in stdio (logs, stats) can be re-emitted by the child
+     * before exec swaps stdio. */
+    fflush(NULL);
     pid_t pid = fork();
     if (pid < 0) {
         int e = errno;

@@ -18,6 +18,7 @@
 #include <spawn.h>      // TL;DR #2: posix_spawnp shell-free fast path
 #include <errno.h>      // EINTR for waitpid retry loop in spawn reap
 #include <fcntl.h>      // TL;DR #4: F_SETPIPE_SZ on Linux for pipe enlarge
+#include <signal.h>     // 2026-05-06: SIGPIPE SIG_IGN install in stdio init
 extern char **environ; // posix_spawnp inherits parent env explicitly
 #if defined(__APPLE__)
 #include <execinfo.h>
@@ -109,11 +110,21 @@ static inline void hexa_pipe_buf_enlarge_full(FILE* fp) {
     (void)setvbuf(fp, NULL, _IOFBF, 256 * 1024);
 }
 
-// Force line-buffered stdout when redirected to file/pipe.
+// 2026-05-06 audit closure:
+//   - stdout: _IOLBF (line-buffered) — flushes on newline when redirected to
+//     file/pipe so subprocess prompts and progress aren't held mid-line.
+//   - stderr: _IONBF (unbuffered) — POSIX default for stderr is unbuffered
+//     so diagnostics appear immediately even on partial-line writes (e.g.
+//     "loading…" without newline). Earlier _IOLBF setting was over-buffered.
+//   - SIGPIPE: SIG_IGN — when a child closes its stdin while the parent is
+//     mid-write (interactive prompts, build pipelines), the default SIGPIPE
+//     would kill the runtime. Ignoring it lets write() return EPIPE and the
+//     caller decide how to handle the broken-pipe case.
 __attribute__((constructor))
 static void _hexa_init_stdio(void) {
     setvbuf(stdout, NULL, _IOLBF, 0);
-    setvbuf(stderr, NULL, _IOLBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+    signal(SIGPIPE, SIG_IGN);
 }
 
 // ═══════════════════════════════════════════════════════════
