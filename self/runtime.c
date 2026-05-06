@@ -136,17 +136,20 @@ static inline void hexa_pipe_buf_enlarge_full(FILE* fp) {
 // vs one per BUFSIZ in fully-buffered. Measured ~5% on tight println
 // loops (1000 iterations). Trade is correctness on interactive prompts;
 // users who need raw throughput set HEXA_STDIO_DEFAULT=1.
-__attribute__((constructor(101)))  // priority 101 = early, before other constructors
+__attribute__((constructor))
 static void _hexa_init_stdio_buffer(void) {
     const char* opt = getenv("HEXA_STDIO_DEFAULT");
     if (opt && opt[0] == '1' && opt[1] == '\0') return;
-    // 2026-05-06 — _IOLBF (line-buffered)는 일부 환경에서 \n 후 flush 안 되는
-    // 사례 발견 (사용자가 enter 한 번 쳐야 출력). _IONBF (fully unbuffered)
-    // 강제 — 매 output 즉시 flush. trade: 5-10% throughput, gain: interactive
-    // dead time 0 보장.
-    // BSD `setlinebuf(stdout)` 대신 `setvbuf(_IONBF)` 선택 — 더 강력.
-    setvbuf(stdout, NULL, _IONBF, 0);
+    // 2026-05-06 revert: _IONBF가 사용자 환경에서 process stuck 야기 (priority 101
+    // constructor 또는 main entry double-call이 stream 깨짐 가능성). _IOLBF로
+    // 복귀 + setlinebuf 추가 (BSD-friendly).
+    setvbuf(stdout, NULL, _IOLBF, BUFSIZ);
     setvbuf(stderr, NULL, _IONBF, 0);
+#ifdef __APPLE__
+    // macOS BSD: setlinebuf is alias for setvbuf(_, NULL, _IOLBF, 0). Belt-and-
+    // suspenders for libc impls that ignore explicit BUFSIZ.
+    setlinebuf(stdout);
+#endif
 }
 
 // ═══════════════════════════════════════════════════════════
