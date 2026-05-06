@@ -1,0 +1,326 @@
+// tool/total_fn_lint.hexa — RFC-010 (e) total-fn / partial-fn lint (Stage 0).
+//
+// Detects recursive functions that lack a termination witness — no
+// `decreases <expr>` comment marker, no `@total` / `@partial` attribute.
+// Heuristic-only (Stage 0 warn-mode) — full checker integration with
+// SCC + measure-decreases lives in self/checker (deferred, RFC-010-A2).
+//
+// Detected violations:
+//   T1 unannotated_recursion — fn body contains direct self-call AND
+//                              no `// decreases` / `@total` / `@partial`.
+//
+// Convention (Stage 0 → Stage 3 path):
+//   - `@total fn f()` / `// decreases <expr>` → asserted-total, lint clean.
+//   - `@partial fn f()` / `partial fn f()` → opt-out, lint clean
+//                                            (acknowledged non-termination).
+//   - Direct recursion without either → T1 warn.
+//
+// Usage:
+//   hexa run tool/total_fn_lint.hexa --selftest
+//   hexa run tool/total_fn_lint.hexa --mode=warn  <file.hexa>...
+//   hexa run tool/total_fn_lint.hexa --mode=error <file.hexa>...
+//
+// Exit codes: 0 clean / mode=warn ; 1 mode=error with violations ; 2 invalid argv.
+
+fn _tf_is_digit(c) {
+    let k = char_code(c, 0)
+    return k >= 48 && k <= 57
+}
+
+fn _tf_is_alpha(c) {
+    let k = char_code(c, 0)
+    return (k >= 97 && k <= 122) || (k >= 65 && k <= 90) || (k == 95)
+}
+
+fn _tf_is_alnum(c) {
+    return _tf_is_digit(c) || _tf_is_alpha(c)
+}
+
+fn _tf_is_ws(c) {
+    return c == " " || c == "\t" || c == "\r"
+}
+
+// strip_block_comments — preserve line counts; blank string literals so
+// `// decreases` / `@total` inside string literals don't confuse detection.
+fn _tf_strip(src) {
+    let n = len(src)
+    let mut i = 0
+    let mut parts = []
+    while i < n {
+        let c = src[i]
+        if c == "/" && i + 1 < n && src[i + 1] == "*" {
+            parts.push("  "); i = i + 2
+            while i + 1 < n && !(src[i] == "*" && src[i + 1] == "/") {
+                if src[i] == "\n" { parts.push("\n") } else { parts.push(" ") }
+                i = i + 1
+            }
+            if i + 1 < n { parts.push("  "); i = i + 2 }
+        } else if c == "\"" {
+            parts.push(c); i = i + 1
+            while i < n && src[i] != "\"" {
+                if src[i] == "\\" && i + 1 < n {
+                    parts.push(" "); i = i + 1
+                    if src[i] == "\n" { parts.push("\n") } else { parts.push(" ") }
+                    i = i + 1
+                } else {
+                    if src[i] == "\n" { parts.push("\n") } else { parts.push(" ") }
+                    i = i + 1
+                }
+            }
+            if i < n { parts.push(src[i]); i = i + 1 }
+        } else {
+            parts.push(c); i = i + 1
+        }
+    }
+    return parts.join("")
+}
+
+fn _tf_match_word(src, i, word) {
+    let n = len(src)
+    let wlen = len(word)
+    if i + wlen > n { return 0 }
+    if src.substring(i, i + wlen) != word { return 0 }
+    if i > 0 && _tf_is_alnum(src[i - 1]) { return 0 }
+    if i + wlen < n && _tf_is_alnum(src[i + wlen]) { return 0 }
+    return wlen
+}
+
+fn _tf_find_match_brace(src, bopen) {
+    let n = len(src)
+    if bopen >= n || src[bopen] != "{" { return -1 }
+    let mut i = bopen + 1
+    let mut depth = 1
+    while i < n {
+        let c = src[i]
+        if c == "{" { depth = depth + 1 }
+        else if c == "}" {
+            depth = depth - 1
+            if depth == 0 { return i }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn _tf_line_of(src, idx) {
+    let mut i = 0
+    let mut line = 1
+    while i < idx && i < len(src) {
+        if src[i] == "\n" { line = line + 1 }
+        i = i + 1
+    }
+    return line
+}
+
+// Given the original (un-stripped) source and a line number, scan up to 5
+// lines backward for `// decreases` / `@total` / `@partial` markers OR
+// `partial fn` modifier on the same line as `fn name(`.
+fn _tf_has_witness(orig, line_no) {
+    // Find char index of start of line `line_no`.
+    let n = len(orig)
+    let mut i = 0
+    let mut cur_line = 1
+    while i < n && cur_line < line_no {
+        if orig[i] == "\n" { cur_line = cur_line + 1 }
+        i = i + 1
+    }
+    let line_start = i
+    // Collect this line + previous up to 5 lines.
+    // Walk backward to start-of-block (~5 lines back).
+    let mut back = line_start
+    let mut steps = 0
+    while back > 0 && steps < 6 {
+        back = back - 1
+        if orig[back] == "\n" { steps = steps + 1 }
+    }
+    // Find end of fn line (next \n after line_start).
+    let mut eol = line_start
+    while eol < n && orig[eol] != "\n" { eol = eol + 1 }
+    let region = orig.substring(back, eol)
+    if region.contains("// decreases") { return true }
+    if region.contains("@total") { return true }
+    if region.contains("@partial") { return true }
+    if region.contains("partial fn ") { return true }
+    if region.contains("@manual_total") { return true }
+    return false
+}
+
+// Find direct-recursion fn defs that lack a termination witness.
+fn _tf_find_t1(orig, clean) {
+    let n = len(clean)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let flen = _tf_match_word(clean, i, "fn")
+        if flen > 0 {
+            // Skip `extern fn`.
+            let mut pp = i
+            while pp > 0 && (_tf_is_ws(clean[pp - 1]) || clean[pp - 1] == "\n") { pp = pp - 1 }
+            let pre_extern = pp >= 6 && clean.substring(pp - 6, pp) == "extern"
+            if pre_extern { i = i + flen; continue }
+            let mut j = i + flen
+            while j < n && _tf_is_ws(clean[j]) { j = j + 1 }
+            let name_start = j
+            while j < n && _tf_is_alnum(clean[j]) { j = j + 1 }
+            let name_end = j
+            if name_end == name_start { i = i + flen; continue }
+            let name = clean.substring(name_start, name_end)
+            // Walk to body `{` — bail if we hit another `fn` keyword.
+            let mut paren_depth = 0
+            let mut bail = false
+            while j < n {
+                let c = clean[j]
+                if c == "(" { paren_depth = paren_depth + 1 }
+                else if c == ")" { paren_depth = paren_depth - 1 }
+                else if c == "{" && paren_depth == 0 { break }
+                else if paren_depth == 0 && _tf_match_word(clean, j, "fn") > 0 { bail = true; break }
+                j = j + 1
+            }
+            if bail || j >= n || clean[j] != "{" { i = i + flen; continue }
+            let close = _tf_find_match_brace(clean, j)
+            if close < 0 { i = i + flen; continue }
+            let body = clean.substring(j + 1, close)
+            // Detect a direct call to `name(` inside body.
+            let blen = len(body)
+            let mut p = 0
+            let mut self_call_found = false
+            while p + len(name) < blen {
+                if _tf_match_word(body, p, name) > 0 {
+                    let mut q = p + len(name)
+                    while q < blen && _tf_is_ws(body[q]) { q = q + 1 }
+                    if q < blen && body[q] == "(" {
+                        self_call_found = true
+                        p = blen
+                    } else {
+                        p = p + 1
+                    }
+                } else {
+                    p = p + 1
+                }
+            }
+            if self_call_found {
+                let line_no = _tf_line_of(clean, i)
+                if !_tf_has_witness(orig, line_no) {
+                    out.push([line_no, "T1", "fn " + name + " — direct recursion without termination witness"])
+                }
+            }
+            i = close + 1
+            continue
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn _tf_lint_text(orig) {
+    let clean = _tf_strip(orig)
+    return _tf_find_t1(orig, clean)
+}
+
+fn _tf_lint_file(path, mode) {
+    let src = read_file(path)
+    let v = _tf_lint_text(src)
+    let mut k = 0
+    while k < len(v) {
+        let row = v[k]
+        let label = if mode == "error" { "error" } else { "warn " }
+        println(path + ":" + to_string(row[0]) + ": [" + label + " " + row[1] + " total-fn-lint] " + row[2])
+        k = k + 1
+    }
+    return len(v)
+}
+
+// ── selftest ───────────────────────────────────────────
+fn cmd_tf_selftest() -> i64 {
+    println("[total_fn_lint selftest]")
+
+    // T1 — recursion without witness (should flag).
+    let bad = "fn fact(n) { return n * fact(n - 1) }\n"
+    let v_bad = _tf_lint_text(bad)
+    if len(v_bad) != 1 {
+        println("[total_fn_lint selftest] FAIL T1 bad: expected 1 got " + to_string(len(v_bad)))
+        return 1
+    }
+
+    // good — has // decreases
+    let good_dec = "// decreases n\nfn fact(n) { return n * fact(n - 1) }\n"
+    let v_dec = _tf_lint_text(good_dec)
+    if len(v_dec) != 0 {
+        println("[total_fn_lint selftest] FAIL good_dec: expected 0 got " + to_string(len(v_dec)))
+        return 1
+    }
+
+    // good — @total
+    let good_tot = "@total\nfn fact(n) { return n * fact(n - 1) }\n"
+    let v_tot = _tf_lint_text(good_tot)
+    if len(v_tot) != 0 {
+        println("[total_fn_lint selftest] FAIL good_tot: expected 0 got " + to_string(len(v_tot)))
+        return 1
+    }
+
+    // good — @partial
+    let good_par = "@partial\nfn loop_forever() { return loop_forever() }\n"
+    let v_par = _tf_lint_text(good_par)
+    if len(v_par) != 0 {
+        println("[total_fn_lint selftest] FAIL good_par: expected 0 got " + to_string(len(v_par)))
+        return 1
+    }
+
+    // good — partial fn modifier
+    let good_pmod = "partial fn loop_forever() { return loop_forever() }\n"
+    let v_pmod = _tf_lint_text(good_pmod)
+    if len(v_pmod) != 0 {
+        println("[total_fn_lint selftest] FAIL good_pmod: expected 0 got " + to_string(len(v_pmod)))
+        return 1
+    }
+
+    // non-recursive — should not flag
+    let plain = "fn add(a, b) { return a + b }\n"
+    let v_plain = _tf_lint_text(plain)
+    if len(v_plain) != 0 {
+        println("[total_fn_lint selftest] FAIL plain: expected 0 got " + to_string(len(v_plain)))
+        return 1
+    }
+
+    println("[total_fn_lint selftest] OK")
+    return 0
+}
+
+fn _tf_print_usage() {
+    println("usage: hexa run tool/total_fn_lint.hexa [--mode=warn|error] <file.hexa>...")
+    println("       hexa run tool/total_fn_lint.hexa --selftest")
+}
+
+fn main() {
+    let argv = args()
+    let mut mode = "warn"
+    let mut do_selftest = false
+    let mut files = []
+    let mut i = 0
+    while i < len(argv) {
+        let a = argv[i]
+        if a == "--selftest" || a == "selftest" { do_selftest = true }
+        else if a.substring(0, 7) == "--mode=" { mode = a.substring(7, len(a)) }
+        else if a == "--mode" { i = i + 1; if i < len(argv) { mode = argv[i] } }
+        else if i > 0 && a.substring(0, 2) != "--" && !a.contains("total_fn_lint") {
+            files.push(a)
+        }
+        i = i + 1
+    }
+    if do_selftest { exit(cmd_tf_selftest()) }
+    if len(files) == 0 { _tf_print_usage(); return }
+    let mut total = 0
+    let mut k = 0
+    while k < len(files) {
+        try { total = total + _tf_lint_file(files[k], mode) }
+        catch e { println(files[k] + ": [lint error] " + e) }
+        k = k + 1
+    }
+    if total > 0 {
+        println("")
+        println("total-fn-lint: " + to_string(total) + " violations [mode=" + mode + "]")
+        if mode == "error" { exit(1) }
+    } else {
+        println("total-fn-lint: CLEAN")
+    }
+}
