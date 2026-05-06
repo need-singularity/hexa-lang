@@ -809,6 +809,11 @@ HexaVal hexa_math_round(HexaVal x);
 HexaVal hexa_math_pow(HexaVal b, HexaVal e);
 HexaVal hexa_math_min(HexaVal a, HexaVal b);
 HexaVal hexa_math_max(HexaVal a, HexaVal b);
+// G1-FLOAT-PRIM 2026-05-06: Beta-Binomial Bayesian audit + calibration stability.
+HexaVal hexa_math_lgamma(HexaVal x);
+HexaVal hexa_math_isnan(HexaVal x);
+HexaVal hexa_math_isinf(HexaVal x);
+HexaVal hexa_math_isfinite(HexaVal x);
 // FIX-A (Anima serving unblock): time_ms / byte_len / dict_keys builtin C syms.
 HexaVal hexa_time_ms(void);
 HexaVal hexa_byte_len(HexaVal v);
@@ -7083,6 +7088,14 @@ HexaVal hexa_math_ceil(HexaVal x) { return hexa_float(ceil(_hexa_f(x))); }
 HexaVal hexa_math_round(HexaVal x){ return hexa_float(round(_hexa_f(x))); }
 HexaVal hexa_math_pow(HexaVal b, HexaVal e) { return hexa_float(pow(_hexa_f(b), _hexa_f(e))); }
 HexaVal hexa_math_min(HexaVal a, HexaVal b) { return hexa_float(fmin(_hexa_f(a), _hexa_f(b))); }
+// G1-FLOAT-PRIM 2026-05-06 — see .roadmap.stdlib.G1-FLOAT-PRIM. lgamma is the
+// log-gamma function used by Beta-Binomial conjugate posteriors throughout
+// the hexa-bio Bayesian audit suite (14 callsites in _python_bridge/module).
+// isnan/isinf/isfinite mirror C99 classifiers; emit hexa boolean.
+HexaVal hexa_math_lgamma(HexaVal x)   { return hexa_float(lgamma(_hexa_f(x))); }
+HexaVal hexa_math_isnan(HexaVal x)    { return hexa_bool(isnan(_hexa_f(x)) ? 1 : 0); }
+HexaVal hexa_math_isinf(HexaVal x)    { return hexa_bool(isinf(_hexa_f(x)) ? 1 : 0); }
+HexaVal hexa_math_isfinite(HexaVal x) { return hexa_bool(isfinite(_hexa_f(x)) ? 1 : 0); }
 HexaVal hexa_math_max(HexaVal a, HexaVal b) { return hexa_float(fmax(_hexa_f(a), _hexa_f(b))); }
 
 // ── ML builtins: matvec, dot ─────────────────────────────────
