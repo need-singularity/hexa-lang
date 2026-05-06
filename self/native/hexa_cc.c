@@ -20502,6 +20502,15 @@ int main(int argc, char** argv) {
     HexaVal tokens = tokenize(src);
     HexaVal ast = parse(tokens);
     HexaVal c_code = codegen_c2_full(ast);
+    /* F05 (2026-05-06): free AST + tokens after codegen, before write/exit.
+     * Drops top-level array containers + arena rewind to reduce peak RSS
+     * during rt_write_file fwrite/fclose and any clang sub-process spawned
+     * by callers chained on this binary. Estimate: ~1.05x peak RAM.
+     * Safety: c_code is a fully-materialized HexaStr (independent heap
+     * alloc, see hexa_str_own); AST/tokens are not referenced again. */
+    if (HX_IS_ARRAY(ast)) hexa_array_free(ast);
+    if (HX_IS_ARRAY(tokens)) hexa_array_free(tokens);
+    hexa_arena_reset();
     rt_write_file(hexa_str(argv[2]), c_code);
     printf("OK: %s\n", argv[2]);
     return 0;
