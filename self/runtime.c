@@ -4073,6 +4073,7 @@ HexaVal hexa_exec_with_status(HexaVal cmd) {
             return arr;
         }
     }
+    hexa_pipe_buf_enlarge(fp);  // TL;DR #4: F_SETPIPE_SZ Linux + setvbuf 256K
     // 2026-04-26 cross-repo upstream: same fgets→fread switch as hexa_exec
     // above (see that function's comment for the embedded-NUL truncation
     // root cause and the residual string-ABI caveat).
