@@ -15,12 +15,85 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <spawn.h>      // TL;DR #2: posix_spawnp shell-free fast path
+#include <errno.h>      // EINTR for waitpid retry loop in spawn reap
+#include <fcntl.h>      // TL;DR #4: F_SETPIPE_SZ on Linux for pipe enlarge
+extern char **environ; // posix_spawnp inherits parent env explicitly
 #if defined(__APPLE__)
 #include <execinfo.h>
 #include <mach/mach.h>
 #include <mach/task.h>
 #include <mach/task_info.h>
 #endif
+
+// ═══════════════════════════════════════════════════════════
+//  Branch hints + cold attribute + cacheline prefetch
+//  (A17 / A18 / Z20 — docs/hexa_speedup_brainstorm_2026_05_06.ai.md)
+// ═══════════════════════════════════════════════════════════
+// HX_LIKELY / HX_UNLIKELY: __builtin_expect wrappers for hot-path bias.
+//   Only wrap branches whose taken-direction is dominated (>~80%) by a
+//   single arm in measured workloads — wrong-way hints can hurt by 1-2%.
+// HX_COLD: function attribute that pushes the body into the cold .text
+//   section so it doesn't pollute icache on the common path.
+// HX_PREFETCH: cacheline prefetch hint (no-op on archs without builtin).
+// All three are zero-cost no-ops under non-GCC/Clang compilers.
+#if defined(__GNUC__) || defined(__clang__)
+#  ifndef HX_LIKELY
+#    define HX_LIKELY(x)   __builtin_expect(!!(x), 1)
+#  endif
+#  ifndef HX_UNLIKELY
+#    define HX_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#  endif
+#  ifndef HX_COLD
+#    define HX_COLD __attribute__((cold))
+#  endif
+#  ifndef HX_PREFETCH
+#    define HX_PREFETCH(addr) __builtin_prefetch((const void*)(addr), 0, 1)
+#  endif
+#else
+#  ifndef HX_LIKELY
+#    define HX_LIKELY(x)   (x)
+#  endif
+#  ifndef HX_UNLIKELY
+#    define HX_UNLIKELY(x) (x)
+#  endif
+#  ifndef HX_COLD
+#    define HX_COLD
+#  endif
+#  ifndef HX_PREFETCH
+#    define HX_PREFETCH(addr) ((void)0)
+#  endif
+#endif
+
+// hexa_pipe_buf_enlarge — TL;DR #4 pipe buffer optimization (2026-05-06).
+// Linux: F_SETPIPE_SZ raises kernel pipe capacity to 1 MB (default 64 KB).
+//        Kernel may reject (EPERM if /proc/sys/fs/pipe-max-size exceeded,
+//        EINVAL on old kernels) — silently fall back to default, never fail
+//        the caller.
+// macOS / fallback: F_SETPIPE_SZ unsupported on Darwin (pipe kernel buf is
+//        fixed at 16 KB TYPICAL_PIPE_SIZE → 64 KB BIG_PIPE_SIZE on demand).
+//        Use setvbuf() to enlarge the userland FILE* buffer to 256 KB so
+//        fread/fgets() drain the kernel pipe in fewer syscalls.
+// Both legs apply: on Linux we get kernel-side headroom AND userland buffer;
+// on macOS only the userland buffer (the realistic lever).
+// Must be called immediately after popen() and before any I/O on fp —
+// setvbuf() requires a fresh stream.
+static inline void hexa_pipe_buf_enlarge(FILE* fp) {
+    if (!fp) return;
+#ifdef __linux__
+#ifdef F_SETPIPE_SZ
+    int fd = fileno(fp);
+    if (fd >= 0) {
+        (void)fcntl(fd, F_SETPIPE_SZ, 1 << 20);
+        // Ignore errno (EPERM/EINVAL) — kernel may reject; default size
+        // still works correctly, only throughput differs.
+    }
+#endif
+#endif
+    // Userland FILE* buffer: 256 KB fully-buffered. Applied on all platforms
+    // (Linux benefits too — fewer fread syscalls on the userland side).
+    (void)setvbuf(fp, NULL, _IOFBF, 256 * 1024);
+}
 
 // Force line-buffered stdout when redirected to file/pipe.
 __attribute__((constructor))
@@ -199,6 +272,203 @@ static size_t _hx_self_rss_bytes(void) {
 #endif
 }
 
+// ═══════════════════════════════════════════════════════════
+//  Fuel-abort telemetry emitter — atlas/anima ledger pipeline
+//  hxa-2026-05-06 fuel_abort_telemetry stub (worker fuel-emit-pipeline)
+//
+//  Schema: hexa-lang/runtime_fuel_abort/1
+//  Target: $HEXA_LANG/state/hx_runtime_fuel_abort.jsonl  (append-only JSONL)
+//
+//  Triggered from any abort path (mem-cap; future cpu/wall fuel exhaustion).
+//  Payload: ts, kind ("mem"|"cpu"|"wall"|"oom"), exit_code, binary path,
+//           argv[1..N], rss_mb, cap_mb, fuel_count, top_frame,
+//           rusage (utime_us+stime_us+maxrss_kb).
+//  Best-effort: any failure (state dir missing, fd starvation) is silently
+//  swallowed — never let telemetry break an abort path.
+//
+//  TODO(fuel-worker): when interpreter fuel lands, call _hx_emit_fuel_abort
+//  from interpreter.hexa abort site too (kind="cpu" / "wall"); pass
+//  top_frame string (function name + line) once interp exposes it.
+//  TODO(fuel-worker): switch to atomic O_APPEND + flock for safe parallel
+//  AOT processes hitting the cap simultaneously.
+// ═══════════════════════════════════════════════════════════
+
+// Forward-decl globals (defined ~line 4632) so the emitter can read argv.
+static int _hexa_argc;
+static char** _hexa_argv;
+
+// JSON-escape into caller's buffer; returns bytes written (excl. NUL).
+// Truncates at cap-1 to guarantee NUL term. Bounded so we don't allocate.
+static size_t _hx_fuel_json_esc(char* dst, size_t cap, const char* s) {
+    if (!dst || cap == 0) return 0;
+    size_t out = 0;
+    if (!s) { dst[0] = '\0'; return 0; }
+    for (; *s && out + 2 < cap; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c == '\\' || c == '"') {
+            if (out + 3 >= cap) break;
+            dst[out++] = '\\';
+            dst[out++] = (char)c;
+        } else if (c == '\n') {
+            if (out + 3 >= cap) break;
+            dst[out++] = '\\'; dst[out++] = 'n';
+        } else if (c == '\r') {
+            if (out + 3 >= cap) break;
+            dst[out++] = '\\'; dst[out++] = 'r';
+        } else if (c == '\t') {
+            if (out + 3 >= cap) break;
+            dst[out++] = '\\'; dst[out++] = 't';
+        } else if (c < 0x20) {
+            if (out + 7 >= cap) break;
+            int n = snprintf(dst + out, cap - out, "\\u%04x", c);
+            if (n <= 0) break;
+            out += (size_t)n;
+        } else {
+            dst[out++] = (char)c;
+        }
+    }
+    dst[out] = '\0';
+    return out;
+}
+
+// Public entry. kind ∈ {"mem","cpu","wall","oom"}. Best-effort emit.
+// Non-static so future Hexa-side callers (interp fuel) can FFI it via
+// the existing dlsym pathway; meanwhile internal callers use it directly.
+void _hx_emit_fuel_abort(const char* kind,
+                         int exit_code,
+                         long long fuel_count,
+                         size_t rss_bytes,
+                         size_t cap_bytes,
+                         const char* top_frame) {
+    if (!kind) kind = "unknown";
+    if (!top_frame) top_frame = "";
+
+    // Resolve ledger path. Honor HEXA_FUEL_LEDGER override (tests / dry-run);
+    // fall back to $HEXA_LANG/state/, then $HOME/core/hexa-lang/state/.
+    char path[1024];
+    const char* override_p = getenv("HEXA_FUEL_LEDGER");
+    if (override_p && override_p[0]) {
+        snprintf(path, sizeof(path), "%s", override_p);
+    } else {
+        const char* root = getenv("HEXA_LANG");
+        if (!root || !root[0]) {
+            const char* home = getenv("HOME");
+            if (!home || !home[0]) home = "/tmp";
+            snprintf(path, sizeof(path),
+                     "%s/core/hexa-lang/state/hx_runtime_fuel_abort.jsonl", home);
+        } else {
+            snprintf(path, sizeof(path),
+                     "%s/state/hx_runtime_fuel_abort.jsonl", root);
+        }
+    }
+
+    // ISO-8601 UTC timestamp (no exec; format inline).
+    char ts[32];
+    time_t now = time(NULL);
+    struct tm tmv;
+#if defined(_WIN32)
+    gmtime_s(&tmv, &now);
+#else
+    gmtime_r(&now, &tmv);
+#endif
+    strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", &tmv);
+
+    // RUSAGE snapshot (best-effort; on failure leave zeros).
+    long utime_us = 0, stime_us = 0, maxrss_kb = 0;
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) == 0) {
+        utime_us = (long)ru.ru_utime.tv_sec * 1000000L + (long)ru.ru_utime.tv_usec;
+        stime_us = (long)ru.ru_stime.tv_sec * 1000000L + (long)ru.ru_stime.tv_usec;
+        // ru_maxrss: Linux=KB, macOS=bytes. Normalize to KB.
+        maxrss_kb = (long)ru.ru_maxrss;
+#if defined(__APPLE__)
+        maxrss_kb /= 1024L;
+#endif
+    }
+
+    // Binary path = argv[0]; user args = argv[2..argc-1] (argv[1] is dup of argv[0]).
+    const char* binary = (_hexa_argv && _hexa_argc > 0) ? _hexa_argv[0] : "";
+    if (!binary) binary = "";
+
+    // Build args array string: ["a","b",...]
+    char args_buf[1024];
+    args_buf[0] = '['; args_buf[1] = '\0';
+    size_t apos = 1;
+    int args_start = (_hexa_argc >= 2) ? 2 : _hexa_argc;
+    int wrote = 0;
+    for (int i = args_start; i < _hexa_argc && _hexa_argv && _hexa_argv[i]; i++) {
+        if (apos + 4 >= sizeof(args_buf)) break;
+        if (wrote) { args_buf[apos++] = ','; }
+        args_buf[apos++] = '"';
+        char esc[256];
+        _hx_fuel_json_esc(esc, sizeof(esc), _hexa_argv[i]);
+        size_t elen = strlen(esc);
+        if (apos + elen + 2 >= sizeof(args_buf)) { apos--; break; }
+        memcpy(args_buf + apos, esc, elen); apos += elen;
+        args_buf[apos++] = '"';
+        wrote = 1;
+    }
+    if (apos + 1 < sizeof(args_buf)) args_buf[apos++] = ']';
+    args_buf[apos] = '\0';
+
+    // JSON-escape variable strings.
+    char binary_esc[512];
+    char top_esc[256];
+    char kind_esc[32];
+    _hx_fuel_json_esc(binary_esc, sizeof(binary_esc), binary);
+    _hx_fuel_json_esc(top_esc, sizeof(top_esc), top_frame);
+    _hx_fuel_json_esc(kind_esc, sizeof(kind_esc), kind);
+
+    // Compose the JSONL line.
+    char line[3072];
+    int n = snprintf(line, sizeof(line),
+        "{\"schema\":\"hexa-lang/runtime_fuel_abort/1\""
+        ",\"ts\":\"%s\""
+        ",\"event\":\"hexa.runtime.fuel_abort\""
+        ",\"kind\":\"%s\""
+        ",\"exit_code\":%d"
+        ",\"binary\":\"%s\""
+        ",\"args\":%s"
+        ",\"fuel_count\":%lld"
+        ",\"rss_mb\":%llu"
+        ",\"cap_mb\":%llu"
+        ",\"top_frame\":\"%s\""
+        ",\"rusage\":{\"utime_us\":%ld,\"stime_us\":%ld,\"maxrss_kb\":%ld}"
+        "}\n",
+        ts, kind_esc, exit_code, binary_esc, args_buf,
+        fuel_count,
+        (unsigned long long)(rss_bytes / (1024ull * 1024ull)),
+        (unsigned long long)(cap_bytes / (1024ull * 1024ull)),
+        top_esc,
+        utime_us, stime_us, maxrss_kb);
+    if (n <= 0) return;
+    if ((size_t)n >= sizeof(line)) n = (int)sizeof(line) - 1;
+
+    // Best-effort mkdir of immediate parent dir; silent on failure.
+    {
+        char dir[1024];
+        size_t pl = strlen(path);
+        size_t cut = pl;
+        while (cut > 0 && path[cut - 1] != '/') cut--;
+        if (cut > 0 && cut < sizeof(dir)) {
+            memcpy(dir, path, cut - 1);
+            dir[cut - 1] = '\0';
+            // TODO(fuel-worker): full mkdir -p chain. state/ usually exists.
+            (void)mkdir(dir, 0755);
+        }
+    }
+
+    FILE* f = fopen(path, "a");
+    if (!f) {
+        // Last-resort: stderr trailer so external watchers still see it.
+        fprintf(stderr, "[hexa-runtime/fuel_abort] %s", line);
+        return;
+    }
+    fwrite(line, 1, (size_t)n, f);
+    fflush(f);
+    fclose(f);
+}
+
 __attribute__((noinline))
 static void _hx_mem_cap_fire(size_t rss) {
     fprintf(stderr,
@@ -207,6 +477,9 @@ static void _hx_mem_cap_fire(size_t rss) {
         "(or HEXA_MEM_UNLIMITED=1) to disable, or --mem-cap=<MB> to raise.\n",
         (size_t)(rss / (1024ull*1024ull)),
         (size_t)(_hx_mem_cap_bytes / (1024ull*1024ull)));
+    // Telemetry: ledger emit before exit. Best-effort; never blocks the abort.
+    // fuel_count = -1 (n/a for memory cap; future interp fuel passes int).
+    _hx_emit_fuel_abort("mem", 77, -1, rss, _hx_mem_cap_bytes, "");
     exit(77);
 }
 
@@ -218,6 +491,35 @@ static inline void _hx_mem_tick(void) {
     if ((++_hx_mem_tick_ctr & 0x0FFFu) != 0) return;
     size_t rss = _hx_self_rss_bytes();
     if (rss > _hx_mem_cap_bytes) _hx_mem_cap_fire(rss);
+}
+
+// ── H03 (2026-05-06): forward decls for HEXA_ALLOC_STATS extensions ──
+// Storage + main definitions live alongside the rt 32 stats block (~line 1080+).
+// We declare them up-front so early callers (hexa_intern, hexa_closure_new,
+// hexa_fn_new — all defined before the stats block) can reference them.
+// `_hx_stats_on()` is the central guard; everything else is only touched
+// inside that guard, so unset-env paths are a single predicted branch + RET.
+static int _hx_stats_on(void);
+#define HX_POOL_LRU 8
+static int64_t _hx_stats_intern_hit;     // file-scope tentative defs (zero-init)
+static int64_t _hx_stats_intern_miss;
+static int64_t _hx_stats_intern_skip;
+static int64_t _hx_stats_intern_grow;
+static int64_t _hx_stats_closure_alloc;
+static int64_t _hx_stats_fn_alloc;
+static int64_t _hx_stats_fn_alloc_dup;
+static int64_t _hx_stats_clo_alloc_dup;
+static void* _hx_stats_fn_lru[HX_POOL_LRU];
+static void* _hx_stats_clo_lru[HX_POOL_LRU];
+static int   _hx_stats_fn_lru_pos;
+static int   _hx_stats_clo_lru_pos;
+static inline int _hx_stats_lru_check(void** ring, int* pos, void* p) {
+    for (int i = 0; i < HX_POOL_LRU; i++) {
+        if (ring[i] == p) return 1;
+    }
+    ring[*pos] = p;
+    *pos = (*pos + 1) % HX_POOL_LRU;
+    return 0;
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -357,28 +659,39 @@ static inline size_t hexa_strlen_v_inline(const char* s) {
 // Only interns strings shorter than INTERN_MAX_LEN.
 // The returned pointer is owned by the intern table -- callers must NOT free it.
 static const char* hexa_intern(const char* s) {
-    if (!s) return s;
+    if (HX_UNLIKELY(!s)) return s;
     size_t slen = strlen(s);
-    if (slen >= INTERN_MAX_LEN) return NULL;  // too long, skip interning
+    if (HX_UNLIKELY(slen >= INTERN_MAX_LEN)) {
+        // H03 Q9: count strings rejected by length cap.
+        if (_hx_stats_on()) _hx_stats_intern_skip++;
+        return NULL;  // too long, skip interning
+    }
 
-    // Lazy init
-    if (!__hexa_intern.buckets) hexa_intern_init();
+    // Lazy init — fires once per process; everything after is hot-path.
+    if (HX_UNLIKELY(!__hexa_intern.buckets)) hexa_intern_init();
 
     uint32_t h = hexa_fnv1a(s, slen);
     uint32_t mask = (uint32_t)(__hexa_intern.cap - 1);
     uint32_t idx = h & mask;
 
-    while (__hexa_intern.buckets[idx]) {
-        if (__hexa_intern.hashes[idx] == h &&
+    // A17: most workloads exhibit a heavy hit-rate (>90%) on hexa_intern —
+    // self-hosting parser interns identifiers + keywords repeatedly. Hint
+    // the slot-occupied loop and the hash-equal+strcmp-hit branch as taken.
+    while (HX_LIKELY(__hexa_intern.buckets[idx] != NULL)) {
+        if (HX_LIKELY(__hexa_intern.hashes[idx] == h) &&
             strcmp(__hexa_intern.buckets[idx], s) == 0) {
+            // H03 Q9: hit — table contained an equal canonical pointer.
+            if (_hx_stats_on()) _hx_stats_intern_hit++;
             return __hexa_intern.buckets[idx];  // already interned
         }
         idx = (idx + 1) & mask;
     }
 
     // Not found -- insert (header-allocated so HX_STRLEN works on interned strings)
-    if (__hexa_intern.count * 100 / __hexa_intern.cap >= INTERN_LOAD_MAX) {
+    // Grow path is rare (amortised O(log N) over program lifetime).
+    if (HX_UNLIKELY(__hexa_intern.count * 100 / __hexa_intern.cap >= INTERN_LOAD_MAX)) {
         hexa_intern_grow();
+        if (_hx_stats_on()) _hx_stats_intern_grow++;
         // Recompute slot after grow
         mask = (uint32_t)(__hexa_intern.cap - 1);
         idx = h & mask;
@@ -389,6 +702,7 @@ static const char* hexa_intern(const char* s) {
     __hexa_intern.buckets[idx] = dup;
     __hexa_intern.hashes[idx]  = h;
     __hexa_intern.count++;
+    if (_hx_stats_on()) _hx_stats_intern_miss++;
     return dup;
 }
 
@@ -744,6 +1058,14 @@ static inline HexaVal hexa_closure_new(void* fn_ptr, int arity, HexaVal env_arr)
     HX_SET_CLO_ARITY(v, arity);
     HX_SET_CLO_ENV(v, (HexaVal*)malloc(sizeof(HexaVal)));
     *HX_CLO_ENV(v) = env_arr;
+    // H03 B25: count closure descriptor allocs + LRU dup signal (pool-reuse
+    // opportunity — same fn_ptr seen recently → cache would have hit).
+    if (_hx_stats_on()) {
+        _hx_stats_closure_alloc++;
+        if (_hx_stats_lru_check(_hx_stats_clo_lru, &_hx_stats_clo_lru_pos, fn_ptr)) {
+            _hx_stats_clo_alloc_dup++;
+        }
+    }
     return v;
 }
 
@@ -754,6 +1076,13 @@ static inline HexaVal hexa_fn_new(void* fn_ptr, int arity) {
     HX_SET_FN_PTR_D(v, (HexaFn*)calloc(1, sizeof(HexaFn)));
     HX_FN_PTR(v) = fn_ptr;
     HX_FN_ARITY(v) = arity;
+    // H03 B25: count fn descriptor allocs + LRU dup signal.
+    if (_hx_stats_on()) {
+        _hx_stats_fn_alloc++;
+        if (_hx_stats_lru_check(_hx_stats_fn_lru, &_hx_stats_fn_lru_pos, fn_ptr)) {
+            _hx_stats_fn_alloc_dup++;
+        }
+    }
     return v;
 }
 
@@ -1081,7 +1410,53 @@ static int64_t _hx_stats_str_arena_heapify   = 0; // arena→heap string promoti
 // M4-edge: RSS peak sampler — opt-in via HEXA_ALLOC_STATS. Sampled only on
 // arena new-block (rare: every 4MB+), so getrusage overhead is negligible.
 static int64_t _hx_stats_rss_peak_bytes      = 0;
+// H03 (2026-05-06): extended observability counters — log2 size histogram,
+// arena block churn (max chain depth), string intern hit/miss, closure/fn
+// descriptor pool reuse signals. All updates are inside _hx_stats_on()
+// guards so the unset-env hot path remains a single predicted branch + RET.
+//
+// Histogram buckets (10 slots, log2-style edges in bytes):
+//   [0]<16  [1]<64  [2]<256  [3]<1K  [4]<4K  [5]<16K  [6]<64K  [7]<256K
+//   [8]<1M  [9]>=1M
+// Each slot accumulates the count of arena-bump allocations in that range
+// (covers the dominant runtime allocator — slab/size decisions for B17).
+#define HX_HIST_BUCKETS 10
+static int64_t _hx_stats_size_hist[HX_HIST_BUCKETS] = {0};
+// Arena block-chain churn. _arena_block_max_chain tracks longest observed
+// linked-list length. _arena_block_reuse counts how many times the alloc
+// path satisfied a request by walking forward into a previously rewound
+// (used=0) tail block instead of malloc'ing a new one.
+static int64_t _hx_stats_arena_block_max_chain = 0;
+static int64_t _hx_stats_arena_block_reuse     = 0;
+// String intern Q9 (hit/miss/skip/grow) and closure/fn pool counters (B25)
+// are forward-declared at top of file (above hexa_intern) — tentative defs
+// per C99 §6.9.2 implicitly zero-initialize; no separate defining decl needed.
+//
+// Closure / fn pool counters — storage matches the forward decls at top of
+// file (above hexa_intern). Tentative-definition rule: top-of-file decls
+// have no initializer; these defining declarations carry the `= 0` zero-init.
+// Note: HX_POOL_LRU and the ring buffers are also forward-declared above —
+// the declarations there are tentative (no init), so these defining declarations
+// (with explicit `= {0}` / `= 0`) coexist legally per C99 §6.9.2.
+// (HX_POOL_LRU macro is also defined at the top, do not redefine here.)
+// We do NOT redeclare _hx_stats_lru_check here — it's defined in the forward
+// block (static inline) and used by hexa_closure_new / hexa_fn_new.
 static int _hx_stats_enabled = -1;             // lazy probe of env
+
+// H03: log2 bucket index for n bytes — branch-free-ish; called only inside
+// _hx_stats_on() so cost is irrelevant when env unset.
+static inline int _hx_stats_size_bucket(size_t n) {
+    if (n < 16)            return 0;
+    if (n < 64)            return 1;
+    if (n < 256)           return 2;
+    if (n < 1024)          return 3;
+    if (n < 4096)          return 4;
+    if (n < 16384)         return 5;
+    if (n < 65536)         return 6;
+    if (n < 262144)        return 7;
+    if (n < 1048576)       return 8;
+    return 9;
+}
 
 static void _hx_stats_sample_rss(void) {
     struct rusage ru;
@@ -1113,6 +1488,55 @@ static void _hx_stats_dump(void) {
         (long long)_hx_stats_array_arena_heapify,
         (long long)_hx_stats_str_arena_heapify,
         (long long)(_hx_stats_rss_peak_bytes / (1024 * 1024)));
+
+    // H03: appended sections (append-only — does not break existing fields).
+    // Section S1: arena-allocation size histogram (B17 slab-decision input).
+    fprintf(stderr,
+        "[HEXA_ALLOC_STATS_HIST] <16=%lld <64=%lld <256=%lld <1K=%lld <4K=%lld <16K=%lld <64K=%lld <256K=%lld <1M=%lld >=1M=%lld\n",
+        (long long)_hx_stats_size_hist[0],
+        (long long)_hx_stats_size_hist[1],
+        (long long)_hx_stats_size_hist[2],
+        (long long)_hx_stats_size_hist[3],
+        (long long)_hx_stats_size_hist[4],
+        (long long)_hx_stats_size_hist[5],
+        (long long)_hx_stats_size_hist[6],
+        (long long)_hx_stats_size_hist[7],
+        (long long)_hx_stats_size_hist[8],
+        (long long)_hx_stats_size_hist[9]);
+
+    // Section S2: arena block churn — max chain depth, reuse rate.
+    fprintf(stderr,
+        "[HEXA_ALLOC_STATS_ARENA] block_max_chain=%lld block_reuse=%lld block_alloc=%lld\n",
+        (long long)_hx_stats_arena_block_max_chain,
+        (long long)_hx_stats_arena_block_reuse,
+        (long long)_hx_stats_arena_blocks);
+
+    // Section S3: string intern hit/miss/skip (Q9 — INTERN_INIT_CAP sizing).
+    int64_t intern_total = _hx_stats_intern_hit + _hx_stats_intern_miss;
+    long ratio_x100 = intern_total > 0
+        ? (long)((_hx_stats_intern_hit * 100) / intern_total)
+        : 0L;
+    fprintf(stderr,
+        "[HEXA_ALLOC_STATS_INTERN] hit=%lld miss=%lld skip=%lld grow=%lld hit_ratio_pct=%ld\n",
+        (long long)_hx_stats_intern_hit,
+        (long long)_hx_stats_intern_miss,
+        (long long)_hx_stats_intern_skip,
+        (long long)_hx_stats_intern_grow,
+        ratio_x100);
+
+    // Section S4: closure / fn descriptor pool reuse opportunity (B25).
+    long fn_dup_pct  = _hx_stats_fn_alloc > 0
+        ? (long)((_hx_stats_fn_alloc_dup * 100) / _hx_stats_fn_alloc) : 0L;
+    long clo_dup_pct = _hx_stats_closure_alloc > 0
+        ? (long)((_hx_stats_clo_alloc_dup * 100) / _hx_stats_closure_alloc) : 0L;
+    fprintf(stderr,
+        "[HEXA_ALLOC_STATS_POOL] fn_alloc=%lld fn_alloc_dup=%lld fn_dup_pct=%ld clo_alloc=%lld clo_alloc_dup=%lld clo_dup_pct=%ld\n",
+        (long long)_hx_stats_fn_alloc,
+        (long long)_hx_stats_fn_alloc_dup,
+        fn_dup_pct,
+        (long long)_hx_stats_closure_alloc,
+        (long long)_hx_stats_clo_alloc_dup,
+        clo_dup_pct);
 }
 
 static int _hx_stats_on(void) {
@@ -1308,7 +1732,13 @@ HexaVal hexa_array_push(HexaVal arr, HexaVal item) {
     _hx_mem_tick();
     if (_hx_stats_on()) _hx_stats_array_push++;
     int real_cap = HX_ARR_CAP(arr) < 0 ? -HX_ARR_CAP(arr) : HX_ARR_CAP(arr);
-    if (HX_ARR_LEN(arr) >= real_cap) {
+    // A17: amortised geometric grow → grow path fires O(log N) times; the
+    // common case is len < cap (no realloc). Hint the no-grow path.
+    // Z20: prefetch the slot we are about to write so the store retires
+    // without a fill miss when the array is large and was last touched
+    // outside the L1 working set.
+    HX_PREFETCH(&HX_ARR_ITEMS(arr)[HX_ARR_LEN(arr)]);
+    if (HX_UNLIKELY(HX_ARR_LEN(arr) >= real_cap)) {
         if (_hx_stats_on()) _hx_stats_array_grow++;
         int new_cap = real_cap < 8 ? 8 : real_cap * 2;
         if (HX_ARR_CAP(arr) < 0) {
@@ -1330,7 +1760,7 @@ HexaVal hexa_array_push(HexaVal arr, HexaVal item) {
                 // Promote to heap.
                 if (_hx_stats_on()) _hx_stats_array_arena_promote++;
                 HexaVal* heap = hexa_array_promote_to_heap(HX_ARR_ITEMS(arr), HX_ARR_LEN(arr), new_cap);
-                if (!heap) { fprintf(stderr, "OOM in array_push (arena promote)\n"); exit(1); }
+                if (HX_UNLIKELY(!heap)) { fprintf(stderr, "OOM in array_push (arena promote)\n"); exit(1); }
                 HX_SET_ARR_ITEMS(arr, heap);
                 HX_SET_ARR_CAP(arr, new_cap);  // positive → heap
             }
@@ -1362,7 +1792,7 @@ HexaVal hexa_array_push(HexaVal arr, HexaVal item) {
                 HX_SET_ARR_CAP(arr, -new_cap);  // negative → from_arena sentinel
             } else {
                 HexaVal* new_items = realloc(HX_ARR_ITEMS(arr), sizeof(HexaVal) * (size_t)new_cap);
-                if (!new_items) { fprintf(stderr, "OOM in array_push\n"); exit(1); }
+                if (HX_UNLIKELY(!new_items)) { fprintf(stderr, "OOM in array_push\n"); exit(1); }
                 HX_SET_ARR_ITEMS(arr, new_items);
                 HX_SET_ARR_CAP(arr, new_cap);
             }
@@ -2463,8 +2893,18 @@ void* hexa_arena_alloc(size_t n) {
             if (!nb) return NULL;
             // Append to end of chain (preserve any rewound-empty tail blocks).
             HexaArenaBlock* tail = __hexa_arena.cur;
-            while (tail->next) tail = tail->next;
+            int64_t chain_len = 1;
+            while (tail->next) { tail = tail->next; chain_len++; }
             tail->next = nb;
+            chain_len++;  // include the just-appended block
+            if (_hx_stats_on()) {
+                if (chain_len > _hx_stats_arena_block_max_chain) {
+                    _hx_stats_arena_block_max_chain = chain_len;
+                }
+            }
+        } else {
+            // Reused a previously rewound tail block (no malloc).
+            if (_hx_stats_on()) _hx_stats_arena_block_reuse++;
         }
         nb->used = 0;
         __hexa_arena.cur = nb;
@@ -2472,7 +2912,11 @@ void* hexa_arena_alloc(size_t n) {
     }
     void* p = (void*)(b->data + b->used);
     b->used += n;
-    if (_hx_stats_on()) _hx_stats_arena_alloc++;
+    if (_hx_stats_on()) {
+        _hx_stats_arena_alloc++;
+        // H03: log2 size bucket histogram (B17 slab decision input).
+        _hx_stats_size_hist[_hx_stats_size_bucket(n)]++;
+    }
     return p;
 }
 
@@ -3102,18 +3546,22 @@ HexaVal __hexa_fn_arena_return(HexaVal ret) {
 // pre-rt-32-D (every concat still does its own malloc).
 HexaVal hexa_str_concat(HexaVal a, HexaVal b) {
     if (_hx_stats_on()) _hx_stats_str_concat++;
-    char* sa = HX_IS_STR(a) ? HX_STR(a) : "";
-    char* sb = HX_IS_STR(b) ? HX_STR(b) : "";
+    // A17: both operands string is the dominant case in self-hosting parser
+    // (token + token, prefix + name). Hint truthy on HX_IS_STR.
+    char* sa = HX_LIKELY(HX_IS_STR(a)) ? HX_STR(a) : "";
+    char* sb = HX_LIKELY(HX_IS_STR(b)) ? HX_STR(b) : "";
     size_t la = strlen(sa);
     size_t lb = strlen(sb);
     // ROI-36: empty-string elision — skip alloc+memcpy when one side is "".
-    if (la == 0) return HX_IS_STR(b) ? b : hexa_str(sb);
-    if (lb == 0) return HX_IS_STR(a) ? a : hexa_str(sa);
+    // Empty-side is uncommon on the hot self-host path (parser keyword
+    // accumulator), so hint the non-empty arms.
+    if (HX_UNLIKELY(la == 0)) return HX_IS_STR(b) ? b : hexa_str(sb);
+    if (HX_UNLIKELY(lb == 0)) return HX_IS_STR(a) ? a : hexa_str(sa);
     size_t total = la + lb + 1;
     char* result;
-    if (hexa_arena_on()) {
+    if (HX_LIKELY(hexa_arena_on())) {
         result = (char*)hexa_arena_alloc(total);
-        if (!result) {
+        if (HX_UNLIKELY(!result)) {
             // Fallback: arena OOM → heap malloc so we stay correct.
             result = (char*)malloc(total);
         } else {
@@ -3343,6 +3791,138 @@ HexaVal hexa_array_sort(HexaVal arr) {
 }
 
 // ── Exec ────────────────────────────────────────────
+// TL;DR #2 (2026-05-06): posix_spawnp fast path for shell-free exec().
+// popen() forks a /bin/sh child which then exec's the actual command —
+// 2 fork+exec hops, plus shell startup time (~5–15 ms on macOS), even when
+// the command has no shell-meta chars. posix_spawnp() skips the shell hop
+// entirely (single fork+exec via the kernel's spawn syscall on macOS, or
+// vfork+execvp emulation on Linux glibc).
+//
+// Opt-in via env HEXA_EXEC_NO_SHELL=1. When set AND the command contains
+// no shell-meta characters (|&;<>*?$()`\\"' newline tab ~{}[]#=) we tokenize
+// on whitespace and posix_spawnp the argv directly, returning a FILE* wired
+// to the child's stdout via pipe2/dup2. When unset, or shell-meta present,
+// we fall through to popen() — preserving every existing behavior.
+//
+// Returns the child PID on success (caller must waitpid to reap), 0 on
+// fallback/skip. The fp out-param receives a FILE* the caller reads as if
+// from popen, freed with fclose() (NOT pclose — the child is reaped via
+// waitpid by the caller using the returned pid).
+static int hexa_exec_no_shell_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* v = getenv("HEXA_EXEC_NO_SHELL");
+        cached = (v && v[0] == '1' && v[1] == '\0') ? 1 : 0;
+    }
+    return cached;
+}
+
+// Returns 1 if cmd contains a shell-meta character that requires sh -c
+// interpretation. Conservative: any of these forces popen fallback.
+// Quote chars (' " `) are included because we tokenize on whitespace only —
+// a quoted arg with spaces would split incorrectly without shell parsing.
+static int hexa_cmd_has_shell_meta(const char* s) {
+    if (!s) return 1;
+    for (const char* p = s; *p; p++) {
+        switch (*p) {
+            case '|': case '&': case ';': case '<': case '>':
+            case '*': case '?': case '$': case '(': case ')':
+            case '`': case '\\': case '"': case '\'':
+            case '\n': case '\t': case '~': case '{': case '}':
+            case '[': case ']': case '#': case '=':
+                return 1;
+        }
+    }
+    return 0;
+}
+
+// Tokenize cmd on ASCII whitespace into a freshly malloc'd argv (NULL-
+// terminated). Caller owns argv + argv[0]; argv[i] for i>0 are interior
+// pointers into the malloc'd argv[0] buffer (we replace whitespace with
+// '\0' in-place). Free via: free(argv[0]); free(argv);
+static char** hexa_tokenize_argv(const char* cmd, int* out_argc) {
+    *out_argc = 0;
+    if (!cmd) return NULL;
+    size_t len = strlen(cmd);
+    char* buf = (char*)malloc(len + 1);
+    if (!buf) return NULL;
+    memcpy(buf, cmd, len + 1);
+    int argc = 0;
+    int in_tok = 0;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)buf[i];
+        int is_ws = (c == ' ' || c == '\t');
+        if (!is_ws && !in_tok) { argc++; in_tok = 1; }
+        else if (is_ws) in_tok = 0;
+    }
+    if (argc == 0) { free(buf); return NULL; }
+    char** argv = (char**)malloc(sizeof(char*) * (argc + 1));
+    if (!argv) { free(buf); return NULL; }
+    int idx = 0;
+    in_tok = 0;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)buf[i];
+        int is_ws = (c == ' ' || c == '\t');
+        if (!is_ws && !in_tok) { argv[idx++] = buf + i; in_tok = 1; }
+        else if (is_ws && in_tok) { buf[i] = '\0'; in_tok = 0; }
+    }
+    argv[argc] = NULL;
+    *out_argc = argc;
+    return argv;
+}
+
+// Spawn child reading cmd's stdout into a returned FILE*. Returns 0 (no
+// FILE* set) when the env flag is off, the cmd has shell-meta, or any
+// spawn step fails — caller must fall back to popen() in those cases.
+// On success returns child pid (>0) and *out_fp = fdopen(read_end, "r").
+static pid_t hexa_spawn_no_shell(const char* cmd, FILE** out_fp) {
+    *out_fp = NULL;
+    if (!hexa_exec_no_shell_enabled()) return 0;
+    if (!cmd || hexa_cmd_has_shell_meta(cmd)) return 0;
+    int argc = 0;
+    char** argv = hexa_tokenize_argv(cmd, &argc);
+    if (!argv || argc == 0) { if (argv) { free(argv[0]); free(argv); } return 0; }
+
+    int pipefd[2];
+    if (pipe(pipefd) != 0) { free(argv[0]); free(argv); return 0; }
+
+    posix_spawn_file_actions_t fa;
+    if (posix_spawn_file_actions_init(&fa) != 0) {
+        close(pipefd[0]); close(pipefd[1]);
+        free(argv[0]); free(argv); return 0;
+    }
+    posix_spawn_file_actions_addclose(&fa, pipefd[0]);
+    posix_spawn_file_actions_adddup2(&fa, pipefd[1], STDOUT_FILENO);
+    posix_spawn_file_actions_addclose(&fa, pipefd[1]);
+
+    pid_t pid = 0;
+    int rc = posix_spawnp(&pid, argv[0], &fa, NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    free(argv[0]); free(argv);
+
+    if (rc != 0) {
+        close(pipefd[0]); close(pipefd[1]);
+        return 0;
+    }
+    close(pipefd[1]);
+    FILE* fp = fdopen(pipefd[0], "r");
+    if (!fp) { close(pipefd[0]); return 0; }
+    *out_fp = fp;
+    return pid;
+}
+
+// Reap a posix_spawn'd child and translate to popen-style status int
+// (matching pclose's encoding so existing WIFEXITED/WEXITSTATUS code works).
+static int hexa_spawn_reap(pid_t pid) {
+    if (pid <= 0) return -1;
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno == EINTR) continue;
+        return -1;
+    }
+    return status;
+}
+
 // 2026-04-26 cross-repo upstream (hive→hexa-lang): switched the read primitive
 // from fgets()+strlen(buf) to fread(). Old loop computed chunk length via
 // strlen() on the buffer fgets() filled — when the child wrote an embedded
@@ -3363,8 +3943,17 @@ HexaVal hexa_array_sort(HexaVal arr) {
 // end, removing the runtime-layer truncation cliff.
 HexaVal hexa_exec(HexaVal cmd) {
     if (!HX_IS_STR(cmd)) return hexa_str("");
-    FILE* fp = popen(HX_STR(cmd), "r");
-    if (!fp) return hexa_str("");
+    // TL;DR #2 fast path: posix_spawnp when env enabled + shell-meta-free.
+    FILE* spawn_fp = NULL;
+    pid_t spawn_pid = hexa_spawn_no_shell(HX_STR(cmd), &spawn_fp);
+    FILE* fp;
+    if (spawn_pid > 0) {
+        fp = spawn_fp;
+    } else {
+        fp = popen(HX_STR(cmd), "r");
+        if (!fp) return hexa_str("");
+    }
+    hexa_pipe_buf_enlarge(fp);  // TL;DR #4: F_SETPIPE_SZ Linux + setvbuf 256K
     char buf[4096]; size_t total = 0;
     size_t cap = 4096;
     char* result = (char*)malloc(cap); result[0] = '\0';
@@ -3377,7 +3966,8 @@ HexaVal hexa_exec(HexaVal cmd) {
         total += n;
     }
     result[total] = '\0';
-    pclose(fp);
+    if (spawn_pid > 0) { fclose(fp); hexa_spawn_reap(spawn_pid); }
+    else               { pclose(fp); }
     return hexa_str_own(result);
 }
 
@@ -3401,15 +3991,26 @@ HexaVal hexa_exec(HexaVal cmd) {
 HexaVal hexa_exec_stream_impl(HexaVal cmd, HexaVal on_line) {
     if (!HX_IS_STR(cmd)) return hexa_int(127);
     if (!HX_IS_FN(on_line) && !HX_IS_CLOSURE(on_line)) return hexa_int(127);
-    FILE* fp = popen(HX_STR(cmd), "r");
-    if (!fp) return hexa_int(127);
+    // TL;DR #2 fast path: posix_spawnp when env enabled + shell-meta-free.
+    FILE* spawn_fp = NULL;
+    pid_t spawn_pid = hexa_spawn_no_shell(HX_STR(cmd), &spawn_fp);
+    FILE* fp;
+    if (spawn_pid > 0) {
+        fp = spawn_fp;
+    } else {
+        fp = popen(HX_STR(cmd), "r");
+        if (!fp) return hexa_int(127);
+    }
+    hexa_pipe_buf_enlarge(fp);  // TL;DR #4: F_SETPIPE_SZ Linux + setvbuf 256K
     char buf[4096];
     while (fgets(buf, sizeof(buf), fp)) {
         // Construct a fresh hexa string per line (the buffer is reused).
         // hexa_str() copies, so this is safe across iterations.
         hexa_call1(on_line, hexa_str(buf));
     }
-    int rc = pclose(fp);
+    int rc;
+    if (spawn_pid > 0) { fclose(fp); rc = hexa_spawn_reap(spawn_pid); }
+    else               { rc = pclose(fp); }
     int exit_code;
     if (WIFEXITED(rc))      exit_code = WEXITSTATUS(rc);
     else if (WIFSIGNALED(rc)) exit_code = 128 + WTERMSIG(rc);
@@ -3458,11 +4059,19 @@ HexaVal hexa_exec_with_status(HexaVal cmd) {
         arr = hexa_array_push(arr, hexa_int(127));
         return arr;
     }
-    FILE* fp = popen(HX_STR(cmd), "r");
-    if (!fp) {
-        arr = hexa_array_push(arr, hexa_str(""));
-        arr = hexa_array_push(arr, hexa_int(127));
-        return arr;
+    // TL;DR #2 fast path: posix_spawnp when env enabled + shell-meta-free.
+    FILE* spawn_fp = NULL;
+    pid_t spawn_pid = hexa_spawn_no_shell(HX_STR(cmd), &spawn_fp);
+    FILE* fp;
+    if (spawn_pid > 0) {
+        fp = spawn_fp;
+    } else {
+        fp = popen(HX_STR(cmd), "r");
+        if (!fp) {
+            arr = hexa_array_push(arr, hexa_str(""));
+            arr = hexa_array_push(arr, hexa_int(127));
+            return arr;
+        }
     }
     // 2026-04-26 cross-repo upstream: same fgets→fread switch as hexa_exec
     // above (see that function's comment for the embedded-NUL truncation
@@ -3477,7 +4086,9 @@ HexaVal hexa_exec_with_status(HexaVal cmd) {
         total += n;
     }
     result[total] = '\0';
-    int rc = pclose(fp);
+    int rc;
+    if (spawn_pid > 0) { fclose(fp); rc = hexa_spawn_reap(spawn_pid); }
+    else               { rc = pclose(fp); }
     int exit_code;
     if (WIFEXITED(rc))      exit_code = WEXITSTATUS(rc);
     else if (WIFSIGNALED(rc)) exit_code = 128 + WTERMSIG(rc);
