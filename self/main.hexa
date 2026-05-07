@@ -51,7 +51,7 @@ fn cmd_help() {
     println("                              A) # @convergence-start/end  multi-line block (legacy)")
     println("                              B) # @convergence k=v k=\"v\"  single-line comment (.md)")
     println("                              C) @convergence(k=\"v\", ...)  hexa attribute (.hexa)")
-    println("    build <file> [-o out]   Compile .hexa to native binary")
+    println("    build <file> [-o out] [--target=<t>]   Compile .hexa (native or cross)")
     println("    bench <file> [opts]     Benchmark a .hexa script (wall/RSS/alloc)")
     println("                              opts: --runs N (default 3)")
     println("                                    --json (JSON output, no table)")
@@ -838,7 +838,29 @@ fn die_no_hexa_v2() {
     exit(1)
 }
 
-fn cmd_build(src, out, c_only) {
+// ── Cross-compile target table (ROADMAP item #20) ──────────────────────
+// Maps hexa target name → zig-cc -target triple. zig (>=0.11) bundles musl
+// + glibc + macOS SDK and produces statically/dynamically linked output for
+// all listed targets from any host. Empty return = unknown target.
+fn target_zig_triple(t) {
+    if t == "linux-x86_64-musl"  { return "x86_64-linux-musl" }
+    if t == "linux-x86_64-glibc" { return "x86_64-linux-gnu"  }
+    if t == "linux-aarch64-musl" { return "aarch64-linux-musl" }
+    if t == "linux-aarch64-glibc" { return "aarch64-linux-gnu" }
+    if t == "darwin-arm64"       { return "aarch64-macos-none" }
+    if t == "darwin-x86_64"      { return "x86_64-macos-none"  }
+    return ""
+}
+fn target_static_flag(t) {
+    if t == "linux-x86_64-musl"  { return " -static" }
+    if t == "linux-aarch64-musl" { return " -static" }
+    return ""
+}
+fn target_supported_list() {
+    return "linux-x86_64-musl, linux-x86_64-glibc, linux-aarch64-musl, linux-aarch64-glibc, darwin-arm64, darwin-x86_64"
+}
+
+fn cmd_build(src, out, c_only, target) {
     // bt 37: AOT 캐시 atomic rename.
     // 문제: 두 `hexa build` 가 동일 `out` 을 쓰면 clang 이 같은 파일을 동시에
     //       open(O_TRUNC) 하여 부분 쓰기/경합 발생 (macOS/Linux 공통). 한 쪽이
@@ -869,7 +891,9 @@ fn cmd_build(src, out, c_only) {
     //
     // Bypass: HEXA_MAC_BUILD_OK=1 (CI dry-run, non-heavy experiments only).
     // Correct path: ssh ubu/hetzner/htz 'cd <repo> && hexa build <src> -o <out>'
-    if is_macos() && env("HEXA_MAC_BUILD_OK") != "1" {
+    // Cross-target bypass (ROADMAP #20): explicit `--target=...` is intentional,
+    // so the kernel-panic guard does not apply to non-native builds.
+    if len(target) == 0 && is_macos() && env("HEXA_MAC_BUILD_OK") != "1" {
         let out_basename = exec("basename '" + out + "' 2>/dev/null").trim()
         let mut _refuse_reason = ""
         let _olen = len(out_basename)
@@ -979,21 +1003,57 @@ fn cmd_build(src, out, c_only) {
     //   nested hexa_add(hexa_add(...)) calls. train_alm_14b.hexa has a 500+
     //   segment embedded Python runner which exceeds clang's default 256.
     let _strict = strict_fp_cflags(c_file)
-    let compile = "clang -O2 " + os_clang_cflags() + _strict + "-Wno-trigraphs -fbracket-depth=4096 -I '" + __inst + "/self' " + c_file + " -o '" + tmp + "'" + os_clang_ldflags() + " 2>&1"
+    // ROADMAP #20: native (target=="") uses host clang; cross-target uses
+    // `zig cc -target <triple>` which bundles musl/glibc/macOS SDKs in the
+    // ~70MB zig install. zig is detected via `command -v zig` and the build
+    // fails fast with an install hint if missing.
+    let mut compile = ""
+    if len(target) == 0 {
+        compile = "clang -O2 " + os_clang_cflags() + _strict + "-Wno-trigraphs -fbracket-depth=4096 -I '" + __inst + "/self' " + c_file + " -o '" + tmp + "'" + os_clang_ldflags() + " 2>&1"
+    } else {
+        let zt = target_zig_triple(target)
+        if len(zt) == 0 {
+            println("error: unknown --target value: " + target)
+            println("       supported: " + target_supported_list())
+            exit(1)
+        }
+        let has_zig = exec("command -v zig >/dev/null 2>&1 && printf yes || printf no")
+        if has_zig != "yes" {
+            println("error: zig not found on PATH (required for --target=" + target + ")")
+            println("       install: brew install zig   (or download from https://ziglang.org/download/)")
+            exit(1)
+        }
+        let static_f = target_static_flag(target)
+        // Linux targets need _GNU_SOURCE + libm; macOS targets do not. Cross
+        // overrides host-uname-based os_clang_cflags()/os_clang_ldflags().
+        let mut cf_target = ""
+        let mut ldf_target = ""
+        if target.starts_with("linux-") {
+            cf_target = "-D_GNU_SOURCE "
+            ldf_target = " -lm"
+        }
+        compile = "zig cc -O2 -target " + zt + static_f + " " + cf_target + _strict + "-Wno-trigraphs -fbracket-depth=4096 -I '" + __inst + "/self' " + c_file + " -o '" + tmp + "'" + ldf_target + " 2>&1"
+    }
     println("  [2/2] " + compile)
     let r2 = exec(compile)
     if len(r2) > 0 { println("    " + r2) }
-    // buglist#6 phase [2/2]: clang 산출물(tmp) 존재 확인. 실패 시 조기 exit(1)
+    // buglist#6 phase [2/2]: 컴파일 산출물(tmp) 존재 확인. 실패 시 조기 exit(1)
     // — mv 단계에서 '파일 없음'이 묻혀 false-positive 로 이어지지 않도록.
+    // cross-target 산출물은 host 에서 실행 비트만 검사 (-x 는 chmod 만 의미).
     let tmp_chk = exec("test -x '" + tmp + "' && printf yes || printf no")
     if tmp_chk != "yes" {
-        println("error: clang compile failed — binary not produced: " + tmp)
+        let _cc_label = "clang"
+        if len(target) > 0 { _cc_label = "zig cc" }
+        println("error: " + _cc_label + " compile failed — binary not produced: " + tmp)
         exit(1)
     }
     // bt 40: codesign tmp (macOS Gatekeeper 호환) — rename 전에 서명.
-    //   - macOS: ad-hoc 서명 수행. Linux 등: skip (no-op).
-    //   - codesign 부재/실패: warning only, 빌드는 계속 진행.
-    codesign_if_macos(tmp)
+    //   - native macOS 만 ad-hoc 서명. cross-target 은 host 가 macOS 라도 skip:
+    //     Linux ELF 산출물에 codesign 은 의미가 없고, darwin-* cross 는 zig
+    //     이 ad-hoc 서명을 이미 부착한다.
+    if len(target) == 0 {
+        codesign_if_macos(tmp)
+    }
     // atomic rename: tmp → out. 실패 시 tmp 보존으로 디버깅 가능.
     let mv = exec("mv -f '" + tmp + "' '" + out + "' 2>&1")
     if len(mv) > 0 { println("    mv: " + mv) }
@@ -2160,25 +2220,37 @@ if len(av) < 3 {
         } else {
             // hexa_v2 트랜스파일러 회귀: dispatch 블록 내부 `let src = av[3]`
             // decl 이 누락되어 cmd_build(src, ...) 가 undeclared 오류. bench
-            // 와 동일한 패턴으로 배열 래핑 우회 — bopts[0]=src, [1]=out.
-            let mut bopts = [av[3], "build/artifacts/app", "0"]
+            // 와 동일한 패턴으로 배열 래핑 우회 —
+            //   bopts[0]=src, [1]=out, [2]=c_only, [3]=target (ROADMAP #20).
+            let mut bopts = [av[3], "build/artifacts/app", "0", ""]
             let mut i = 4
             while i < len(av) {
                 if av[i] == "-o" {
                     if i + 1 < len(av) {
-                        bopts = [bopts[0], av[i + 1], bopts[2]]
+                        bopts = [bopts[0], av[i + 1], bopts[2], bopts[3]]
                         i = i + 2
                     } else {
                         i = i + 1
                     }
                 } else if av[i] == "--c-only" {
-                    bopts = [bopts[0], bopts[1], "1"]
+                    bopts = [bopts[0], bopts[1], "1", bopts[3]]
+                    i = i + 1
+                } else if av[i] == "--target" {
+                    if i + 1 < len(av) {
+                        bopts = [bopts[0], bopts[1], bopts[2], av[i + 1]]
+                        i = i + 2
+                    } else {
+                        i = i + 1
+                    }
+                } else if av[i].starts_with("--target=") {
+                    let _v = av[i].substring(9, len(av[i]))
+                    bopts = [bopts[0], bopts[1], bopts[2], _v]
                     i = i + 1
                 } else {
                     i = i + 1
                 }
             }
-            cmd_build(bopts[0], bopts[1], bopts[2])
+            cmd_build(bopts[0], bopts[1], bopts[2], bopts[3])
         }
     } else if sub == "check" {
         // T3 Phase A: AST-based @invariant DSL checker.

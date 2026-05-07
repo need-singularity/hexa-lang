@@ -89,7 +89,7 @@ SSOT 와 현실이 어긋나면 commit reject.
 | fixpoint evidence archive | `tool/fixpoint_archive.hexa` · `tool/fixpoint_bisect.hexa` | ✓ tool 있음, archive 미가동 (17 planned) |
 | raw#12 cherry-pick 금지 (실측 그대로) | 자격강제 | ✓ invariant |
 | own 4 bt-solution-claim-ban | `.own` | ✓ invariant |
-| cross-platform fixpoint (arm64↔x86_64) | roadmap 20 | ⚠️ planned |
+| cross-platform fixpoint (arm64↔x86_64) | `hexa build --target=<t>` (zig cc backend) | ✓ live (20) |
 
 ### 6. 우회방지 (bypass prevention)
 git-hook 은 폐기 (2026-04-21) — 우회 가능하기 때문. kernel EPERM 만 남김.
