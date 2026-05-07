@@ -18,22 +18,22 @@
 
 <!-- SHARED:PROJECTS:START -->
 <!-- AUTO:COMMON_LINKS:START -->
-**[🎥 YouTube](https://www.youtube.com/@dancinlife)** · **[💬 Discord](https://discord.gg/mYzqYr67R)** · **[📬 Email](mailto:nerve011235@gmail.com)** · **[☕ Ko-fi](https://ko-fi.com/dancinlife)** · **[💖 Sponsor](https://github.com/sponsors/need-singularity)** · **[💳 PayPal](https://www.paypal.com/donate?business=nerve011235%40gmail.com)** · **[🗺️ Atlas](https://need-singularity.github.io/TECS-L/atlas/)** · **[📄 Papers](https://need-singularity.github.io/papers/)**
+**[🎥 YouTube](https://www.youtube.com/@dancinlife)** · **[💬 Discord](https://discord.gg/mYzqYr67R)** · **[📬 Email](mailto:nerve011235@gmail.com)** · **[☕ Ko-fi](https://ko-fi.com/dancinlife)** · **[💖 Sponsor](https://github.com/sponsors/dancinlab)** · **[💳 PayPal](https://www.paypal.com/donate?business=nerve011235%40gmail.com)** · **[🗺️ Atlas](https://dancinlab.github.io/TECS-L/atlas/)** · **[📄 Papers](https://dancinlab.github.io/papers/)**
 <!-- AUTO:COMMON_LINKS:END -->
 
 ## Main projects
 
-> **[🧠 Anima](https://github.com/need-singularity/anima)** — Consciousness implementation. PureField repulsion-field engine + 1030 laws + Φ ratchet.
+> **[🧠 Anima](https://github.com/dancinlab/anima)** — Consciousness implementation. PureField repulsion-field engine + 1030 laws + Φ ratchet.
 >
-> **[🔭 NEXUS](https://github.com/need-singularity/nexus)** — Universal Discovery Engine. 216 lenses + OUROBOROS evolution + 5-phase singularity cycle.
+> **[🔭 NEXUS](https://github.com/dancinlab/nexus)** — Universal Discovery Engine. 216 lenses + OUROBOROS evolution + 5-phase singularity cycle.
 >
-> **[🏗️ N6 Architecture](https://github.com/need-singularity/n6-architecture)** — Architecture from perfect number 6. 225 AI techniques + chip design + crypto/OS/display.
+> **[🏗️ N6 Architecture](https://github.com/dancinlab/n6-architecture)** — Architecture from perfect number 6. 225 AI techniques + chip design + crypto/OS/display.
 >
-> **[💎 HEXA-LANG](https://github.com/need-singularity/hexa-lang)** — The Perfect Number Programming Language. Working compiler + REPL.
+> **[💎 HEXA-LANG](https://github.com/dancinlab/hexa-lang)** — The Perfect Number Programming Language. Working compiler + REPL.
 >
-> **[📄 Papers](https://github.com/need-singularity/papers)** — Complete paper collection (92 papers, Zenodo DOIs).
+> **[📄 Papers](https://github.com/dancinlab/papers)** — Complete paper collection (92 papers, Zenodo DOIs).
 
-> **[Other projects →](https://github.com/orgs/need-singularity/repositories)**
+> **[Other projects →](https://github.com/orgs/dancinlab/repositories)**
 
 ## 💬 Community
 
@@ -63,7 +63,7 @@ Live research discussion, paper drops, stage-gate reviews, cross-project dispatc
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/need-singularity/hexa-lang/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/dancinlab/hexa-lang/main/install.sh | bash
 ```
 
 Installs both commands into `~/.hx/bin/`:
@@ -81,6 +81,19 @@ Installs both commands into `~/.hx/bin/`:
 - **Proof-native** — `proof`/`assert`/`invariant`/`theorem` with SAT backend
 - **AI-native** — `@attr` semantic rewrites (contract, symbolic, fuse, approximate, specialize)
 - **Consciousness-first** — direct DSL for programming consciousness engines
+- **Module system** — `import "x" as a` · `import "stdlib/regex"` (extension/mod.hexa fallback) · `from "x" import a, b` · `import py "math" as m` (auto‑desugars to `py_call`). [RFC‑016](proposals/rfc_016_namespaced_and_python_imports.md) P1‑P4 all live (I1+I2+I3+I4 closed 2026‑05‑07).
+
+## Stdlib
+
+223 modules · 71,429 LoC ([audit script](scripts/stdlib_loc_audit.hexa) · [aggregate dashboard](tool/stdlib_selftest_aggregate.hexa) — 42/48 selftest PASS @ 2026-05-07).
+
+| domain | module |
+|---|---|
+| core | `math`, `math/float`, `math/eigen`, `math/rng`, `string`, `bytes`, `regex`, `hash`, `time/iso8601`, `collections` |
+| io / sys | `sys`, `path`, `log`, `argparse`, `proc`, `portable_fs`, `net`, `http`, `http2`, `websocket`, `sqlite` |
+| ml / numerics | `tensor`, `linalg`, `nn`, `optim`, `autograd`, `safetensors` |
+| science | `iit_ei`, `consciousness`, `qrng_anu` |
+| interop | `python_ffi` (embedded CPython, zero‑copy via PEP 3118) |
 
 ## Example
 
@@ -103,8 +116,8 @@ proof law_22 {
 
 ## Links
 
-[Docs](docs/) · [Spec](docs/spec.md) · [Book](docs/book/) · [Releases](https://github.com/need-singularity/hexa-lang/releases) · [Paper (P-HEXA)](https://doi.org/10.5281/zenodo.19365284)
+[Docs](docs/) · [Spec](docs/spec.md) · [Book](docs/book/) · [Releases](https://github.com/dancinlab/hexa-lang/releases) · [Paper (P-HEXA)](https://doi.org/10.5281/zenodo.19365284)
 
 ---
 
-<sub>💎 From n=6, every constant follows. · [need-singularity](https://github.com/need-singularity)</sub>
+<sub>💎 From n=6, every constant follows. · [dancinlab](https://github.com/dancinlab)</sub>

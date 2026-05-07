@@ -130,6 +130,213 @@ fn ml_parse_import(line) {
     return ""
 }
 
+// RFC-016 P1 (I1-IMPORT-ALIAS) — extract `alias` from
+//   import "foo.hexa" as bar
+// Returns "" if no `as <Ident>` present. Used by the alias-aware
+// emission pass; the legacy `ml_parse_import(line)` keeps returning the
+// path only so existing call sites (collect_imports, walker) stay
+// untouched until the second-half I1 implementation lands.
+fn ml_parse_import_alias(line) {
+    let trimmed = ml_trim_left(line)
+    let mut prefix_len = 0
+    if ml_starts_with(trimmed, "import ") {
+        prefix_len = 7
+    } else if ml_starts_with(trimmed, "use ") {
+        prefix_len = 4
+    } else {
+        return ""
+    }
+    let n = len(trimmed)
+    if prefix_len >= n { return "" }
+    let rest = ml_trim_left(trimmed.substring(prefix_len, n))
+    let rn = len(rest)
+    if rn < 2 { return "" }
+    if rest[0] != '"' { return "" }
+    // skip past closing quote
+    let mut i = 1
+    while i < rn {
+        if rest[i] == '"' { break }
+        i = i + 1
+    }
+    if i >= rn { return "" }
+    let after = ml_trim_left(rest.substring(i + 1, rn))
+    let an = len(after)
+    if an < 4 { return "" }
+    if after.substring(0, 3) != "as " { return "" }
+    let alias_part = ml_trim_left(after.substring(3, an))
+    // alias is identifier chars [A-Za-z_][A-Za-z0-9_]*; consume until first
+    // non-ident char so trailing comments/whitespace don't pollute.
+    let apn = len(alias_part)
+    let mut j = 0
+    while j < apn {
+        let c = alias_part[j]
+        let is_alpha = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
+        let is_digit = c >= '0' && c <= '9'
+        if !is_alpha && !is_digit { break }
+        j = j + 1
+    }
+    if j == 0 { return "" }
+    return alias_part.substring(0, j)
+}
+
+// RFC-016 P1 (I1-IMPORT-ALIAS) — collect the names of all top-level
+// `pub fn`/`pub let`/`pub const`/`pub struct`/`pub enum` decls. Returns
+// a flat string list. Used by ml_apply_alias_prefix to also rewrite
+// intra-module references after prefixing the declarations.
+fn ml_collect_pub_names(src) {
+    let mut out = []
+    let lines = ml_split_lines(src)
+    let n = len(lines)
+    let mut i = 0
+    while i < n {
+        let line = lines[i]
+        let trimmed = ml_trim_left(line)
+        let mut prefix = ""
+        let mut nlen = 0
+        if ml_starts_with(trimmed, "pub fn ")     { prefix = "pub fn "     nlen = 7 }
+        else if ml_starts_with(trimmed, "pub let ")    { prefix = "pub let "    nlen = 8 }
+        else if ml_starts_with(trimmed, "pub const ")  { prefix = "pub const "  nlen = 10 }
+        else if ml_starts_with(trimmed, "pub struct ") { prefix = "pub struct " nlen = 11 }
+        else if ml_starts_with(trimmed, "pub enum ")   { prefix = "pub enum "   nlen = 9 }
+        if nlen > 0 {
+            let rest = trimmed.substring(nlen, len(trimmed))
+            // identifier = [A-Za-z_][A-Za-z0-9_]*
+            let rn = len(rest)
+            let mut j = 0
+            while j < rn {
+                let c = rest[j]
+                let alpha = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
+                let dgt   = c >= '0' && c <= '9'
+                if !alpha && !dgt { break }
+                j = j + 1
+            }
+            if j > 0 { out.push(rest.substring(0, j)) }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// RFC-016 P1 (I1-IMPORT-ALIAS) — apply `__mod_<alias>__` prefix to all
+// `pub fn`/`pub let`/`pub const`/`pub struct`/`pub enum` *names* in `src`.
+// AND also rewrite intra-module references (calls like `path_is_abs(x)`
+// from inside `path_join`) so renamed sibling pubs still resolve. Without
+// the second pass, intra-module calls 'undefined' at runtime.
+//
+// Conservative: matches only at line start (first column) or after a
+// newline for declarations. References are matched via the same set of
+// preceding contexts as ml_rewrite_alias_refs (whitespace + delimiters).
+//
+// NB: must run BEFORE ml_strip_and_clean's `pub` stripper.
+fn ml_apply_alias_prefix(src, alias) {
+    if len(alias) == 0 { return src }
+    let mut p = []
+    p.push("__mod_")
+    p.push(alias)
+    p.push("__")
+    let pre = p.join("")
+
+    // Pass 1: collect all pub-decl names BEFORE we mutate src.
+    let names = ml_collect_pub_names(src)
+
+    // Pass 2: prefix the declarations themselves.
+    let mut s = src
+    if ml_starts_with(s, "pub fn ")     { s = "pub fn "     + pre + s.substring(7,  len(s)) }
+    if ml_starts_with(s, "pub let ")    { s = "pub let "    + pre + s.substring(8,  len(s)) }
+    if ml_starts_with(s, "pub const ")  { s = "pub const "  + pre + s.substring(10, len(s)) }
+    if ml_starts_with(s, "pub struct ") { s = "pub struct " + pre + s.substring(11, len(s)) }
+    if ml_starts_with(s, "pub enum ")   { s = "pub enum "   + pre + s.substring(9,  len(s)) }
+    s = s.replace("\npub fn ",     "\npub fn @@MARK_FN@@")
+    s = s.replace("\npub let ",    "\npub let @@MARK_LET@@")
+    s = s.replace("\npub const ",  "\npub const @@MARK_CONST@@")
+    s = s.replace("\npub struct ", "\npub struct @@MARK_STRUCT@@")
+    s = s.replace("\npub enum ",   "\npub enum @@MARK_ENUM@@")
+    s = s.replace("@@MARK_FN@@",     pre)
+    s = s.replace("@@MARK_LET@@",    pre)
+    s = s.replace("@@MARK_CONST@@",  pre)
+    s = s.replace("@@MARK_STRUCT@@", pre)
+    s = s.replace("@@MARK_ENUM@@",   pre)
+
+    // Pass 3: rewrite intra-module references to those names. Same
+    // preceding-context set as ml_rewrite_alias_refs but the needle is
+    // `<lhs><name>` (no '.') and must be followed by a non-ident char so
+    // we don't rewrite `path_join_extra` when the name is `path_join`.
+    // To handle the trailing-boundary cheaply, we rely on the common
+    // contexts where a name appears: `(`, ` `, `\n`, `,`. For each name
+    // we replace `<lhs><name><rhs>` triples.
+    let mut lhs_set = []
+    lhs_set.push(" ") lhs_set.push("\n") lhs_set.push("\t")
+    lhs_set.push("(") lhs_set.push(",") lhs_set.push("=")
+    lhs_set.push("[") lhs_set.push("{") lhs_set.push(";")
+    let mut rhs_set = []
+    rhs_set.push("(") rhs_set.push(" ") rhs_set.push("\n") rhs_set.push("\t")
+    rhs_set.push(")") rhs_set.push(",") rhs_set.push(";")
+    rhs_set.push("[") rhs_set.push("]") rhs_set.push("=")
+    rhs_set.push(".") rhs_set.push("+") rhs_set.push("-")
+    rhs_set.push("*") rhs_set.push("/") rhs_set.push("<")
+    rhs_set.push(">") rhs_set.push("}")
+
+    let mut ni = 0
+    while ni < len(names) {
+        let name = names[ni]
+        // Skip the alias prefix itself (defensive — collect_pub_names
+        // returns raw, but a malformed input might already be prefixed).
+        if !ml_starts_with(name, pre) {
+            let mut li = 0
+            while li < len(lhs_set) {
+                let lhs = lhs_set[li]
+                let mut ri = 0
+                while ri < len(rhs_set) {
+                    let rhs = rhs_set[ri]
+                    let needle = lhs + name + rhs
+                    let repl   = lhs + pre + name + rhs
+                    s = s.replace(needle, repl)
+                    ri = ri + 1
+                }
+                li = li + 1
+            }
+        }
+        ni = ni + 1
+    }
+    return s
+}
+
+// RFC-016 P1 — rewrite caller-side `<alias>.<sym>` references to the
+// fully-prefixed name. Used after a module is concatenated under an
+// alias. Conservative pattern: matches only when preceded by a
+// whitespace char or at line start, and followed by a valid identifier
+// char. Misses: same-line back-to-back tokens like `(alias.foo)` —
+// fixed by treating `(` and `,` and `=` as preceding-class members too.
+fn ml_rewrite_alias_refs(src, alias) {
+    if len(alias) == 0 { return src }
+    let mut p = []
+    p.push("__mod_")
+    p.push(alias)
+    p.push("__")
+    let pre = p.join("")
+    let mut s = src
+    // Common preceding contexts in hexa source:
+    let mut a = []
+    a.push(" ")
+    a.push("\n")
+    a.push("\t")
+    a.push("(")
+    a.push(",")
+    a.push("=")
+    a.push("[")
+    a.push("{")
+    a.push(";")
+    let mut i = 0
+    while i < len(a) {
+        let lhs = a[i]
+        let needle = lhs + alias + "."
+        let repl   = lhs + pre
+        s = s.replace(needle, repl)
+        i = i + 1
+    }
+    return s
+}
+
 // ── resolution (3-way: caller-relative, stdlib, project-root) ──
 
 // Env hygiene helpers — 2026-04-26 Option B (raw#92 silent-no-op fix).
@@ -175,24 +382,27 @@ fn ml_resolve_stdlib(imp) {
     // 1. HEXA_STDLIB_ROOT override (deterministic, env-hygiene-friendly).
     let sr = env_hexa_stdlib_root()
     if len(sr) > 0 {
-        let mut p = []
-        p.push(sr)
-        p.push("/")
-        p.push(rest)
-        p.push(".hexa")
-        let cand = p.join("")
-        if file_exists(cand) { return cand }
+        let base = ml_join_path(sr, rest)
+        // RFC-016 P2 — variants (.hexa / /mod.hexa) via shared helper.
+        let v = ml_try_path_variants(base)
+        if len(v) > 0 { return v }
     }
-    // 2. HEXA_LANG canonical resolution.
+    // 2. HEXA_LANG canonical resolution. Two roots in this monorepo:
+    //   * $HEXA_LANG/stdlib        — top-level stdlib (124 files; mod.hexa-style packages, RFC-016 target)
+    //   * $HEXA_LANG/self/stdlib   — bootstrap stdlib (96 files, pre-2026-05 baseline)
+    // RFC-016 P2 prefers top-level — that's where new namespaced/aliased
+    // modules live (path/sys/log/argparse/etc.). self/stdlib is fallback
+    // for legacy 'use "self/stdlib/foo"' imports.
     let hl = env_hexa_lang()
     if len(hl) > 0 {
-        let mut p = []
-        p.push(hl)
-        p.push("/self/stdlib/")
-        p.push(rest)
-        p.push(".hexa")
-        let cand = p.join("")
-        if file_exists(cand) { return cand }
+        let mut p1 = []
+        p1.push(hl) p1.push("/stdlib/") p1.push(rest)
+        let v1 = ml_try_path_variants(p1.join(""))
+        if len(v1) > 0 { return v1 }
+        let mut p2 = []
+        p2.push(hl) p2.push("/self/stdlib/") p2.push(rest)
+        let v2 = ml_try_path_variants(p2.join(""))
+        if len(v2) > 0 { return v2 }
     }
     return ""
 }
@@ -201,13 +411,12 @@ fn ml_resolve_project_root(imp) {
     let hl = env_hexa_lang()
     if len(hl) > 0 {
         let cand = ml_join_path(hl, imp)
-        if file_exists(cand) { return cand }
-        let cand_ext = ml_with_hexa_ext(cand)
-        if file_exists(cand_ext) { return cand_ext }
+        // RFC-016 P2 — try base / .hexa / mod.hexa variants in one shot.
+        let v = ml_try_path_variants(cand)
+        if len(v) > 0 { return v }
     }
-    if file_exists(imp) { return imp }
-    let imp_ext = ml_with_hexa_ext(imp)
-    if file_exists(imp_ext) { return imp_ext }
+    let v2 = ml_try_path_variants(imp)
+    if len(v2) > 0 { return v2 }
     return ""
 }
 
@@ -217,23 +426,59 @@ fn ml_resolve_project_root(imp) {
 // (caller-dir would look for self/poc/stmt/poc/common, which doesn't exist).
 let mut g_target_dir = "."
 
+// RFC-016 P2 (I2-IMPORT-PATH) — try `<base>.hexa` then `<base>/mod.hexa`.
+// Returns first existing path, or "".
+fn ml_try_path_variants(base) {
+    if file_exists(base) { return base }
+    let with_ext = ml_with_hexa_ext(base)
+    if file_exists(with_ext) { return with_ext }
+    // mod.hexa fallback for directory-style imports (e.g. import "stdlib/regex"
+    // → stdlib/regex/mod.hexa).
+    let mut p = []
+    p.push(base)
+    p.push("/mod.hexa")
+    let mod_path = p.join("")
+    if file_exists(mod_path) { return mod_path }
+    return ""
+}
+
+// RFC-016 P2 (I2-IMPORT-PATH) — search HEXA_PATH (colon-separated). Returns
+// first match across all path entries × (base/.hexa/mod.hexa) variants.
+fn ml_resolve_hexa_path(imp) {
+    let raw = env_var("HEXA_PATH")
+    if len(raw) == 0 { return "" }
+    let entries = raw.split(":")
+    let mut i = 0
+    while i < len(entries) {
+        let e = entries[i]
+        if len(e) > 0 {
+            let cand = ml_join_path(e, imp)
+            let hit = ml_try_path_variants(cand)
+            if len(hit) > 0 { return hit }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
 fn ml_resolve_full(imp, caller_dir) {
     // 1. caller-relative (C-style #include)
     let raw_full = ml_join_path(caller_dir, imp)
-    if file_exists(raw_full) { return raw_full }
-    let with_ext = ml_with_hexa_ext(raw_full)
-    if file_exists(with_ext) { return with_ext }
+    let v1 = ml_try_path_variants(raw_full)
+    if len(v1) > 0 { return v1 }
     // 2. target-relative (flatten_imports convention — POC uses this)
     if caller_dir != g_target_dir {
         let tgt_full = ml_join_path(g_target_dir, imp)
-        if file_exists(tgt_full) { return tgt_full }
-        let tgt_ext = ml_with_hexa_ext(tgt_full)
-        if file_exists(tgt_ext) { return tgt_ext }
+        let v2 = ml_try_path_variants(tgt_full)
+        if len(v2) > 0 { return v2 }
     }
     // 3. stdlib ("stdlib/..." → $HEXA_LANG/self/...)
     let sp = ml_resolve_stdlib(imp)
     if len(sp) > 0 { return sp }
-    // 4. project-root
+    // 4. RFC-016 P2 — $HEXA_PATH search (user-defined module roots)
+    let hp = ml_resolve_hexa_path(imp)
+    if len(hp) > 0 { return hp }
+    // 5. project-root
     let pr = ml_resolve_project_root(imp)
     if len(pr) > 0 { return pr }
     return ""
@@ -314,6 +559,154 @@ fn ml_collect_imports(src) {
     return imps
 }
 
+// RFC-016 P1 (I1-IMPORT-ALIAS) — paired collector returning [{path, alias}].
+// `alias` is "" when the import is the legacy non-alias form; the walker
+// can therefore mix old and new shapes freely without a feature flag.
+//
+// Fast-path: most lines in a 4k-line file are not directives. We skip
+// the trim+starts_with cascade entirely when the first non-whitespace
+// character is not 'i' (import/use) or 'f' (from) or 'u' (use). On
+// self/parser.hexa this drops ~95% of the parse calls.
+fn ml_collect_imports_with_alias(src) {
+    let lines = ml_split_lines(src)
+    let n = len(lines)
+    let mut imps = []
+    let mut i = 0
+    while i < n {
+        let line = lines[i]
+        let ln = len(line)
+        // skip empty lines + lines that obviously aren't directives
+        if ln >= 4 {
+            // Find first non-whitespace; if it's not i/u/f, skip.
+            let mut k = 0
+            while k < ln {
+                let c = line[k]
+                if c != ' ' && c != '\t' { break }
+                k = k + 1
+            }
+            if k < ln {
+                let fc = line[k]
+                if fc == 'i' || fc == 'u' || fc == 'f' {
+                    let path  = ml_parse_import(line)
+                    if path != "" {
+                        let alias = ml_parse_import_alias(line)
+                        imps.push(#{ "path": path, "alias": alias })
+                    } else {
+                        // RFC-016 P3 (I3-IMPORT-FROM) — `from "X" import a, b`
+                        // → treat as a regular non-alias import. Selective
+                        // filtering is a v2 optimization.
+                        let from_path = ml_parse_from_import_path(line)
+                        if from_path != "" {
+                            imps.push(#{ "path": from_path, "alias": "" })
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return imps
+}
+
+// RFC-016 P4 (I4-IMPORT-PY) — collect [{module, alias}] for py-imports.
+fn ml_collect_py_imports(src) {
+    let lines = ml_split_lines(src)
+    let n = len(lines)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let pi = ml_parse_import_py(lines[i])
+        if len(pi) > 0 { out.push(pi) }
+        i = i + 1
+    }
+    return out
+}
+
+// RFC-016 P4 (I4-IMPORT-PY) — detect `import py "<module>" as <alias>` and
+// return {module, alias}. Returns empty map on no-match.
+fn ml_parse_import_py(line) {
+    let trimmed = ml_trim_left(line)
+    if !ml_starts_with(trimmed, "import py ") { return #{} }
+    let n = len(trimmed)
+    let rest = ml_trim_left(trimmed.substring(10, n))
+    let rn = len(rest)
+    if rn < 4 { return #{} }
+    if rest[0] != '"' { return #{} }
+    let mut i = 1
+    while i < rn { if rest[i] == '"' { break } i = i + 1 }
+    if i >= rn { return #{} }
+    let module_name = rest.substring(1, i)
+    let after = ml_trim_left(rest.substring(i + 1, rn))
+    if !ml_starts_with(after, "as ") { return #{} }
+    let alias_part = ml_trim_left(after.substring(3, len(after)))
+    let apn = len(alias_part)
+    let mut j = 0
+    while j < apn {
+        let c = alias_part[j]
+        let alpha = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
+        let dgt   = c >= '0' && c <= '9'
+        if !alpha && !dgt { break }
+        j = j + 1
+    }
+    if j == 0 { return #{} }
+    return #{ "module": module_name, "alias": alias_part.substring(0, j) }
+}
+
+// RFC-016 P4 — generate the desugared preamble for one py-import. The
+// preamble emits a 1-shot init (py_init + py_eval("import X")) plus a
+// helper `__py_<alias>_call(fn_name, arg)` that all rewritten call sites
+// route through. Idempotent: py_init is idempotent in libhxpyembed, and
+// `import X` is module-cached by Python itself.
+fn ml_py_preamble(module_name, alias) {
+    let mut p = []
+    p.push("\n// === RFC-016 P4 py-shim for alias '")
+    p.push(alias)
+    p.push("' (module '")
+    p.push(module_name)
+    p.push("') ===\n")
+    p.push("fn __py_")
+    p.push(alias)
+    p.push("_call(__py_fn_name, __py_arg) {\n")
+    p.push("    py_init()\n")
+    p.push("    py_eval(\"import ")
+    p.push(module_name)
+    p.push("\")\n")
+    p.push("    return py_call(\"")
+    p.push(module_name)
+    p.push("\", __py_fn_name, __py_arg)\n")
+    p.push("}\n")
+    return p.join("")
+}
+
+// RFC-016 P3 (I3-IMPORT-FROM) — extract path from `from "X" import a, b`.
+// Returns "" if the line is not a from-import. Comments / strings can
+// happen to contain `from` but the column-0 + `from "` requirement is
+// stringent enough to reject them in practice.
+fn ml_parse_from_import_path(line) {
+    let trimmed = ml_trim_left(line)
+    if !ml_starts_with(trimmed, "from ") { return "" }
+    let n = len(trimmed)
+    if n < 6 { return "" }
+    let rest = ml_trim_left(trimmed.substring(5, n))
+    let rn = len(rest)
+    if rn < 2 { return "" }
+    if rest[0] != '"' { return "" }
+    let mut i = 1
+    while i < rn {
+        if rest[i] == '"' {
+            // Verify there is a subsequent ` import ` clause; otherwise
+            // not a valid from-import.
+            let path = rest.substring(1, i)
+            let after = rest.substring(i + 1, rn)
+            let aft = ml_trim_left(after)
+            if !ml_starts_with(aft, "import ") { return "" }
+            return path
+        }
+        i = i + 1
+    }
+    return ""
+}
+
 // ── strip directives + `pub ` prefix in ONE pass ───────────
 
 // Strip `import "..."` / `use "..."` directives and `pub ` prefix on
@@ -348,11 +741,11 @@ fn ml_strip_and_clean(src) {
             s = ""
         }
     }
-    if s.index_of("import ") < 0 && s.index_of("use ") < 0 && s.index_of("pub ") < 0 {
+    if s.index_of("import ") < 0 && s.index_of("use ") < 0 && s.index_of("pub ") < 0 && s.index_of("from \"") < 0 {
         return s
     }
     // First-line directive / pub — rare but correct-handle.
-    if ml_starts_with(s, "import ") || ml_starts_with(s, "use ") {
+    if ml_starts_with(s, "import ") || ml_starts_with(s, "use ") || ml_starts_with(s, "from \"") {
         let nl = s.index_of("\n")
         let prefix = "// [ml-stripped] "
         if nl < 0 {
@@ -373,8 +766,11 @@ fn ml_strip_and_clean(src) {
         s = s.substring(4, len(s))
     }
     // Interior (after a newline) — builtin replace, O(n), no intermediate arrays.
+    s = s.replace("\nimport py \"", "\n// [ml-stripped] import py \"")
     s = s.replace("\nimport \"", "\n// [ml-stripped] import \"")
     s = s.replace("\nuse \"", "\n// [ml-stripped] use \"")
+    // RFC-016 P3 (I3-IMPORT-FROM) — strip `from "X" import a, b` lines.
+    s = s.replace("\nfrom \"", "\n// [ml-stripped] from \"")
     s = s.replace("\npub fn ", "\nfn ")
     s = s.replace("\npub struct ", "\nstruct ")
     s = s.replace("\npub enum ", "\nenum ")
@@ -400,6 +796,20 @@ fn ml_strip_and_clean(src) {
 
 let mut g_order_parts = []
 let mut g_visited_hs = ml_hset_new()
+
+// RFC-016 P1 (I1-IMPORT-ALIAS) — alias bookkeeping. Both maps are scoped
+// per-walk and reset in load_module.
+//   g_path_alias[full_path]      = alias under which this module was imported
+//                                  (last writer wins if multiple parents
+//                                  import the same module under different
+//                                  aliases; v1 limitation, lint-rule TODO).
+//   g_file_aliases[parent_path]  = [aliases ...] used in that parent's imports;
+//                                  drives ml_rewrite_alias_refs at emit.
+let mut g_path_alias = #{}
+let mut g_file_aliases = #{}
+// RFC-016 P4 (I4-IMPORT-PY) — py-shim bookkeeping.
+//   g_file_py_imports[parent_path] = [{module, alias}, ...]
+let mut g_file_py_imports = #{}
 
 fn ml_iter_walk(start_file) {
     let MARKER = "<<EMIT>>"
@@ -431,14 +841,24 @@ fn ml_iter_walk(start_file) {
 
                 let src = read_file(top)
                 let caller_dir = ml_dirname(top)
-                let imps = ml_collect_imports(src)
-                let dn = len(imps)
+                // RFC-016 P1 — paired collector to capture alias alongside
+                // path. ml_collect_imports kept available for non-alias
+                // pre-existing callers; we use the with-alias form here.
+                let imps_pa = ml_collect_imports_with_alias(src)
+                let dn = len(imps_pa)
+                let mut my_aliases = []
                 // Reverse-push so first `use` is popped first → natural order.
                 let mut di = dn - 1
                 while di >= 0 {
-                    let imp = imps[di]
+                    let pa = imps_pa[di]
+                    let imp = pa["path"]
+                    let alias = pa["alias"]
                     let full = ml_resolve_full(imp, caller_dir)
                     if len(full) > 0 {
+                        if len(alias) > 0 {
+                            g_path_alias[full] = alias
+                            my_aliases.push(alias)
+                        }
                         if !ml_hset_has(g_visited_hs, full) {
                             stack.push(full)
                         }
@@ -479,6 +899,16 @@ fn ml_iter_walk(start_file) {
                     }
                     di = di - 1
                 }
+                // RFC-016 P1 — record this file's alias usage for the emit
+                // phase. Even when my_aliases is empty, the assignment is
+                // a cheap no-op that keeps the keyset consistent.
+                if len(my_aliases) > 0 { g_file_aliases[top] = my_aliases }
+                // RFC-016 P4 — record this file's py-imports. Fast-path:
+                // skip the full line scan if the substring isn't present.
+                if src.contains("import py \"") {
+                    let py_imps = ml_collect_py_imports(src)
+                    if len(py_imps) > 0 { g_file_py_imports[top] = py_imps }
+                }
             }
         }
     }
@@ -490,6 +920,11 @@ fn load_module(path) {
     g_order_parts = []
     g_visited_hs = ml_hset_new()
     g_target_dir = ml_dirname(path)
+    // RFC-016 P1 — alias bookkeeping reset per call.
+    g_path_alias = #{}
+    g_file_aliases = #{}
+    // RFC-016 P4 — py-shim bookkeeping reset.
+    g_file_py_imports = #{}
 
     ml_iter_walk(path)
 
@@ -507,7 +942,117 @@ fn load_module(path) {
     let mut ei = 0
     while ei < m {
         let f = g_order_parts[ei]
-        let body = read_file(f)
+        let mut body = read_file(f)
+        // RFC-016 P1 (I1-IMPORT-ALIAS) emit-phase transformations:
+        //   (1) caller-side: rewrite this file's `<alias>.<sym>` references
+        //       to `__mod_<alias>__<sym>` for every alias it imported.
+        //   (2) module-side: if THIS file was imported under an alias by
+        //       some parent, prefix its top-level `pub` decls.
+        // Both are idempotent on bodies with no alias activity (empty alias
+        // → ml_apply_alias_prefix / ml_rewrite_alias_refs return src as-is).
+        let aliases_here = g_file_aliases[f]
+        if aliases_here != void {
+            let mut ai = 0
+            while ai < len(aliases_here) {
+                body = ml_rewrite_alias_refs(body, aliases_here[ai])
+                ai = ai + 1
+            }
+        }
+        let my_alias = g_path_alias[f]
+        if my_alias != void {
+            body = ml_apply_alias_prefix(body, my_alias)
+        }
+        // RFC-016 P4 — py-shim emit + caller-side call-site rewrite.
+        let py_here = g_file_py_imports[f]
+        if py_here != void {
+            // Rewrite call sites BEFORE prepending the preamble (otherwise
+            // the preamble's helper definition would be matched and broken).
+            // Pattern: `<lhs><alias>.<fn>(<arg>)` → `<lhs>__py_<alias>_call("<fn>", <arg>)`.
+            // We approximate by rewriting `<alias>.` → unique sentinel,
+            // then `<sentinel><fn>(` → `__py_<alias>_call("<fn>", `, and
+            // mid-arg `to_string()` wrapping is the user's responsibility.
+            let mut pi = 0
+            while pi < len(py_here) {
+                let p = py_here[pi]
+                let alias = p["alias"]
+                // Replace `<alias>.` with a magic prefix. Then rewrite the
+                // first `(` that follows to inject the helper signature.
+                // Two-pass approach for simplicity.
+                let mut lhs_set = []
+                lhs_set.push(" ") lhs_set.push("\n") lhs_set.push("\t")
+                lhs_set.push("(") lhs_set.push(",") lhs_set.push("=")
+                lhs_set.push("[") lhs_set.push("{") lhs_set.push(";")
+                let mut li = 0
+                while li < len(lhs_set) {
+                    let lhs = lhs_set[li]
+                    // Use a sentinel that won't collide with hexa idents.
+                    let sentinel = lhs + "@@PYC_" + alias + "@@"
+                    let needle = lhs + alias + "."
+                    body = body.replace(needle, sentinel)
+                    li = li + 1
+                }
+                pi = pi + 1
+            }
+            // Second pass: turn `@@PYC_<alias>@@<fn>(<args>)` into
+            // `__py_<alias>_call("<fn>", <args>)`. State-machine walk:
+            // consume body char-by-char, accumulating chunks split at
+            // each sentinel boundary. The function name is the run of
+            // ident chars after the sentinel up to the next '('; args
+            // remain as-is (caller wraps non-strings via to_string()).
+            let mut pi2 = 0
+            while pi2 < len(py_here) {
+                let p = py_here[pi2]
+                let alias = p["alias"]
+                let sent = "@@PYC_" + alias + "@@"
+                let sent_len = len(sent)
+                let mut acc = []
+                let mut cur = 0
+                let blen = len(body)
+                while cur < blen {
+                    // Find the next sentinel from `cur` forward by slicing
+                    // a tail and using index_of (returns relative index).
+                    let tail = body.substring(cur, blen)
+                    let rel = tail.index_of(sent)
+                    if rel < 0 {
+                        acc.push(tail)
+                        cur = blen
+                    } else {
+                        acc.push(tail.substring(0, rel))
+                        let after_sent = cur + rel + sent_len
+                        // Find the function name end ('(').
+                        let mut k = after_sent
+                        while k < blen {
+                            if body[k] == '(' { break }
+                            k = k + 1
+                        }
+                        if k >= blen {
+                            // Malformed — emit sentinel as-is and stop.
+                            acc.push(body.substring(cur + rel, blen))
+                            cur = blen
+                        } else {
+                            let fn_name = body.substring(after_sent, k)
+                            acc.push("__py_")
+                            acc.push(alias)
+                            acc.push("_call(\"")
+                            acc.push(fn_name)
+                            acc.push("\", ")
+                            cur = k + 1
+                        }
+                    }
+                }
+                body = acc.join("")
+                pi2 = pi2 + 1
+            }
+            // Prepend py-shim preamble for each py-import in this file.
+            let mut pre_parts = []
+            let mut pi3 = 0
+            while pi3 < len(py_here) {
+                let p = py_here[pi3]
+                pre_parts.push(ml_py_preamble(p["module"], p["alias"]))
+                pi3 = pi3 + 1
+            }
+            body = pre_parts.join("") + body
+        }
         let cleaned = ml_strip_and_clean(body)
         let mut bp = []
         bp.push("\n// [module_loader] begin: ")

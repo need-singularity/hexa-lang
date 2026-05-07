@@ -1,0 +1,133 @@
+// self/lsp/import_diagnostics.hexa — LP4-IMPORT-SURFACE close (RFC-016 wiring)
+//
+// Bridges module_loader's import-resolution failures into LSP Diagnostic
+// squiggles. The loader (self/module_loader.hexa) already emits a fail-loud
+// FATAL marker on any unresolved `use`/`import` (raw#92 no_silent_errors,
+// 2026-04-26). We invoke it as a sub-process, scan stderr for the marker,
+// and synthesize one diagnostic per offending line.
+//
+// Surface (companion to raw_diagnostics.collect_for_file):
+//   pub fn collect_imports_for_file(path: string) -> array
+//     Returns `[Diagnostic JSON, ...]` — empty array on success/no imports.
+//
+// Format of the loader's FATAL output (verbatim from module_loader.hexa):
+//   [module_loader] FATAL module not found: <imp> (from <file>)
+//     searched:
+//       HEXA_LANG=<path>
+//       HEXA_STDLIB_ROOT=<unset|path>
+//       project_root=<path>
+//       caller_dir=<path>
+//       cwd=<path>
+//
+// The line/col we emit is the FIRST line in `path` whose stripped text
+// equals `import "<imp>"` (or `use "<imp>"` or `from "<imp>" import ...`).
+// If no exact match, fallback to (1,1).
+//
+// Fail-open: any spawn/parse error returns []; LSP keeps running.
+
+use "self/lsp/protocol"
+
+fn _file_exists_safe(p: string) -> bool {
+    return file_exists(p)
+}
+
+fn _split_lines_local(s: string) {
+    return s.split("\n")
+}
+
+fn _trim_left_local(s: string) {
+    let n = len(s)
+    let mut i = 0
+    while i < n {
+        let c = s[i]
+        if c != ' ' && c != '\t' { break }
+        i = i + 1
+    }
+    if i == 0 { return s }
+    return s.substring(i, n)
+}
+
+// Find the (1-based) line number of the first import directive in `src`
+// that references `imp` (exact path match between quotes). Returns 1 on
+// no match (defensive).
+fn _locate_import_line(src: string, imp: string) -> int {
+    let lines = _split_lines_local(src)
+    let n = len(lines)
+    let mut i = 0
+    let needle = "\"" + imp + "\""
+    while i < n {
+        let t = _trim_left_local(lines[i])
+        if t.starts_with("import ") || t.starts_with("use ") || t.starts_with("from ") {
+            if t.contains(needle) { return i + 1 }
+        }
+        i = i + 1
+    }
+    return 1
+}
+
+// Extract the unresolved import path from a single FATAL line.
+// Input: "[module_loader] FATAL module not found: stdlib/foo (from bench/x.hexa)"
+// Output: "stdlib/foo" or "" on parse fail.
+fn _extract_imp_from_fatal(line: string) -> string {
+    let marker = "FATAL module not found: "
+    let idx = line.index_of(marker)
+    if idx < 0 { return "" }
+    let tail = line.substring(idx + len(marker), len(line))
+    // tail = "stdlib/foo (from bench/x.hexa)"
+    let stop = tail.index_of(" (from ")
+    if stop < 0 { return tail }
+    return tail.substring(0, stop)
+}
+
+// Public entry: returns an array of diagnostic-JSON strings.
+pub fn collect_imports_for_file(path: string) -> array {
+    if len(path) == 0 { return [] }
+    if !_file_exists_safe(path) { return [] }
+    // Fast-path: skip files with no import directive at all.
+    let src = read_file(path)
+    let has_import = src.contains("\nimport \"") || src.starts_with("import \"")
+    let has_use    = src.contains("\nuse \"")    || src.starts_with("use \"")
+    let has_from   = src.contains("\nfrom \"")   || src.starts_with("from \"")
+    if !has_import && !has_use && !has_from { return [] }
+
+    // Spawn the loader. tmp_out is throwaway; we only need the FATAL output.
+    // Use shell mktemp for atomicity (avoids time_now_ms interp dependency).
+    let tmp_out = exec("mktemp /tmp/_lsp_imp_check_XXXXXX 2>/dev/null").trim()
+    if len(tmp_out) == 0 { return [] }
+    let loader = "self/module_loader.hexa"
+    if !_file_exists_safe(loader) { return [] }
+    let cmd = "/Users/ghost/.hx/bin/hexa " + loader + " '" + path + "' '" + tmp_out + "' 2>&1"
+    let out = exec(cmd)
+    // Best-effort cleanup.
+    exec("rm -f '" + tmp_out + "' 2>/dev/null")
+
+    let mut diags = []
+    let lines = _split_lines_local(out)
+    let n = len(lines)
+    let mut i = 0
+    while i < n {
+        let line = lines[i]
+        if line.contains("FATAL module not found:") {
+            let imp = _extract_imp_from_fatal(line)
+            if len(imp) > 0 {
+                let lineno = _locate_import_line(src, imp)
+                // LSP positions are 0-based; convert.
+                let zr = lineno - 1
+                let msg = "import-resolve-fail: module '" + imp + "' not found in HEXA_LANG/stdlib, /self/stdlib, $HEXA_PATH, or project root"
+                let d = diagnostic(zr, 0, zr, 0, 1, "rfc016", msg)
+                diags.push(d)
+            }
+        }
+        i = i + 1
+    }
+    return diags
+}
+
+// Convenience: returns a ready-to-publish JSON array body.
+pub fn collect_imports_as_json(path: string) -> string {
+    let diags = collect_imports_for_file(path)
+    if len(diags) == 0 { return "[]" }
+    let joined = diags.join(",")
+    let parts = ["[", joined, "]"]
+    return parts.join("")
+}
