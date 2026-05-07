@@ -5085,15 +5085,48 @@ HexaVal hexa_format_n(HexaVal fmt, HexaVal args) {
                 char buf[128];
                 HexaVal arg = HX_ARR_ITEMS(args)[ai++];
                 if (spec[0] == ':' && spec[1] == '.') {
-                    // Precision format {:.N}
+                    // Precision format {:.N} or {:.Nf}
                     int prec = atoi(spec + 2);
                     double val = HX_IS_FLOAT(arg) ? HX_FLOAT(arg) : (double)HX_INT(arg);
                     snprintf(buf, sizeof(buf), "%.*f", prec, val);
+                } else if (spec[0] == ':') {
+                    // Width/pad/int-suffix format: {:N} {:<N} {:>N} {:0N} {:Nd}
+                    // Strategy: render arg via hexa_to_string, then pad/truncate
+                    // to a width parsed from the spec body.
+                    const char* p = spec + 1;
+                    char align = 'R';                           // numeric default
+                    char fill  = ' ';
+                    if (*p == '<') { align = 'L'; p++; }
+                    else if (*p == '>') { align = 'R'; p++; }
+                    else if (*p == '^') { align = 'C'; p++; }
+                    if (*p == '0' && p[1] != 0) { fill = '0'; p++; }
+                    int width = 0;
+                    while (*p >= '0' && *p <= '9') { width = width * 10 + (*p - '0'); p++; }
+                    // ignore trailing type char ('d'/'s'/'f')
+                    HexaVal s = hexa_to_string(arg);
+                    int slen = (int)HX_STRLEN(s);
+                    int pad = width > slen ? width - slen : 0;
+                    int bp = 0;
+                    if (align == 'L') {
+                        memcpy(buf + bp, HX_STR(s), slen); bp += slen;
+                        for (int q = 0; q < pad && bp < (int)sizeof(buf) - 1; q++) buf[bp++] = fill;
+                    } else if (align == 'C') {
+                        int lp = pad / 2, rp = pad - lp;
+                        for (int q = 0; q < lp && bp < (int)sizeof(buf) - 1; q++) buf[bp++] = fill;
+                        memcpy(buf + bp, HX_STR(s), slen); bp += slen;
+                        for (int q = 0; q < rp && bp < (int)sizeof(buf) - 1; q++) buf[bp++] = fill;
+                    } else {
+                        for (int q = 0; q < pad && bp < (int)sizeof(buf) - 1; q++) buf[bp++] = fill;
+                        memcpy(buf + bp, HX_STR(s), slen); bp += slen;
+                    }
+                    if (bp >= (int)sizeof(buf)) bp = sizeof(buf) - 1;
+                    buf[bp] = 0;
                 } else if (spec[0] == 0) {
                     // Simple {}
                     HexaVal s = hexa_to_string(arg);
                     strncpy(buf, HX_STR(s), sizeof(buf)-1); buf[sizeof(buf)-1]=0;
                 } else {
+                    // Indexed {N} — best-effort; non-numeric falls through to to_string
                     HexaVal s = hexa_to_string(arg);
                     strncpy(buf, HX_STR(s), sizeof(buf)-1); buf[sizeof(buf)-1]=0;
                 }
